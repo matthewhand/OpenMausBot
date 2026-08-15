@@ -226,4 +226,6 @@ New-NetFirewallRule -DisplayName "OpenMausBot UI" -Direction Inbound -Protocol T
 
 ## Next Steps
 
-For automatic startup on Windows Server, see the [Windows Service documentation](./windows-service.md) (created in PR 2).
+For automatic startup on Windows Server, see the [Windows Service documentation](./windows-service.md).
+
+To enable LAN access before setting up the service, ensure you've configured the environment variables as described in this guide.
