@@ -33,6 +33,14 @@ import { readCuaConnection } from "./local-computer.ts";
 import { RoutineManager, type RoutineRunOn } from "./routines.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
+const HOST = process.env.OMB_HOST || "127.0.0.1";
+// LAN access auth token. When set, all /api/ requests (except /api/health and
+// /api/internal/* which has COMMS_TOKEN) require the Authorization header.
+// Defaults to disabled for backward compatibility and local-only use.
+const AUTH_TOKEN = process.env.OMB_AUTH_TOKEN || null;
+// CORS origin for LAN access. Set to "*" or a specific origin (e.g., "http://10.0.0.32:5199").
+// Defaults to null (no CORS headers) for localhost-only setups.
+const CORS_ORIGIN = process.env.OMB_CORS_ORIGIN || null;
 const STATIC_DIR = process.env.OMB_STATIC_DIR || null;
 const MIME: Record<string, string> = {
   ".html": "text/html",
@@ -938,6 +946,21 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
   const path = url.pathname;
   const method = req.method ?? "GET";
+  
+  // CORS headers for LAN access
+  if (CORS_ORIGIN) {
+    res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    
+    // Handle preflight requests
+    if (method === "OPTIONS") {
+      res.writeHead(204);
+      return res.end();
+    }
+  }
+  
   try {
     // ── internal peer-agent comms (localhost + shared token only) ──────
     // The agents-proxy (spawned inside a bot's agent process) calls these to
@@ -1032,6 +1055,16 @@ const server = createServer(async (req, res) => {
         return json(res, 200, { botName: target.name, text: reply });
       }
       return json(res, 404, { error: "unknown internal endpoint" });
+    }
+
+    // ── LAN access authentication ──────────────────────────────────────
+    // When OMB_AUTH_TOKEN is set, all public /api/ endpoints (except /api/health)
+    // require Bearer token authentication. Health check is always open for probes.
+    if (AUTH_TOKEN && path.startsWith("/api/") && path !== "/api/health") {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || authHeader !== `Bearer ${AUTH_TOKEN}`) {
+        return json(res, 401, { error: "unauthorized: valid OMB_AUTH_TOKEN required" });
+      }
     }
 
     // ── routines calendar ────────────────────────────────────────────────
@@ -1635,8 +1668,20 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`openmausbot server on http://127.0.0.1:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`openmausbot server on http://${HOST}:${PORT}`);
+  if (AUTH_TOKEN) {
+    console.log("⚠️  LAN authentication enabled (OMB_AUTH_TOKEN is set)");
+  }
+  if (CORS_ORIGIN) {
+    console.log(`✓ CORS enabled for origin: ${CORS_ORIGIN}`);
+  }
+  if (HOST !== "127.0.0.1") {
+    console.log(`⚠️  Server bound to ${HOST} — accessible from the network`);
+    if (!AUTH_TOKEN) {
+      console.log("⚠️  WARNING: No OMB_AUTH_TOKEN set. Consider setting one for LAN security.");
+    }
+  }
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
