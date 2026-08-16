@@ -531,6 +531,10 @@ async function startTurn(
     try {
       const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
       if (cfg.composio?.key) integrations.composio = { key: cfg.composio.key, url: cfg.composio.url };
+      // Custom remote MCP servers (enabled servers only)
+      if (cfg.mcpServers?.length) {
+        integrations.mcpServers = cfg.mcpServers.filter((s) => s.enabled !== false);
+      }
       const wants = opts?.runOn === "cloud" ? "cloud" : bot.computer; // cloud routine overrides the MAUS default
       const mountsComputerMcp = instance.adapter.capabilities.computerMcp === true;
       const mountsCloudComputer = mountsComputerMcp || instance.driverKind === "boxAgent";
@@ -872,6 +876,15 @@ function configStatus() {
     tts: tts.describeVoice(cfg),
     // not a secret — the sidebar shows it
     profile: { name: cfg.profile?.name ?? "", email: cfg.profile?.email ?? "" },
+    // custom MCP servers: names, urls, and enabled state are echoed back;
+    // headers are write-only like other secrets
+    mcpServers: (cfg.mcpServers ?? []).map((s) => ({
+      name: s.name,
+      transport: s.transport,
+      url: s.url,
+      enabled: s.enabled ?? true,
+      hasHeaders: Boolean(s.headers && Object.keys(s.headers).length),
+    })),
   };
 }
 
@@ -1528,6 +1541,10 @@ const server = createServer(async (req, res) => {
       const patch: Record<string, object> = {};
       for (const key of ["xai", "composio", "box", "tts", "profile"] as const) {
         if (body[key] && typeof body[key] === "object") patch[key] = body[key];
+      }
+      // mcpServers is an array, not an object
+      if (Array.isArray(body.mcpServers)) {
+        patch.mcpServers = body.mcpServers;
       }
       if (!Object.keys(patch).length) return json(res, 400, { error: "nothing to save" });
       // check a box token against the provider before storing it: a

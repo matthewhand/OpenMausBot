@@ -51,7 +51,7 @@ already have:
 - **Local first.** One small harness server on `127.0.0.1` owns every agent process. Transcripts, keys, and
   events live in `~/.openmausbot`, not a cloud.
 - **Agents with hands.** Each bot can get a real computer — a cloud Linux desktop it drives while you watch
-  live, or your own Mac — plus 500+ apps through Composio Connect.
+  live, or your own Mac — plus custom tools through remote MCP servers (HTTP or SSE).
 
 ## Features
 
@@ -91,12 +91,12 @@ permission broker turns every risky action into a decision you make, for cloud a
 </td>
 <td width="50%" valign="top">
 
-### 🔌 Connected apps
+### 🔌 Custom remote MCP servers
 
-A one-click marketplace over Composio Connect: Gmail, Slack, GitHub, Notion, Linear and hundreds more.
-OAuth once, and every bot can use them as tools.
+Add your own HTTP or SSE MCP servers in the Plugins panel. Point at any Model Context Protocol server —
+Notion, GitHub, custom APIs — and every Claude bot can use those tools. Composio is optional.
 
-<img src="docs/screenshots/marketplace.png" alt="Connected apps marketplace" width="100%">
+<img src="docs/screenshots/marketplace.png" alt="Remote MCP servers panel" width="100%">
 
 </td>
 </tr>
@@ -163,7 +163,7 @@ flowchart LR
     REG --> CL & CX & GR
     CL & CX & GR -- "permission requests" --> BROKER
     server -- "Box API" --> BOX[("Cloud computer<br/>box.ascii.dev")]
-    server -- "Composio Connect" --> APPS[("Gmail · Slack · GitHub · …")]
+    server -- "Custom MCP servers" --> APPS[("Your HTTP/SSE MCP tools")]
 ```
 
 | Layer | Where | What it does |
@@ -216,7 +216,7 @@ pnpm package:linux    # Ubuntu x64: .deb + AppImage; no Swift required
 | Capability | macOS | Ubuntu 24.04 Xorg | Ubuntu 24.04 Wayland |
 |---|---|---|---|
 | Packaged app, embedded harness, local agent CLIs | Supported | Beta | Beta |
-| Composio and Box/cloud computers | Supported | Beta | Beta |
+| Remote MCP servers and Box/cloud computers | Supported | Beta | Beta |
 | Local screen preview and computer control | Supported | Planned | Planned after compositor validation |
 | Native on-device dictation | Supported | Planned | Planned |
 
@@ -229,13 +229,31 @@ in the sidebar footer) when you want to enable its integration:
 
 | Credential | What it enables | Where to get it |
 |---|---|---|
-| Composio Connect key (`ck_…`) | Connect Gmail, GitHub, Slack, Notion, and other apps to your bots | [Composio Connect setup guide](https://docs.composio.dev/docs/composio-connect) |
-| Composio API key (`ak_…`) | Browse the full app catalog with official names and logos | [Composio project API key guide](https://docs.composio.dev/reference/authenticating-to-composio/project-api-key-permissions) |
 | Box API key | Give bots an isolated remote Linux computer with a desktop and terminal | [Box API key guide](https://docs.ascii.dev/box/api-keys) |
 | TTS provider | Read replies aloud and call your bots — choose ElevenLabs or OpenAI-compatible (Kokoro, etc.) | [ElevenLabs keys](https://elevenlabs.io/app/settings/api-keys) or [local Kokoro setup](docs/voice-mode.md) |
+| Composio Connect key (`ck_…`) (optional) | Use Composio's connected apps marketplace instead of custom MCP servers | [Composio Connect setup guide](https://docs.composio.dev/docs/composio-connect) |
+**Custom MCP servers** are configured in the Plugins panel (puzzle icon in the chat header). No account
+or API key required — just point at your HTTP or SSE MCP server URL. See the [MCP servers
+directory](https://github.com/modelcontextprotocol/servers) for examples.
 
-Composio and Box are third-party services with their own accounts and terms. Box is a paid service after
-its trial, and using a cloud computer may incur charges.
+### Adding a custom remote MCP server
+
+1. Click the puzzle icon (🧩) in the chat header to open the Plugins panel
+2. Click "Add Server"
+3. Fill in:
+   - **Name**: A unique identifier (lowercase, alphanumeric, dash, underscore) — used as `mcp__<name>` in tool allowlists
+   - **Transport**: HTTP (streamable HTTP) or SSE (Server-Sent Events)
+   - **URL**: Your MCP server endpoint
+   - **Headers** (optional): Add auth headers, API keys, etc. These are stored securely and never echoed back
+4. Click "Save"
+
+Your Claude bots can now use tools from that server. Example custom servers:
+- **Notion**: Read and write pages, databases
+- **GitHub**: Issues, PRs, code search
+- **APIs.guru**: Browse and test public APIs
+- **Custom APIs**: Your own internal tools
+
+MCP servers can be enabled/disabled per server without losing their configuration.
 
 ```sh
 pnpm typecheck     # app + server

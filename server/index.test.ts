@@ -277,6 +277,56 @@ describe("harness HTTP API", () => {
     expect(after.body.profile).toEqual({ name: "Ada Lovelace", email: "Ada@Example.com" });
   });
 
+  it("saves custom MCP servers and never echoes headers back", async () => {
+    const servers = [
+      {
+        name: "notion",
+        transport: "http",
+        url: "https://api.example.com/mcp/notion",
+        headers: { Authorization: "Bearer secret-token-123" },
+        enabled: true,
+      },
+      {
+        name: "deepwiki",
+        transport: "sse",
+        url: "https://api.example.com/mcp/deepwiki",
+        enabled: false,
+      },
+    ];
+
+    const put = await api("PUT", "/api/config", { mcpServers: servers });
+    expect(put.status).toBe(200);
+    expect(put.body.mcpServers).toHaveLength(2);
+    expect(put.body.mcpServers[0]).toMatchObject({
+      name: "notion",
+      transport: "http",
+      url: "https://api.example.com/mcp/notion",
+      enabled: true,
+      hasHeaders: true,
+    });
+    expect(put.body.mcpServers[0].headers).toBeUndefined();
+    expect(JSON.stringify(put.body)).not.toContain("secret-token-123");
+    expect(JSON.stringify(put.body)).not.toContain("Bearer");
+
+    const after = await api("GET", "/api/config");
+    expect(after.body.mcpServers).toHaveLength(2);
+    expect(after.body.mcpServers[0]).toMatchObject({
+      name: "notion",
+      transport: "http",
+      url: "https://api.example.com/mcp/notion",
+      enabled: true,
+      hasHeaders: true,
+    });
+    expect(after.body.mcpServers[1]).toMatchObject({
+      name: "deepwiki",
+      transport: "sse",
+      url: "https://api.example.com/mcp/deepwiki",
+      enabled: false,
+      hasHeaders: false,
+    });
+    expect(JSON.stringify(after.body)).not.toContain("secret-token-123");
+  });
+
   it("404s unknown routes with the route in the error", async () => {
     const res = await api("GET", "/api/definitely-not-a-route");
     expect(res.status).toBe(404);
