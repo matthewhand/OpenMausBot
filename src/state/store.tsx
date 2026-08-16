@@ -160,10 +160,14 @@ export interface ConfigStatus {
   xai?: { configured: boolean };
   composio: { configured: boolean; apiKeyConfigured?: boolean };
   box: { configured: boolean };
-  /** Voice (ElevenLabs). `configured` = a key is saved; `ready` = a key AND
-   * a voice, which is what it takes to actually speak. The key itself is
-   * never echoed back. */
-  tts?: { configured: boolean; ready: boolean; voice: string };
+  /** Voice synthesis with provider selection (ElevenLabs or OpenAI-compatible) */
+  tts?: {
+    configured: boolean;
+    ready: boolean;
+    voice: string;
+    provider: "elevenlabs" | "openai";
+    baseUrl?: string;
+  };
   /** who's using the app — collected in onboarding, shown in the sidebar */
   profile?: { name: string; email: string };
   /** Network/remote access settings. Token is never echoed back. */
@@ -172,8 +176,18 @@ export interface ConfigStatus {
     host: string;
     authConfigured: boolean;
     corsOrigin?: string;
+    runAsService: boolean;
     isLoopback: boolean;
   };
+  /** Custom MCP servers (headers redacted) */
+  mcpServers?: Array<{
+    id: string;
+    name: string;
+    url: string;
+    transport: "http" | "stdio" | "sse";
+    enabled: boolean;
+    hasHeaders: boolean;
+  }>;
 }
 
 /** How an engine gets installed — declared by its driver, mirrors
@@ -202,7 +216,7 @@ export interface InstanceInfo {
   install?: EngineInstall;
 }
 
-export type AppSettingsSection = "general" | "connections" | "voice" | "computer" | "network";
+export type AppSettingsSection = "general" | "connections" | "voice" | "computer" | "network" | "tools";
 
 interface AppState {
   bots: Bot[];

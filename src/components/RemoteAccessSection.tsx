@@ -39,6 +39,7 @@ export function RemoteAccessSection() {
   const [enabled, setEnabled] = useState(network?.enabled ?? false);
   const [host, setHost] = useState(network?.host || "127.0.0.1");
   const [corsOrigin, setCorsOrigin] = useState(network?.corsOrigin || "");
+  const [runAsService, setRunAsService] = useState(network?.runAsService ?? false);
   const [newToken, setNewToken] = useState<string>("");
   const [showToken, setShowToken] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -50,6 +51,7 @@ export function RemoteAccessSection() {
       setEnabled(network.enabled);
       setHost(network.host);
       setCorsOrigin(network.corsOrigin || "");
+      setRunAsService(network.runAsService);
     }
   }, [network]);
 
@@ -87,6 +89,7 @@ export function RemoteAccessSection() {
           enabled,
           host: host.trim(),
           corsOrigin: corsOrigin.trim() || undefined,
+          runAsService,
         },
       };
 
@@ -312,6 +315,41 @@ export function RemoteAccessSection() {
           className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[14px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
         />
       </Card>
+
+      {/* Windows Service (Windows only) */}
+      {typeof window !== "undefined" && (window as any).ogb?.platform === "win32" && (
+        <Card
+          title="Run as Windows Service (Optional)"
+          subtitle="Start OpenMausBot automatically on system boot"
+        >
+          <div className="flex flex-col gap-3">
+            <label className="flex items-center gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={runAsService}
+                onChange={(e) => setRunAsService(e.target.checked)}
+                className="w-4 h-4"
+              />
+              <span className="text-[13px] text-ink">
+                Install as Windows service (requires admin rights)
+              </span>
+            </label>
+            <p className="text-[11px] text-ink-secondary">
+              When enabled, OpenMausBot will start automatically with Windows. Requires NSSM (Non-Sucking Service Manager) to be installed.
+              Must configure LAN access and auth token first.
+            </p>
+            {runAsService && (
+              <div className="flex gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+                <AlertTriangle size={16} className="text-amber-500 mt-0.5 shrink-0" />
+                <div className="text-[12px] text-ink-secondary">
+                  <strong className="text-ink">Note:</strong> Service installation must be done manually using the provided scripts after saving these settings.
+                  See documentation for setup instructions.
+                </div>
+              </div>
+            )}
+          </div>
+        </Card>
+      )}
 
       {/* Error Display */}
       {error && (

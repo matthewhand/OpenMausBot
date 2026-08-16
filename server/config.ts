@@ -15,9 +15,17 @@ export interface AppConfig {
    * catalog with official logos in the plugins marketplace. */
   composio?: { key?: string; apiKey?: string; url?: string };
   box?: { token?: string };
-  /** Voice (ElevenLabs). `key` is the credential and is never echoed back;
-   * `voice` is the chosen voice id, which is a setting, not a secret. */
-  tts?: { key?: string; voice?: string };
+  /** Voice synthesis provider. Supports ElevenLabs and OpenAI-compatible endpoints.
+   * `provider`: "elevenlabs" or "openai" (default: "elevenlabs")
+   * `key`: API key (optional for local servers)
+   * `baseUrl`: Base URL for OpenAI-compatible servers (default: "http://127.0.0.1:9093/v1")
+   * `voice`: Voice ID or name (setting, not a secret) */
+  tts?: {
+    provider?: "elevenlabs" | "openai";
+    key?: string;
+    baseUrl?: string;
+    voice?: string;
+  };
   /** The person using the app (collected in onboarding, shown in the
    * sidebar). Not a secret — echoed back by GET /api/config. */
   profile?: { name?: string; email?: string };
@@ -26,13 +34,25 @@ export interface AppConfig {
    * `enabled`: Whether LAN access is enabled (default: false)
    * `host`: Bind address (default: "127.0.0.1", can be "0.0.0.0" for LAN)
    * `authToken`: Bearer token for authentication (required when enabled)
-   * `corsOrigin`: Optional CORS origin for web clients */
+   * `corsOrigin`: Optional CORS origin for web clients
+   * `runAsService`: Whether to run as Windows service (Windows only) */
   network?: {
     enabled?: boolean;
     host?: string;
     authToken?: string;
     corsOrigin?: string;
+    runAsService?: boolean;
   };
+  /** Custom MCP (Model Context Protocol) servers.
+   * Each entry defines a remote tool server with name, URL, transport, and optional headers. */
+  mcpServers?: Array<{
+    id: string;
+    name: string;
+    url: string;
+    transport: "http" | "stdio" | "sse";
+    enabled: boolean;
+    headers?: Record<string, string>;
+  }>;
 }
 
 // OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.
@@ -85,9 +105,13 @@ export function saveConfig(patch: Partial<AppConfig>): void {
   } catch {
     /* first write */
   }
-  for (const key of ["xai", "composio", "box", "tts", "profile", "network"] as const) {
-    if (patch[key] && typeof patch[key] === "object") {
-      disk[key] = { ...(disk[key] as object), ...patch[key] };
+  for (const key of ["xai", "composio", "box", "tts", "profile", "network", "mcpServers"] as const) {
+    if (patch[key] !== undefined) {
+      if (typeof patch[key] === "object" && !Array.isArray(patch[key])) {
+        disk[key] = { ...(disk[key] as object), ...patch[key] };
+      } else {
+        disk[key] = patch[key];
+      }
     }
   }
   mkdirSync(DATA_DIR, { recursive: true });

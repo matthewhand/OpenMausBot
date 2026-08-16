@@ -875,9 +875,12 @@ function configStatus() {
     xai: { configured: Boolean(cfg.xai?.key) },
     composio: { configured: Boolean(cfg.composio?.key), apiKeyConfigured: Boolean(cfg.composio?.apiKey) },
     box: { configured: Boolean(cfg.box?.token) },
-    // the chosen voice is a setting, not a secret; the key is reported the
-    // same configured-or-not way as every other credential
-    tts: tts.describeVoice(cfg),
+    // Voice with provider selection support (ElevenLabs or OpenAI-compatible)
+    tts: {
+      ...tts.describeVoice(cfg),
+      provider: cfg.tts?.provider || "elevenlabs",
+      baseUrl: cfg.tts?.baseUrl,
+    },
     // not a secret — the sidebar shows it
     profile: { name: cfg.profile?.name ?? "", email: cfg.profile?.email ?? "" },
     // Network settings (redact token, show status and non-sensitive config)
@@ -886,10 +889,20 @@ function configStatus() {
       host: cfg.network?.host || "127.0.0.1",
       authConfigured: Boolean(cfg.network?.authToken),
       corsOrigin: cfg.network?.corsOrigin,
+      runAsService: cfg.network?.runAsService ?? false,
       isLoopback: (cfg.network?.host || "127.0.0.1") === "127.0.0.1" || 
                    (cfg.network?.host || "127.0.0.1") === "localhost" ||
                    (cfg.network?.host || "127.0.0.1") === "::1",
     },
+    // MCP servers (redact headers that might contain auth tokens)
+    mcpServers: (cfg.mcpServers || []).map(server => ({
+      id: server.id,
+      name: server.name,
+      url: server.url,
+      transport: server.transport,
+      enabled: server.enabled,
+      hasHeaders: Boolean(server.headers && Object.keys(server.headers).length > 0),
+    })),
   };
 }
 
@@ -1558,14 +1571,16 @@ const server = createServer(async (req, res) => {
     }
     if ((method === "PUT" || method === "PATCH") && path === "/api/config") {
       const body = await readBody(req);
-      const patch: Record<string, object> = {};
-      for (const key of ["xai", "composio", "box", "tts", "profile", "network"] as const) {
-        if (body[key] && typeof body[key] === "object") patch[key] = body[key];
+      const patch: Record<string, unknown> = {};
+      for (const key of ["xai", "composio", "box", "tts", "profile", "network", "mcpServers"] as const) {
+        if (body[key] !== undefined) {
+          patch[key] = body[key];
+        }
       }
       if (!Object.keys(patch).length) return json(res, 400, { error: "nothing to save" });
       
       // Validate network settings if provided
-      if (patch.network) {
+      if (patch.network && typeof patch.network === "object") {
         const net = patch.network as any;
         
         // If enabling LAN, require an auth token
@@ -1595,6 +1610,19 @@ const server = createServer(async (req, res) => {
         }
       }
       
+      // Validate MCP servers if provided
+      if (patch.mcpServers && Array.isArray(patch.mcpServers)) {
+        const servers = patch.mcpServers as any[];
+        for (const server of servers) {
+          if (!server.id || !server.name || !server.url || !server.transport) {
+            return json(res, 400, { error: "MCP server must have id, name, url, and transport" });
+          }
+          if (!["http", "stdio", "sse"].includes(server.transport)) {
+            return json(res, 400, { error: "MCP transport must be http, stdio, or sse" });
+          }
+        }
+      }
+      
       // check a box token against the provider before storing it: a
       // rejected token used to save happily and only surface as a 401 in
       // another panel later, with nothing the user could act on
@@ -1606,18 +1634,22 @@ const server = createServer(async (req, res) => {
       // same rule for a voice key — and check it against the provider the
       // patch SELECTS, not the one already saved, or pasting a Cartesia key
       // while switching from ElevenLabs validates against the wrong service
-      const newTts = patch.tts as { key?: unknown } | undefined;
+      const newTts = patch.tts as { key?: unknown; provider?: string } | undefined;
       if (typeof newTts?.key === "string" && newTts.key.trim()) {
-        const check = await tts.verifyKey(newTts.key.trim());
-        if (!check.ok) return json(res, 400, { error: check.message });
+        const provider = (newTts.provider || cfg.tts?.provider || "elevenlabs") as "elevenlabs" | "openai";
+        if (provider === "elevenlabs") {
+          const check = await tts.verifyKey(newTts.key.trim());
+          if (!check.ok) return json(res, 400, { error: check.message });
+        }
+        // OpenAI-compatible providers: skip verification (local servers may not be running yet)
       }
       saveConfig(patch);
       Object.assign(cfg, loadConfig());
       // provider keys change the fleet; a profile or voice edit must not
       // kill in-flight turns with a pointless reload — no driver reads
       // either, and picking a voice mid-turn should be free
-      // Network changes also require a restart, but we don't reload providers
-      if (Object.keys(patch).some((k) => k !== "profile" && k !== "tts" && k !== "network")) {
+      // Network and MCP changes also don't require provider reload
+      if (Object.keys(patch).some((k) => k !== "profile" && k !== "tts" && k !== "network" && k !== "mcpServers")) {
         await reloadProviders();
       }
       
