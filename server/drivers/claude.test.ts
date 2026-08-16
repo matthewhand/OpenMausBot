@@ -164,6 +164,100 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(allowed).toContain("mcp__agents");
   });
 
+  it("mounts custom remote MCP servers (HTTP/SSE) and pre-allows their tools", async () => {
+    await create();
+    const dump = join(scratch, "dump.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-custom-mcp",
+      text: "hi",
+      integrations: {
+        mcpServers: [
+          {
+            name: "notion",
+            transport: "http",
+            url: "https://api.example.com/mcp/notion",
+            headers: { Authorization: "Bearer secret-token" },
+            enabled: true,
+          },
+          {
+            name: "deepwiki",
+            transport: "sse",
+            url: "https://api.example.com/mcp/deepwiki",
+            enabled: true,
+          },
+          {
+            name: "disabled-server",
+            transport: "http",
+            url: "https://disabled.example.com/mcp",
+            enabled: false,
+          },
+        ],
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    const mcpConfig = JSON.parse(seen.argv[seen.argv.indexOf("--mcp-config") + 1]);
+    
+    // Enabled servers are mounted
+    expect(mcpConfig.mcpServers.notion).toMatchObject({
+      type: "http",
+      url: "https://api.example.com/mcp/notion",
+      headers: { Authorization: "Bearer secret-token" },
+    });
+    expect(mcpConfig.mcpServers.deepwiki).toMatchObject({
+      type: "sse",
+      url: "https://api.example.com/mcp/deepwiki",
+    });
+    
+    // Disabled server is not mounted
+    expect(mcpConfig.mcpServers["disabled-server"]).toBeUndefined();
+    
+    // Tools are pre-allowed
+    const allowed = seen.argv[seen.argv.indexOf("--allowedTools") + 1];
+    expect(allowed).toContain("mcp__notion");
+    expect(allowed).toContain("mcp__deepwiki");
+    expect(allowed).not.toContain("mcp__disabled-server");
+  });
+
+  it("mounts Composio alongside custom MCP servers when both are present", async () => {
+    await create();
+    const dump = join(scratch, "dump.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-both",
+      text: "hi",
+      integrations: {
+        composio: { key: "ck_test123" },
+        mcpServers: [
+          { name: "custom", transport: "http", url: "https://custom.example.com/mcp", enabled: true },
+        ],
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    const mcpConfig = JSON.parse(seen.argv[seen.argv.indexOf("--mcp-config") + 1]);
+    
+    // Both are mounted
+    expect(mcpConfig.mcpServers.custom).toMatchObject({
+      type: "http",
+      url: "https://custom.example.com/mcp",
+    });
+    expect(mcpConfig.mcpServers.composio).toMatchObject({
+      type: "http",
+      url: "https://connect.composio.dev/mcp",
+      headers: { "x-consumer-api-key": "ck_test123" },
+    });
+    
+    const allowed = seen.argv[seen.argv.indexOf("--allowedTools") + 1];
+    expect(allowed).toContain("mcp__custom");
+    expect(allowed).toContain("mcp__composio");
+  });
+
   it("resumes with --resume when a cursor exists and reports that session id", async () => {
     await create();
     const dump = join(scratch, "dump.json");

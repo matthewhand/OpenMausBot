@@ -8,6 +8,16 @@ import { join } from "node:path";
 import { writeFileAtomic } from "./atomic.ts";
 import type { InstanceConfigMap } from "./contracts.ts";
 
+export interface McpServer {
+  name: string;
+  transport: "http" | "sse";
+  url: string;
+  /** Optional headers (e.g. Authorization, API keys) — stored on the harness,
+   * never echoed back in GET /api/config (same write-only rule as other secrets). */
+  headers?: Record<string, string>;
+  enabled?: boolean;
+}
+
 export interface AppConfig {
   xai?: { key?: string; url?: string };
   /** key = ck_… Connect consumer key (connections + agent tools);
@@ -21,6 +31,9 @@ export interface AppConfig {
   /** The person using the app (collected in onboarding, shown in the
    * sidebar). Not a secret — echoed back by GET /api/config. */
   profile?: { name?: string; email?: string };
+  /** Custom remote MCP servers: user-configured HTTP or SSE servers. Persisted
+   * in ~/.openmausbot/config.json; headers are write-only like other secrets. */
+  mcpServers?: McpServer[];
   instances?: InstanceConfigMap;
 }
 
@@ -71,6 +84,10 @@ export function saveConfig(patch: Partial<AppConfig>): void {
     if (patch[key] && typeof patch[key] === "object") {
       disk[key] = { ...(disk[key] as object), ...patch[key] };
     }
+  }
+  // mcpServers is an array, not an object to merge — replace wholesale
+  if (Array.isArray(patch.mcpServers)) {
+    disk.mcpServers = patch.mcpServers;
   }
   mkdirSync(DATA_DIR, { recursive: true });
   writeFileAtomic(p, JSON.stringify(disk, null, 2));

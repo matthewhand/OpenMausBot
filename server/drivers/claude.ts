@@ -262,6 +262,22 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // acceptEdits run silently denies anything unlisted)
       const mcpServers: Record<string, unknown> = {};
       const allowed: string[] = [];
+      
+      // Custom remote MCP servers (user-configured HTTP/SSE)
+      if (turn.integrations?.mcpServers) {
+        for (const server of turn.integrations.mcpServers) {
+          if (!server.enabled) continue;
+          const headers = server.headers ?? {};
+          mcpServers[server.name] = {
+            type: server.transport,
+            url: server.url,
+            ...(Object.keys(headers).length ? { headers } : {}),
+          };
+          allowed.push(`mcp__${server.name}`);
+        }
+      }
+      
+      // Composio (optional preset)
       if (turn.integrations?.composio?.key) {
         mcpServers.composio = {
           type: "http",
