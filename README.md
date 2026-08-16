@@ -130,8 +130,9 @@ Press the speaker on any reply, or switch a bot to read its answers out as they 
 to what ran overnight while you make breakfast. Hit **call** and it's a conversation: it hears you, tells
 you what it's doing while it works, and asks for approvals out loud.
 
-Bring your own ElevenLabs key — paste it once in App Settings, pick a voice, and every bot can talk.
-Give a bot its own voice and a room stops sounding like one person.
+Choose your TTS provider: **ElevenLabs** (cloud, high quality) or **OpenAI-compatible** (local servers like
+Kokoro, or any service using the OpenAI audio API). Paste your credentials once in App Settings, pick a
+voice, and every bot can talk. Give a bot its own voice and a room stops sounding like one person.
 
 **Also in the box:** streaming replies with tool-run activity chips · native macOS dictation from the
 composer mic (on-device Apple speech recognition — desktop app) · SupaMaus cursor mascots with role-aware
@@ -231,7 +232,7 @@ in the sidebar footer) when you want to enable its integration:
 | Composio Connect key (`ck_…`) | Connect Gmail, GitHub, Slack, Notion, and other apps to your bots | [Composio Connect setup guide](https://docs.composio.dev/docs/composio-connect) |
 | Composio API key (`ak_…`) | Browse the full app catalog with official names and logos | [Composio project API key guide](https://docs.composio.dev/reference/authenticating-to-composio/project-api-key-permissions) |
 | Box API key | Give bots an isolated remote Linux computer with a desktop and terminal | [Box API key guide](https://docs.ascii.dev/box/api-keys) |
-| ElevenLabs key | Read replies aloud, and call your bots | [ElevenLabs API keys](https://elevenlabs.io/app/settings/api-keys) |
+| TTS provider | Read replies aloud and call your bots — choose ElevenLabs or OpenAI-compatible (Kokoro, etc.) | [ElevenLabs keys](https://elevenlabs.io/app/settings/api-keys) or [local Kokoro setup](docs/voice-mode.md) |
 
 Composio and Box are third-party services with their own accounts and terms. Box is a paid service after
 its trial, and using a cloud computer may incur charges.
@@ -250,8 +251,9 @@ pnpm package:linux # Ubuntu x64 .deb + AppImage → release/
 Early but real — the loop works end to end: message → agent → streamed reply → tools → approvals →
 computer use. macOS and Windows have released builds; Ubuntu 24.04 x64 packages are in beta with the
 capability limits above. Rough edges to expect: routines are a placeholder and sidebar sections aren't built yet.
-Voice needs an ElevenLabs key, and calls are macOS-only for now (they ride the same on-device dictation as
-the composer mic) — see [`docs/voice-mode.md`](docs/voice-mode.md) for the design and the known gaps.
+Voice supports ElevenLabs and OpenAI-compatible providers (like local Kokoro), and calls are macOS-only for
+now (they ride the same on-device dictation as the composer mic) — see [`docs/voice-mode.md`](docs/voice-mode.md)
+for the design and the known gaps.
 
 Contributions welcome — the driver SPI in [`server/contracts.ts`](server/contracts.ts) is deliberately
 small; adding a provider is one file in [`server/drivers/`](server/drivers/) plus a one-line registration.
