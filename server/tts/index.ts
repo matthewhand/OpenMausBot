@@ -92,17 +92,20 @@ export async function listVoices(cfg: AppConfig): Promise<elevenlabs.Voice[]> {
  * to speak with, which the route turns into a 409 the client can explain. */
 export function speak(cfg: AppConfig, text: string, voiceId?: string) {
   const provider = getProvider(cfg);
-  const voice = voiceId || cfg.tts?.voice;
-  if (!voice) throw new NoVoiceConfigured("voice", provider);
 
   if (provider === "openai-compatible") {
     const baseUrl = cfg.tts?.baseUrl;
     if (!baseUrl) throw new NoVoiceConfigured("baseUrl", provider);
+    const voice = voiceId || cfg.tts?.voice;
+    if (!voice) throw new NoVoiceConfigured("voice", provider);
     return openaiCompatible.synthesize(text, voice, baseUrl, cfg.tts?.key);
   }
 
+  // ElevenLabs: check key first, then voice (matches the original behavior)
   const key = cfg.tts?.key;
   if (!key) throw new NoVoiceConfigured("key", provider);
+  const voice = voiceId || cfg.tts?.voice;
+  if (!voice) throw new NoVoiceConfigured("voice", provider);
   return elevenlabs.synthesize(text, voice, key);
 }
 
