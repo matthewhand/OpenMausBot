@@ -47,6 +47,22 @@ const MIME: Record<string, string> = {
 
 ensureDirs();
 const cfg = loadConfig();
+
+// Determine bind address and authentication from config
+const BIND_HOST = cfg.network?.host || "127.0.0.1";
+const LAN_ENABLED = cfg.network?.enabled ?? false;
+const AUTH_TOKEN = cfg.network?.authToken;
+const CORS_ORIGIN = cfg.network?.corsOrigin;
+
+// Security check: warn if binding to non-loopback without auth
+const isLoopback = BIND_HOST === "127.0.0.1" || BIND_HOST === "localhost" || BIND_HOST === "::1";
+if (!isLoopback && !AUTH_TOKEN) {
+  console.warn("⚠️  WARNING: Binding to non-loopback address without authentication token!");
+  console.warn("   Set OMB_AUTH_TOKEN or configure auth in App Settings → Remote Access");
+}
+if (!isLoopback && LAN_ENABLED && AUTH_TOKEN) {
+  console.log(`🌐 LAN access enabled on ${BIND_HOST}:${PORT} with authentication`);
+}
 const registry = new ProviderRegistry(BUILT_IN_DRIVERS);
 await registry.load(instanceConfigs(cfg));
 
@@ -864,6 +880,16 @@ function configStatus() {
     tts: tts.describeVoice(cfg),
     // not a secret — the sidebar shows it
     profile: { name: cfg.profile?.name ?? "", email: cfg.profile?.email ?? "" },
+    // Network settings (redact token, show status and non-sensitive config)
+    network: {
+      enabled: cfg.network?.enabled ?? false,
+      host: cfg.network?.host || "127.0.0.1",
+      authConfigured: Boolean(cfg.network?.authToken),
+      corsOrigin: cfg.network?.corsOrigin,
+      isLoopback: (cfg.network?.host || "127.0.0.1") === "127.0.0.1" || 
+                   (cfg.network?.host || "127.0.0.1") === "localhost" ||
+                   (cfg.network?.host || "127.0.0.1") === "::1",
+    },
   };
 }
 
@@ -891,6 +917,22 @@ async function reloadProviders() {
 }
 
 // ── HTTP plumbing ─────────────────────────────────────────────────────
+/** Check if the request is authenticated when AUTH_TOKEN is set.
+ * Returns true if authenticated or no auth is required. */
+function isAuthenticated(req: IncomingMessage): boolean {
+  // No auth token configured = no authentication required (localhost-only mode)
+  if (!AUTH_TOKEN) return true;
+  
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return false;
+  
+  // Support Bearer token format
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  const token = match ? match[1] : authHeader;
+  
+  return token === AUTH_TOKEN;
+}
+
 function json(res: ServerResponse, status: number, body: unknown) {
   const data = JSON.stringify(body);
   res.writeHead(status, { "content-type": "application/json" });
@@ -938,7 +980,31 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
   const path = url.pathname;
   const method = req.method ?? "GET";
+  
+  // CORS support when configured
+  if (CORS_ORIGIN) {
+    res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.setHeader("Access-Control-Max-Age", "86400");
+    
+    // Handle preflight requests
+    if (method === "OPTIONS") {
+      res.writeHead(204);
+      return res.end();
+    }
+  }
+  
   try {
+    // Authentication check for API endpoints (except health check)
+    if (path.startsWith("/api/") && path !== "/api/health") {
+      if (!isAuthenticated(req)) {
+        return json(res, 401, { 
+          error: "Unauthorized. Provide a valid Bearer token in the Authorization header." 
+        });
+      }
+    }
+    
     // ── internal peer-agent comms (localhost + shared token only) ──────
     // The agents-proxy (spawned inside a bot's agent process) calls these to
     // discover peers and hand a message to one. Not part of the public API.
@@ -1493,10 +1559,42 @@ const server = createServer(async (req, res) => {
     if ((method === "PUT" || method === "PATCH") && path === "/api/config") {
       const body = await readBody(req);
       const patch: Record<string, object> = {};
-      for (const key of ["xai", "composio", "box", "tts", "profile"] as const) {
+      for (const key of ["xai", "composio", "box", "tts", "profile", "network"] as const) {
         if (body[key] && typeof body[key] === "object") patch[key] = body[key];
       }
       if (!Object.keys(patch).length) return json(res, 400, { error: "nothing to save" });
+      
+      // Validate network settings if provided
+      if (patch.network) {
+        const net = patch.network as any;
+        
+        // If enabling LAN, require an auth token
+        if (net.enabled === true && !net.authToken && !cfg.network?.authToken) {
+          return json(res, 400, { 
+            error: "Cannot enable LAN access without an authentication token. Generate a token first." 
+          });
+        }
+        
+        // Validate host format if provided
+        if (net.host && typeof net.host === "string") {
+          const host = net.host.trim();
+          // Basic validation: not empty and looks like an IP or hostname
+          if (!host || (host !== "0.0.0.0" && host !== "127.0.0.1" && host !== "localhost" && 
+                        !/^(\d{1,3}\.){3}\d{1,3}$/.test(host) && !/^[a-z0-9.-]+$/i.test(host))) {
+            return json(res, 400, { 
+              error: "Invalid host address. Use 127.0.0.1 (localhost), 0.0.0.0 (all interfaces), or a valid IP/hostname." 
+            });
+          }
+        }
+        
+        // Warn about enabling non-loopback binding
+        const targetHost = net.host || cfg.network?.host || "127.0.0.1";
+        const isLoopback = targetHost === "127.0.0.1" || targetHost === "localhost" || targetHost === "::1";
+        if (net.enabled === true && !isLoopback) {
+          console.warn(`⚠️  LAN access enabled on ${targetHost}. Ensure firewall is properly configured.`);
+        }
+      }
+      
       // check a box token against the provider before storing it: a
       // rejected token used to save happily and only surface as a 401 in
       // another panel later, with nothing the user could act on
@@ -1518,7 +1616,16 @@ const server = createServer(async (req, res) => {
       // provider keys change the fleet; a profile or voice edit must not
       // kill in-flight turns with a pointless reload — no driver reads
       // either, and picking a voice mid-turn should be free
-      if (Object.keys(patch).some((k) => k !== "profile" && k !== "tts")) await reloadProviders();
+      // Network changes also require a restart, but we don't reload providers
+      if (Object.keys(patch).some((k) => k !== "profile" && k !== "tts" && k !== "network")) {
+        await reloadProviders();
+      }
+      
+      // If network settings changed, notify user that restart is required
+      if (patch.network) {
+        console.log("⚠️  Network settings updated. Restart OpenMausBot to apply changes.");
+      }
+      
       const status = configStatus();
       broadcast({ kind: "config", ...status });
       return json(res, 200, status);
@@ -1635,8 +1742,17 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`openmausbot server on http://127.0.0.1:${PORT}`);
+server.listen(PORT, BIND_HOST, () => {
+  const actualHost = BIND_HOST === "0.0.0.0" ? "0.0.0.0 (all interfaces)" : BIND_HOST;
+  console.log(`openmausbot server on http://${actualHost}:${PORT}`);
+  if (!isLoopback) {
+    console.log(`⚠️  Server is accessible on the network at http://${BIND_HOST}:${PORT}`);
+    if (AUTH_TOKEN) {
+      console.log("   Authentication is enabled.");
+    } else {
+      console.log("   ⚠️  WARNING: No authentication configured! Set an auth token in App Settings.");
+    }
+  }
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {

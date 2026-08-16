@@ -169,10 +169,48 @@ flowchart LR
 |---|---|---|
 | Drivers | `server/drivers/` | One per provider: Claude, Codex, and Grok Build over their local CLIs (stream-JSON / JSON-RPC / ACP), plus a cloud-computer agent. Unknown drivers degrade to "unavailable", never crash the fleet. |
 | Harness | `server/harness/` | Registry (configs → live instances) and the fan-in event bus every client folds. |
-| API | `server/index.ts` | Bots, turns, approvals, model catalog, computer lifecycle, connectors, config — HTTP + SSE. |
+| API | `server/index.ts` | Bots, turns, approvals, model catalog, computer lifecycle, connectors, config — HTTP + SSE. Supports optional LAN access with authentication. |
 | Voice | `server/tts/` | ElevenLabs, bring your own key. Runs on the harness so the key never reaches the UI; markdown is rewritten into something worth hearing before it is spoken. |
 | App | `src/` | The chat shell. Server-backed store, one reducer, zero client-side transports. |
 | Desktop | `electron/` | macOS, Windows, and Ubuntu shells with an embedded harness and explicit platform capabilities; Apple speech, local screen capture, and the current CUA bridge remain macOS-only. |
+
+## Remote Access / LAN Web UI
+
+**Default: localhost-only (secure).** The web UI binds to `127.0.0.1:8799` by default and is only
+accessible from the same machine. To enable LAN access from other devices on your network:
+
+1. Open **App Settings → Remote Access**
+2. Generate an authentication token (required for security)
+3. Choose bind address:
+   - `127.0.0.1` — localhost only (default, most secure)
+   - `0.0.0.0` — all network interfaces (LAN accessible)
+4. Enable LAN access
+5. Save and **restart OpenMausBot**
+
+**Security:**
+- Authentication token is **required** before enabling LAN access
+- Unauthenticated API requests are rejected with HTTP 401
+- Token is stored securely and never echoed back after initial creation
+- CORS can be configured for web clients
+- Health check endpoint (`/api/health`) remains public for monitoring
+
+**Accessing from another device:**
+```bash
+# Example with curl (replace with your token and IP)
+curl -H "Authorization: Bearer your-token-here" http://192.168.1.100:8799/api/bots
+```
+
+**Environment variable overrides** (for advanced use):
+```bash
+OMB_HOST=0.0.0.0              # Bind address
+OMB_AUTH_TOKEN=your-token     # Authentication token
+OMB_CORS_ORIGIN=https://...   # CORS origin for web clients
+OMB_PORT=8799                 # Server port (default: 8799)
+```
+
+**Threat model:** LAN access is designed for trusted local networks (home/office LAN). The Bearer
+token is a shared secret. This is **not** a replacement for HTTPS/TLS on hostile networks.
+Future releases may add TLS support and more advanced authentication.
 
 ## Quick start
 

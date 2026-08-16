@@ -22,6 +22,17 @@ export interface AppConfig {
    * sidebar). Not a secret — echoed back by GET /api/config. */
   profile?: { name?: string; email?: string };
   instances?: InstanceConfigMap;
+  /** Network settings for LAN/remote access. Default is localhost-only.
+   * `enabled`: Whether LAN access is enabled (default: false)
+   * `host`: Bind address (default: "127.0.0.1", can be "0.0.0.0" for LAN)
+   * `authToken`: Bearer token for authentication (required when enabled)
+   * `corsOrigin`: Optional CORS origin for web clients */
+  network?: {
+    enabled?: boolean;
+    host?: string;
+    authToken?: string;
+    corsOrigin?: string;
+  };
 }
 
 // OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.
@@ -54,6 +65,13 @@ export function loadConfig(): AppConfig {
   cfg.composio = { key: process.env.COMPOSIO_KEY, ...cfg.composio };
   cfg.box = { token: process.env.BOX_TOKEN, ...cfg.box };
   cfg.tts = { key: process.env.OMB_TTS_KEY, ...cfg.tts };
+  // Network settings with env fallbacks (OMB_HOST, OMB_AUTH_TOKEN, OMB_CORS_ORIGIN)
+  cfg.network = {
+    enabled: cfg.network?.enabled ?? false,
+    host: process.env.OMB_HOST || cfg.network?.host || "127.0.0.1",
+    authToken: process.env.OMB_AUTH_TOKEN || cfg.network?.authToken,
+    corsOrigin: process.env.OMB_CORS_ORIGIN || cfg.network?.corsOrigin,
+  };
   return cfg;
 }
 
@@ -67,7 +85,7 @@ export function saveConfig(patch: Partial<AppConfig>): void {
   } catch {
     /* first write */
   }
-  for (const key of ["xai", "composio", "box", "tts", "profile"] as const) {
+  for (const key of ["xai", "composio", "box", "tts", "profile", "network"] as const) {
     if (patch[key] && typeof patch[key] === "object") {
       disk[key] = { ...(disk[key] as object), ...patch[key] };
     }

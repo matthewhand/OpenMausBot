@@ -166,6 +166,14 @@ export interface ConfigStatus {
   tts?: { configured: boolean; ready: boolean; voice: string };
   /** who's using the app — collected in onboarding, shown in the sidebar */
   profile?: { name: string; email: string };
+  /** Network/remote access settings. Token is never echoed back. */
+  network?: {
+    enabled: boolean;
+    host: string;
+    authConfigured: boolean;
+    corsOrigin?: string;
+    isLoopback: boolean;
+  };
 }
 
 /** How an engine gets installed — declared by its driver, mirrors
@@ -194,7 +202,7 @@ export interface InstanceInfo {
   install?: EngineInstall;
 }
 
-export type AppSettingsSection = "general" | "connections" | "voice" | "computer";
+export type AppSettingsSection = "general" | "connections" | "voice" | "computer" | "network";
 
 interface AppState {
   bots: Bot[];
