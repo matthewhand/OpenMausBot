@@ -32,10 +32,42 @@ function desktopCapabilities({
   env = process.env,
   packaged = false,
   localConnection = null,
+  sttConfig = null,
 } = {}) {
   const hostPlatform = normalizedPlatform(platform);
   const isMac = hostPlatform === "darwin";
   const localAvailable = localComputerReady(hostPlatform, localConnection);
+
+  // Determine STT availability based on config
+  let dictationAvailable = false;
+  let dictationEngine = "none";
+  let dictationOnDevice = false;
+  let dictationReasonCode = undefined;
+
+  if (sttConfig) {
+    const provider = sttConfig.provider || (isMac ? "apple-speech" : "none");
+    if (provider === "openai-whisper" && sttConfig.baseUrl) {
+      dictationAvailable = true;
+      dictationEngine = "openai-whisper";
+      dictationOnDevice = false;
+    } else if (provider === "apple-speech" && isMac) {
+      dictationAvailable = true;
+      dictationEngine = "apple-speech";
+      dictationOnDevice = true;
+    } else if (provider === "openai-whisper" && !sttConfig.baseUrl) {
+      dictationReasonCode = "stt-not-configured";
+    } else if (provider === "apple-speech" && !isMac) {
+      dictationReasonCode = "unsupported-platform";
+    } else {
+      dictationReasonCode = "stt-not-configured";
+    }
+  } else {
+    // No STT config provided — fall back to the old behavior (macOS only)
+    dictationAvailable = isMac;
+    dictationEngine = isMac ? "apple-speech" : "none";
+    dictationOnDevice = isMac;
+    if (!isMac) dictationReasonCode = "unsupported-platform";
+  }
 
   return {
     host: {
@@ -58,10 +90,10 @@ function desktopCapabilities({
       ...(!isMac ? { reasonCode: "unsupported-platform" } : {}),
     },
     dictation: {
-      available: isMac,
-      engine: isMac ? "apple-speech" : "none",
-      onDevice: isMac,
-      ...(!isMac ? { reasonCode: "unsupported-platform" } : {}),
+      available: dictationAvailable,
+      engine: dictationEngine,
+      onDevice: dictationOnDevice,
+      ...(dictationReasonCode ? { reasonCode: dictationReasonCode } : {}),
     },
     localComputer: {
       available: localAvailable,

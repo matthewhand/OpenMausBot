@@ -25,6 +25,7 @@ import { currentCall, deferCallCleanup, endCall, startCall, useOnCall } from "@/
 import { speaker } from "@/lib/tts";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
+import { AudioRecorder } from "@/lib/stt/recorder";
 import { MausAvatar } from "./Avatar";
 import { pendingApprovals } from "./PendingApproval";
 import { cn } from "@/lib/cn";
@@ -65,12 +66,24 @@ export function CallTargetButton({
   const { state, dispatch } = useStore();
   const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
   const active = useOnCall() === targetId;
-  const supported = capabilities.dictation.available && Boolean(window.ogb?.speechStart);
+  
+  // Check STT availability: either Apple Speech (via window.ogb) or OpenAI-compatible Whisper
+  const sttConfig = state.config?.stt;
+  const sttProvider = sttConfig?.provider || (capabilities.host.platform === "darwin" ? "apple-speech" : "none");
+  const sttAvailable = sttConfig?.available ?? false;
+  
+  // Apple Speech requires the native bridge
+  const appleSpeechSupported = sttProvider === "apple-speech" && Boolean(window.ogb?.speechStart);
+  // OpenAI-compatible Whisper works in any desktop app (uses WebRTC)
+  const whisperSupported = sttProvider === "openai-whisper" && sttAvailable;
+  
+  const supported = appleSpeechSupported || whisperSupported;
   const configured = Boolean(state.config?.tts?.configured);
   const voiceReady =
     configured && Boolean(state.config?.tts?.ready || (voices.length > 0 && voices.every((voice) => Boolean(voice))));
   const unavailable = !active && (!capabilitiesReady || !supported || !voiceReady);
   const voiceSetupRequired = capabilitiesReady && supported && !voiceReady;
+  const sttSetupRequired = capabilitiesReady && !supported && configured;
   const [helpOpen, setHelpOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -80,7 +93,9 @@ export function CallTargetButton({
     : !capabilitiesReady
       ? "Checking call availability"
       : !supported
-        ? "Calls currently need the macOS desktop app"
+        ? sttProvider === "apple-speech"
+          ? "Calls with Apple Speech require the macOS desktop app"
+          : "Configure speech-to-text in App Settings to make calls"
         : !configured
           ? "Add an ElevenLabs key in App Settings to make calls"
           : !voiceReady
@@ -89,17 +104,19 @@ export function CallTargetButton({
 
   const reason = !capabilitiesReady
     ? "Checking whether this device can make calls."
-    : !capabilities.dictation.available
-      ? "Calls require OpenMausBot for macOS because speech recognition runs on-device."
-      : !window.ogb?.speechStart
-        ? "The speech service is unavailable in this app build. Restart or update OpenMausBot."
-        : !configured
-          ? "Add an ElevenLabs API key so the bot can speak during calls."
-          : !voiceReady
-            ? voices.length > 1
-              ? "Choose an app voice, or give every room member their own ElevenLabs voice."
-              : "Choose an ElevenLabs voice before starting a call."
-            : "";
+    : !supported
+      ? sttProvider === "apple-speech"
+        ? "Calls with Apple Speech require OpenMausBot for macOS."
+        : sttProvider === "openai-whisper"
+          ? "Configure an OpenAI-compatible Whisper endpoint in App Settings."
+          : "Choose a speech-to-text provider in App Settings (Apple Speech on macOS, or OpenAI-compatible Whisper)."
+      : !configured
+        ? "Add an ElevenLabs API key so the bot can speak during calls."
+        : !voiceReady
+          ? voices.length > 1
+            ? "Choose an app voice, or give every room member their own ElevenLabs voice."
+            : "Choose an ElevenLabs voice before starting a call."
+          : "";
 
   useEffect(() => {
     if (!helpOpen) return;
@@ -160,7 +177,7 @@ export function CallTargetButton({
         >
           <div className="text-[13px] font-medium text-ink">Call unavailable</div>
           <div className="mt-1 text-[12px] leading-[1.45] text-ink-secondary">{reason}</div>
-          {voiceSetupRequired && (
+          {(voiceSetupRequired || sttSetupRequired) && (
             <button
               type="button"
               onClick={() => {
@@ -185,12 +202,22 @@ export function CallOverlay({ bot }: { bot: Bot }) {
 }
 
 function Call({ bot }: { bot: Bot }) {
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
   const speech = useSpeech();
   const initialPhase: Phase = bot.busy ? "working" : "listening";
   const [phase, setPhase] = useState<Phase>(initialPhase);
   const [heard, setHeard] = useState("");
   const [note, setNote] = useState<string | null>(null);
+  
+  // Determine which STT method to use
+  const sttConfig = state.config?.stt;
+  const sttProvider = sttConfig?.provider || (window.ogb?.platform === "darwin" ? "apple-speech" : "openai-whisper");
+  const useAppleSpeech = sttProvider === "apple-speech" && Boolean(window.ogb?.speechStart);
+  const useWebRTC = !useAppleSpeech;
+  
+  // WebRTC recorder (for OpenAI-compatible Whisper)
+  const recorderRef = useRef<AudioRecorder | null>(null);
+  
   const pushToTalk = usePushToTalk(bot.id, phase === "listening", () => {
     setNote("Push to talk couldn't start. Check Microphone and Speech Recognition access.");
   });
@@ -232,20 +259,91 @@ function Call({ bot }: { bot: Bot }) {
   }, []);
 
   const hush = useCallback(() => {
-    void window.ogb?.speechStop();
-  }, []);
+    if (useAppleSpeech) {
+      void window.ogb?.speechStop();
+    } else if (recorderRef.current?.isActive()) {
+      recorderRef.current.stop();
+    }
+  }, [useAppleSpeech]);
 
   const listen = useCallback(() => {
     if (!alive.current || currentCall() !== bot.id) return;
     move("listening");
     setHeard("");
     setNote(null);
-    void window.ogb?.speechStart({ endpointMs: CALL_ENDPOINT_MS }).catch(() => {
-      if (alive.current && currentCall() === bot.id) {
-        setNote("The microphone couldn't start. Check Microphone and Speech Recognition access.");
-      }
-    });
-  }, [bot.id, move]);
+
+    if (useAppleSpeech) {
+      // Use Apple Speech via IPC
+      void window.ogb?.speechStart({ endpointMs: CALL_ENDPOINT_MS }).catch(() => {
+        if (alive.current && currentCall() === bot.id) {
+          setNote("The microphone couldn't start. Check Microphone and Speech Recognition access.");
+        }
+      });
+    } else {
+      // Use WebRTC AudioRecorder
+      const recorder = new AudioRecorder({
+        endpointMs: CALL_ENDPOINT_MS,
+        onTranscript: (text, isFinal) => {
+          if (!alive.current || currentCall() !== bot.id || phaseRef.current !== "listening") return;
+          setHeard(text);
+          if (!isFinal) return;
+
+          // Final result — the user's turn ended
+          const said = text.trim();
+          if (!said) return listen();
+
+          const open = askedApproval.current;
+          if (open) {
+            if (YES.test(said) || NO.test(said)) {
+              const allow = YES.test(said);
+              askedApproval.current = null;
+              dispatch({
+                type: "decideRequest",
+                threadId: bot.threadId,
+                requestId: open,
+                behavior: allow ? "allow" : "deny",
+                message: allow ? undefined : "Denied by the user, on a call.",
+              });
+              move("working");
+              return;
+            }
+            void sayThenListen("Sorry — is that a yes or a no?");
+            return;
+          }
+
+          const openQuestion = askedQuestion.current;
+          if (openQuestion) {
+            askedQuestion.current = null;
+            dispatch({ type: "answerCard", botId: bot.id, messageId: openQuestion.messageId, answer: said });
+            move("working");
+            return;
+          }
+
+          move("sending");
+          dispatch({ type: "send", botId: bot.id, text: said });
+        },
+        onEnd: (code, reason) => {
+          if (!alive.current || currentCall() !== bot.id) return;
+          if (code === 2) {
+            setNote("Speech-to-text is not configured. Please configure it in App Settings.");
+            return;
+          }
+          if (code === 1) {
+            setNote("Dictation failed. Please check your microphone access or STT configuration.");
+            return;
+          }
+          // The recorder ended normally — if we should still be listening, restart
+          if (phaseRef.current === "listening") listen();
+        },
+        onError: (error) => {
+          if (!alive.current || currentCall() !== bot.id) return;
+          setNote(error);
+        },
+      });
+      recorderRef.current = recorder;
+      void recorder.start();
+    }
+  }, [bot.id, bot.threadId, dispatch, move, useAppleSpeech]);
 
   /** Speak, with the microphone closed for the duration (see the header
    * comment — an open mic during playback is a feedback loop). */
@@ -288,6 +386,18 @@ function Call({ bot }: { bot: Bot }) {
 
   // ── the microphone ───────────────────────────────────────────────────
   useEffect(() => {
+    if (!useAppleSpeech) {
+      // WebRTC mode — events are handled in the AudioRecorder callbacks
+      if (bot.busy && !approval && !question) move("working");
+      else listen();
+      return () => {
+        if (recorderRef.current?.isActive()) {
+          recorderRef.current.stop();
+        }
+      };
+    }
+
+    // Apple Speech mode — use IPC events
     const bridge = window.ogb;
     if (!bridge) return;
     const offTranscript = bridge.onSpeechTranscript((line) => {
@@ -363,7 +473,7 @@ function Call({ bot }: { bot: Bot }) {
     // busy/approval are intentionally initial snapshots. Their live changes
     // are handled below without tearing down native event listeners.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bot.id, bot.threadId, dispatch, listen, move, sayThenListen]);
+  }, [bot.id, bot.threadId, dispatch, listen, move, sayThenListen, useAppleSpeech]);
 
   // ── narrate the work, speak the answer, read the approvals ───────────
   useEffect(() => {

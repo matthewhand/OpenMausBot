@@ -18,6 +18,17 @@ export interface AppConfig {
   /** Voice (ElevenLabs). `key` is the credential and is never echoed back;
    * `voice` is the chosen voice id, which is a setting, not a secret. */
   tts?: { key?: string; voice?: string };
+  /** Speech-to-text provider config. Supports Apple Speech (macOS only) or
+   * OpenAI-compatible Whisper. `provider` defaults to "apple-speech" on macOS,
+   * "none" elsewhere. When "openai-whisper" is selected, `baseUrl` is required,
+   * `key` is optional (for unauthenticated local servers), `model` defaults to
+   * "whisper". Keys are never echoed back by GET /api/config. */
+  stt?: {
+    provider?: "apple-speech" | "openai-whisper" | "none";
+    baseUrl?: string;
+    key?: string;
+    model?: string;
+  };
   /** The person using the app (collected in onboarding, shown in the
    * sidebar). Not a secret — echoed back by GET /api/config. */
   profile?: { name?: string; email?: string };
@@ -54,6 +65,12 @@ export function loadConfig(): AppConfig {
   cfg.composio = { key: process.env.COMPOSIO_KEY, ...cfg.composio };
   cfg.box = { token: process.env.BOX_TOKEN, ...cfg.box };
   cfg.tts = { key: process.env.OMB_TTS_KEY, ...cfg.tts };
+  cfg.stt = {
+    baseUrl: process.env.OMB_STT_BASE_URL,
+    key: process.env.OMB_STT_KEY,
+    model: process.env.OMB_STT_MODEL,
+    ...cfg.stt,
+  };
   return cfg;
 }
 
@@ -67,7 +84,7 @@ export function saveConfig(patch: Partial<AppConfig>): void {
   } catch {
     /* first write */
   }
-  for (const key of ["xai", "composio", "box", "tts", "profile"] as const) {
+  for (const key of ["xai", "composio", "box", "tts", "stt", "profile"] as const) {
     if (patch[key] && typeof patch[key] === "object") {
       disk[key] = { ...(disk[key] as object), ...patch[key] };
     }

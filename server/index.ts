@@ -29,6 +29,7 @@ import { ProviderRegistry } from "./harness/registry.ts";
 import { mentionedBots, roomResponders, Store, type GroupDefaultResponder, type Message } from "./store.ts";
 import * as tts from "./tts/index.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
+import * as stt from "./stt/index.ts";
 import { readCuaConnection } from "./local-computer.ts";
 import { RoutineManager, type RoutineRunOn } from "./routines.ts";
 
@@ -862,6 +863,8 @@ function configStatus() {
     // the chosen voice is a setting, not a secret; the key is reported the
     // same configured-or-not way as every other credential
     tts: tts.describeVoice(cfg),
+    // STT status — provider, baseUrl, and model are settings; key is never echoed
+    stt: stt.describeSTT(cfg),
     // not a secret — the sidebar shows it
     profile: { name: cfg.profile?.name ?? "", email: cfg.profile?.email ?? "" },
   };
@@ -929,6 +932,34 @@ function readBody(req: IncomingMessage): Promise<any> {
       }
       done = true;
       resolve(body);
+    });
+    req.on("error", (e) => fail(400, e instanceof Error ? e.message : String(e)));
+  });
+}
+
+function readRawBody(req: IncomingMessage, maxBytes: number = 10_000_000): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let done = false;
+    const fail = (status: number, msg: string) => {
+      if (done) return;
+      done = true;
+      const err = Object.assign(new Error(msg), { status });
+      reject(err);
+    };
+    req.on("data", (chunk: Buffer) => {
+      if (done) return;
+      bytes += chunk.length;
+      if (bytes > maxBytes) {
+        return fail(413, "body too large");
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (done) return;
+      done = true;
+      resolve(Buffer.concat(chunks));
     });
     req.on("error", (e) => fail(400, e instanceof Error ? e.message : String(e)));
   });
@@ -1493,7 +1524,7 @@ const server = createServer(async (req, res) => {
     if ((method === "PUT" || method === "PATCH") && path === "/api/config") {
       const body = await readBody(req);
       const patch: Record<string, object> = {};
-      for (const key of ["xai", "composio", "box", "tts", "profile"] as const) {
+      for (const key of ["xai", "composio", "box", "tts", "stt", "profile"] as const) {
         if (body[key] && typeof body[key] === "object") patch[key] = body[key];
       }
       if (!Object.keys(patch).length) return json(res, 400, { error: "nothing to save" });
@@ -1515,10 +1546,10 @@ const server = createServer(async (req, res) => {
       }
       saveConfig(patch);
       Object.assign(cfg, loadConfig());
-      // provider keys change the fleet; a profile or voice edit must not
-      // kill in-flight turns with a pointless reload — no driver reads
-      // either, and picking a voice mid-turn should be free
-      if (Object.keys(patch).some((k) => k !== "profile" && k !== "tts")) await reloadProviders();
+      // provider keys change the fleet; a profile, voice, or STT edit must not
+      // kill in-flight turns with a pointless reload — no driver reads any of
+      // those, and picking a voice mid-turn should be free
+      if (Object.keys(patch).some((k) => k !== "profile" && k !== "tts" && k !== "stt")) await reloadProviders();
       const status = configStatus();
       broadcast({ kind: "config", ...status });
       return json(res, 200, status);
@@ -1565,6 +1596,30 @@ const server = createServer(async (req, res) => {
         if (e instanceof tts.NoVoiceConfigured) return json(res, 409, { error: e.message });
         return json(res, 502, { error: e instanceof Error ? e.message : String(e) });
       }
+    }
+
+    // ── STT endpoints ──
+    if (method === "POST" && path === "/api/stt/transcribe") {
+      try {
+        // Read raw audio data (limit to 10MB for safety)
+        const audioBuffer = await readRawBody(req, 10_000_000);
+        if (audioBuffer.length === 0) {
+          return json(res, 400, { error: "audio data required" });
+        }
+
+        const text = await stt.transcribe(cfg, audioBuffer);
+        return json(res, 200, { text });
+      } catch (e) {
+        // "you haven't set this up yet" is not a provider failure — 409 so
+        // the client can point at App Settings instead of showing a 502
+        if (e instanceof stt.NoSTTConfigured) {
+          return json(res, 409, { error: e.message, reason: e.reason });
+        }
+        return json(res, 502, { error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    if (method === "GET" && path === "/api/stt/status") {
+      return json(res, 200, stt.describeSTT(cfg));
     }
 
     // ── connectors (Composio) ──

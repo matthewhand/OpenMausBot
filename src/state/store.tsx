@@ -164,6 +164,16 @@ export interface ConfigStatus {
    * a voice, which is what it takes to actually speak. The key itself is
    * never echoed back. */
   tts?: { configured: boolean; ready: boolean; voice: string };
+  /** Speech-to-text. `provider` is the selected STT provider (apple-speech,
+   * openai-whisper, or none); `available` = STT is configured and ready for
+   * the current platform; `baseUrl` and `model` are settings (not secrets). */
+  stt?: {
+    provider: "apple-speech" | "openai-whisper" | "none";
+    available: boolean;
+    ready: boolean;
+    baseUrl: string;
+    model: string;
+  };
   /** who's using the app — collected in onboarding, shown in the sidebar */
   profile?: { name: string; email: string };
 }
