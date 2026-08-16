@@ -133,8 +133,9 @@ you what it's doing while it works, and asks for approvals out loud.
 Bring your own ElevenLabs key — paste it once in App Settings, pick a voice, and every bot can talk.
 Give a bot its own voice and a room stops sounding like one person.
 
-**Also in the box:** streaming replies with tool-run activity chips · native macOS dictation from the
-composer mic (on-device Apple speech recognition — desktop app) · SupaMaus cursor mascots with role-aware
+**Also in the box:** streaming replies with tool-run activity chips · speech-to-text via Apple Speech
+(macOS) or OpenAI-compatible Whisper (all platforms) — paste your LiteLLM or faster-whisper URL in
+App Settings · SupaMaus cursor mascots with role-aware
 expressions · screenshots of the bot's work folded into the transcript.
 
 ## How it works
@@ -171,8 +172,9 @@ flowchart LR
 | Harness | `server/harness/` | Registry (configs → live instances) and the fan-in event bus every client folds. |
 | API | `server/index.ts` | Bots, turns, approvals, model catalog, computer lifecycle, connectors, config — HTTP + SSE. |
 | Voice | `server/tts/` | ElevenLabs, bring your own key. Runs on the harness so the key never reaches the UI; markdown is rewritten into something worth hearing before it is spoken. |
+| Speech-to-text | `server/stt/`, `src/lib/stt/` | Apple Speech (macOS, on-device) or OpenAI-compatible Whisper (all platforms). Whisper support includes LiteLLM, faster-whisper, and OpenAI. Config in App Settings. |
 | App | `src/` | The chat shell. Server-backed store, one reducer, zero client-side transports. |
-| Desktop | `electron/` | macOS, Windows, and Ubuntu shells with an embedded harness and explicit platform capabilities; Apple speech, local screen capture, and the current CUA bridge remain macOS-only. |
+| Desktop | `electron/` | macOS, Windows, and Ubuntu shells with an embedded harness and explicit platform capabilities; Apple Speech and local screen capture remain macOS-only, but Whisper STT works everywhere. |
 
 ## Quick start
 
@@ -217,10 +219,11 @@ pnpm package:linux    # Ubuntu x64: .deb + AppImage; no Swift required
 | Packaged app, embedded harness, local agent CLIs | Supported | Beta | Beta |
 | Composio and Box/cloud computers | Supported | Beta | Beta |
 | Local screen preview and computer control | Supported | Planned | Planned after compositor validation |
-| Native on-device dictation | Supported | Planned | Planned |
+| Speech-to-text (Apple Speech) | Supported | — | — |
+| Speech-to-text (OpenAI-compatible Whisper) | Supported | Supported | Supported |
 
 Unavailable native features fail closed on Ubuntu without blocking chat or cloud features. Linux local computer
-control, Wayland capture/automation, dictation, and ARM64 are tracked in
+control, Wayland capture/automation, and ARM64 are tracked in
 [#29](https://github.com/milind-soni/OpenMausBot/issues/29) and are not claimed by the baseline package.
 
 These credentials are optional — local chat works without them. Paste a key once in **App Settings** (gear
@@ -250,8 +253,10 @@ pnpm package:linux # Ubuntu x64 .deb + AppImage → release/
 Early but real — the loop works end to end: message → agent → streamed reply → tools → approvals →
 computer use. macOS and Windows have released builds; Ubuntu 24.04 x64 packages are in beta with the
 capability limits above. Rough edges to expect: routines are a placeholder and sidebar sections aren't built yet.
-Voice needs an ElevenLabs key, and calls are macOS-only for now (they ride the same on-device dictation as
-the composer mic) — see [`docs/voice-mode.md`](docs/voice-mode.md) for the design and the known gaps.
+Voice needs an ElevenLabs key. Calls work on all platforms: macOS uses on-device Apple Speech, while
+Windows and Linux use OpenAI-compatible Whisper (LiteLLM, faster-whisper, or OpenAI). Configure your
+STT provider and endpoint in App Settings → Voice → Speech-to-Text. See [`docs/voice-mode.md`](docs/voice-mode.md)
+for the design and the known gaps.
 
 Contributions welcome — the driver SPI in [`server/contracts.ts`](server/contracts.ts) is deliberately
 small; adding a provider is one file in [`server/drivers/`](server/drivers/) plus a one-line registration.

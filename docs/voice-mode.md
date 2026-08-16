@@ -52,14 +52,23 @@ the two of them talk forever. So the mic is live only when the bot is not
 speaking, and interrupting is a tap, the Space bar, or Escape. Full-duplex
 barge-in needs AEC on the capture path — a real follow-up, not a footnote.
 
+**Two STT providers: Apple Speech (macOS only) and OpenAI-compatible Whisper
+(all platforms).** Apple Speech uses `SFSpeechRecognizer` via a native Swift
+helper in the main process. OpenAI-compatible Whisper uses WebRTC
+(getUserMedia/MediaRecorder) in the renderer and sends audio to the harness,
+which forwards it to any `/v1/audio/transcriptions` endpoint (LiteLLM,
+faster-whisper, or OpenAI). The harness holds the API key and base URL. The
+provider is selectable in App Settings → Voice → Speech-to-Text.
+
 **Turn detection stays native and local.** A buffer-backed
 `SFSpeechRecognizer` does not emit `isFinal` just because the speaker becomes
 quiet; it finalizes only after its audio stream ends. Call mode therefore starts
 the native helper with a silence timeout. Once a non-empty transcript stops
 changing for 850ms, the helper stops capture and calls `endAudio()`, which
-produces the final transcript sent to the renderer. Composer dictation omits the
-timeout and keeps its press-to-stop behavior. No cloud STT or bundled VAD model
-is involved.
+produces the final transcript sent to the renderer. For WebRTC Whisper, the
+AudioRecorder implements silence detection in the browser using an
+AnalyserNode. Composer dictation omits the timeout and keeps its press-to-stop
+behavior. No cloud STT or bundled VAD model is involved.
 
 **Narration is what makes it bearable.** An agent turn is 5–60 seconds of tool
 calls, and silence that long reads as a dropped call. Every activity chip the
@@ -93,7 +102,6 @@ delegate real work to specialists over `ask_bot` — no new machinery required.
 
 ## Known gaps
 
-- **Calls are macOS-only**, because dictation is. The voice half works everywhere.
 - **Rooms don't speak yet**, though per-bot voices already exist (`bot.voice`).
 - **No spend meter.** ElevenLabs bills per character. Auto-speak is off by
   default partly for that reason, but the app should eventually show usage.
