@@ -128,7 +128,7 @@ describe("configuration", () => {
   it("distinguishes 'no baseUrl' from 'no voice' for OpenAI-compatible", async () => {
     const { speak, NoVoiceConfigured } = await voice();
     const openaiCfg = (tts: AppConfig["tts"]): AppConfig => ({ tts: { provider: "openai-compatible", ...tts } });
-    expect(() => speak(openaiCfg({}), "hi")).toThrow(/voice/i);
+    expect(() => speak(openaiCfg({}), "hi")).toThrow(/base url/i);
     expect(() => speak(openaiCfg({ baseUrl: "http://localhost" }), "hi")).toThrow(/voice/i);
   });
 
