@@ -1508,10 +1508,23 @@ const server = createServer(async (req, res) => {
       // same rule for a voice key — and check it against the provider the
       // patch SELECTS, not the one already saved, or pasting a Cartesia key
       // while switching from ElevenLabs validates against the wrong service
-      const newTts = patch.tts as { key?: unknown } | undefined;
-      if (typeof newTts?.key === "string" && newTts.key.trim()) {
-        const check = await tts.verifyKey(newTts.key.trim());
-        if (!check.ok) return json(res, 400, { error: check.message });
+      const newTts = patch.tts as { provider?: string; key?: unknown; baseUrl?: unknown } | undefined;
+      if (newTts) {
+        const provider = (newTts.provider ?? cfg.tts?.provider ?? "elevenlabs") as "elevenlabs" | "openai-compatible";
+        // For OpenAI-compatible, verify if baseUrl is provided (key is optional)
+        if (provider === "openai-compatible" && typeof newTts.baseUrl === "string" && newTts.baseUrl.trim()) {
+          const check = await tts.verifyKey(
+            typeof newTts.key === "string" ? newTts.key.trim() : "",
+            provider,
+            newTts.baseUrl.trim(),
+          );
+          if (!check.ok) return json(res, 400, { error: check.message });
+        }
+        // For ElevenLabs, verify if key is provided
+        else if (provider === "elevenlabs" && typeof newTts.key === "string" && newTts.key.trim()) {
+          const check = await tts.verifyKey(newTts.key.trim(), provider);
+          if (!check.ok) return json(res, 400, { error: check.message });
+        }
       }
       saveConfig(patch);
       Object.assign(cfg, loadConfig());

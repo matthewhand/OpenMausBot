@@ -15,9 +15,11 @@ export interface AppConfig {
    * catalog with official logos in the plugins marketplace. */
   composio?: { key?: string; apiKey?: string; url?: string };
   box?: { token?: string };
-  /** Voice (ElevenLabs). `key` is the credential and is never echoed back;
-   * `voice` is the chosen voice id, which is a setting, not a secret. */
-  tts?: { key?: string; voice?: string };
+  /** Voice. Supports ElevenLabs and OpenAI-compatible servers (Kokoro, etc.).
+   * `provider` defaults to "elevenlabs" for backward compatibility.
+   * `key` is the credential and is never echoed back; `voice` is the chosen
+   * voice id. OpenAI-compatible servers need `baseUrl` and optionally `key`. */
+  tts?: { provider?: "elevenlabs" | "openai-compatible"; key?: string; voice?: string; baseUrl?: string };
   /** The person using the app (collected in onboarding, shown in the
    * sidebar). Not a secret — echoed back by GET /api/config. */
   profile?: { name?: string; email?: string };
@@ -53,7 +55,12 @@ export function loadConfig(): AppConfig {
   cfg.xai = { key: process.env.XAI_API_KEY, ...cfg.xai };
   cfg.composio = { key: process.env.COMPOSIO_KEY, ...cfg.composio };
   cfg.box = { token: process.env.BOX_TOKEN, ...cfg.box };
-  cfg.tts = { key: process.env.OMB_TTS_KEY, ...cfg.tts };
+  cfg.tts = {
+    provider: process.env.OMB_TTS_PROVIDER as "elevenlabs" | "openai-compatible" | undefined,
+    key: process.env.OMB_TTS_KEY,
+    baseUrl: process.env.OMB_TTS_BASE_URL,
+    ...cfg.tts,
+  };
   return cfg;
 }
 
