@@ -306,16 +306,18 @@ export function PluginsPanel() {
               Custom MCP
             </button>
           </div>
-          {tab !== "mcp" && <label className="flex h-11 w-full items-center gap-2.5 rounded-xl bg-raised/70 px-3.5 sm:w-[320px]">
-            <Search size={17} className="shrink-0 text-ink-secondary" />
-            <input
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="Search plugins"
-              aria-label="Search plugins"
-              className="min-w-0 flex-1 bg-transparent text-[14px] text-ink placeholder:text-ink-secondary focus:outline-none"
-            />
-          </label>
+          {tab !== "mcp" && (
+            <label className="flex h-11 w-full items-center gap-2.5 rounded-xl bg-raised/70 px-3.5 sm:w-[320px]">
+              <Search size={17} className="shrink-0 text-ink-secondary" />
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="Search plugins"
+                aria-label="Search plugins"
+                className="min-w-0 flex-1 bg-transparent text-[14px] text-ink placeholder:text-ink-secondary focus:outline-none"
+              />
+            </label>
+          )}
         </div>
 
         {tab === "mcp" ? (
