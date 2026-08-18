@@ -6,13 +6,16 @@ import {
   Circle,
   ExternalLink,
   Loader2,
+  Monitor,
   RefreshCw,
   RotateCcw,
   Square,
   Trash2,
+  X,
 } from "lucide-react";
 import { Card, CommandLine } from "./SettingsPrimitives";
 import { cn } from "@/lib/cn";
+import { loopbackViewerUsable } from "@/lib/loopback-viewer";
 
 type Action = "pull" | "run" | "start" | "stop" | "remove" | "recreate";
 
@@ -104,6 +107,9 @@ export function LocalComputerSection() {
   const [pending, setPending] = useState<Action | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [watching, setWatching] = useState(false);
+  const [watchFrame, setWatchFrame] = useState<string | null>(null);
+  const [watchError, setWatchError] = useState<string | null>(null);
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     const response = await fetch("/api/local-computer", { signal });
@@ -140,6 +146,43 @@ export function LocalComputerSection() {
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [refresh, refreshKey]);
+
+  useEffect(() => {
+    if (!watching) return;
+    let alive = true;
+    let inFlight = false;
+    let controller: AbortController | undefined;
+    const shoot = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      controller = new AbortController();
+      try {
+        const response = await fetch("/api/local-computer/screenshot", {
+          method: "POST",
+          signal: controller.signal,
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error ?? `screenshot failed (${response.status})`);
+        if (alive && typeof body.image === "string") {
+          setWatchFrame(body.image);
+          setWatchError(null);
+        }
+      } catch (e) {
+        if (alive && !(e instanceof DOMException && e.name === "AbortError")) {
+          setWatchError(e instanceof Error ? e.message : String(e));
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+    void shoot();
+    const timer = window.setInterval(() => void shoot(), 3000);
+    return () => {
+      alive = false;
+      controller?.abort();
+      window.clearInterval(timer);
+    };
+  }, [watching]);
 
   const post = async (action: Exclude<Action, "recreate">) => {
     const response = await fetch(`/api/local-computer/${action}`, {
@@ -222,13 +265,25 @@ export function LocalComputerSection() {
             <RefreshCw size={12} /> Re-check
           </button>
           {ready && (
+            <button
+              type="button"
+              onClick={() => {
+                setWatchError(null);
+                setWatching(true);
+              }}
+              className="flex items-center gap-1.5 rounded-lg border border-hairline/40 px-2.5 py-1 text-[12.5px] text-ink hover:bg-raised"
+            >
+              <Monitor size={12} /> Watch screen
+            </button>
+          )}
+          {ready && loopbackViewerUsable(window.location.hostname) && (
             <a
               href={status?.viewer_url ?? c?.view}
               target="_blank"
               rel="noreferrer"
-              className="flex items-center gap-1.5 rounded-lg border border-hairline/40 px-2.5 py-1 text-[12.5px] text-ink hover:bg-raised"
+              className="flex items-center gap-1.5 rounded-lg border border-hairline/40 px-2.5 py-1 text-[12.5px] text-ink-secondary hover:bg-raised hover:text-ink"
             >
-              <ExternalLink size={12} /> Watch screen
+              <ExternalLink size={12} /> Open noVNC
             </a>
           )}
         </div>
@@ -327,6 +382,43 @@ export function LocalComputerSection() {
           {status?.base_image_ref ? <> · Base: {status.base_image_ref}</> : null}
         </div>
       </Card>
+
+      {watching && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+          <div className="flex max-h-[90vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-hairline/40 bg-panel shadow-2xl">
+            <div className="flex items-center justify-between gap-3 border-b border-hairline/30 px-4 py-3">
+              <div className="text-[14px] font-medium text-ink">Local VM screen</div>
+              <button
+                type="button"
+                onClick={() => setWatching(false)}
+                className="rounded-md p-1 text-ink-secondary hover:bg-raised hover:text-ink"
+                title="Close"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="min-h-[240px] overflow-auto bg-black p-3">
+              {watchFrame ? (
+                <img
+                  src={watchFrame.startsWith("data:") ? watchFrame : `data:image/png;base64,${watchFrame}`}
+                  alt="Local VM screen"
+                  className="mx-auto max-h-[70vh] w-auto max-w-full"
+                />
+              ) : (
+                <div className="flex h-[240px] items-center justify-center gap-2 text-[13px] text-ink-secondary">
+                  <Loader2 size={14} className="animate-spin" /> Capturing…
+                </div>
+              )}
+            </div>
+            {watchError && (
+              <div className="border-t border-hairline/30 px-4 py-2 text-[12px] text-danger">{watchError}</div>
+            )}
+            <div className="border-t border-hairline/30 px-4 py-2 text-[12px] text-ink-secondary">
+              Live preview through the harness — works over LAN. The noVNC desktop stays on this machine’s loopback.
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
