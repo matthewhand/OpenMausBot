@@ -208,13 +208,19 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   useEffect(() => {
     if (phase !== "ready" || sseFlowing) return;
     let alive = true;
+    let controller: AbortController | undefined;
     const shoot = async () => {
       if (inFlight.current) return;
       inFlight.current = true;
+      controller = new AbortController();
       try {
-        const { png, format } = await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" });
+        const { png, format } = await api(`/api/bots/${bot.id}/computer/screenshot`, {
+          method: "POST",
+          signal: controller.signal,
+        });
         if (alive) setPolledFrame({ png, mime: format === "jpeg" ? "image/jpeg" : "image/png" });
-      } catch {
+      } catch (e) {
+        if (e instanceof DOMException && e.name === "AbortError") return;
         /* box mid-command or asleep — next tick */
       } finally {
         inFlight.current = false;
@@ -224,6 +230,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
     const timer = setInterval(shoot, 4000);
     return () => {
       alive = false;
+      controller?.abort();
       clearInterval(timer);
     };
   }, [phase, sseFlowing, bot.id]);
@@ -234,13 +241,16 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   useEffect(() => {
     if (phase !== "vm") return;
     let alive = true;
+    let controller: AbortController | undefined;
     const shoot = async () => {
       if (vmInFlight.current) return;
       vmInFlight.current = true;
+      controller = new AbortController();
       try {
-        const { image } = await api("/api/local-computer/screenshot", { method: "POST" });
+        const { image } = await api("/api/local-computer/screenshot", { method: "POST", signal: controller.signal });
         if (alive && typeof image === "string") setVmFrame(image);
       } catch (e) {
+        if (e instanceof DOMException && e.name === "AbortError") return;
         if (alive) setError(e instanceof Error ? e.message : String(e));
       } finally {
         vmInFlight.current = false;
@@ -250,6 +260,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
     const timer = window.setInterval(() => void shoot(), 3000);
     return () => {
       alive = false;
+      controller?.abort();
       window.clearInterval(timer);
     };
   }, [phase]);
@@ -300,12 +311,21 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
     api(`/api/bots/${bot.id}/computer/${kind}`, { method: "POST" })
       .then((result) => {
         // the join URL's stream token rotates — always freshly minted, never cached
-        if (kind === "join" && result.joinUrl) {
-          if (canOpenExternalUrl(result.joinUrl, window.location.hostname)) {
-            window.open(result.joinUrl);
-          } else {
-            setError("That desktop URL is only reachable from this machine. Use Watch screen instead.");
+        if (kind === "join") {
+          if (!result.joinUrl) {
+            setError("The desktop link could not be created.");
+            return;
           }
+          if (!canOpenExternalUrl(result.joinUrl, window.location.hostname)) {
+            setError("That desktop URL is only reachable from this machine. Use Watch screen instead.");
+            return;
+          }
+          if (window.ogb?.openExternal) {
+            void window.ogb.openExternal(result.joinUrl);
+            return;
+          }
+          const opened = window.open(result.joinUrl, "_blank", "noopener,noreferrer");
+          if (!opened) setError("The browser blocked the desktop window. Allow pop-ups and try again.");
         }
         if (kind === "sleep") setBoxState("archived");
       })
