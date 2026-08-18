@@ -263,19 +263,28 @@ describe("OpenAI-compatible", () => {
     expect(JSON.parse(call.body)).toMatchObject({ model: "tts-1", input: "hello there", voice: "af_heart" });
   });
 
-  it("sends Authorization header when key is provided", async () => {
+  it("sends Authorization header when openaiKey is provided", async () => {
     seen.length = 0;
     const { speak } = await voice();
-    await speak(openaiCfg({ key: "sk-test", voice: "af_heart" }), "hello");
+    await speak(openaiCfg({ openaiKey: "sk-test", voice: "af_heart" }), "hello");
     const call = seen.at(-1)!;
     expect(call.headers.authorization).toBe("Bearer sk-test");
   });
 
-  it("omits Authorization header when key is absent", async () => {
+  it("omits Authorization header when openaiKey is absent", async () => {
     seen.length = 0;
     const { speak } = await voice();
     await speak(openaiCfg({ voice: "af_heart" }), "hello");
     const call = seen.at(-1)!;
     expect(call.headers.authorization).toBeUndefined();
+  });
+
+  it("does not send a leftover ElevenLabs key as Bearer to the OpenAI-compatible server", async () => {
+    seen.length = 0;
+    const { speak } = await voice();
+    await speak(openaiCfg({ key: "el-secret", voice: "af_heart" }), "hello");
+    const call = seen.at(-1)!;
+    expect(call.headers.authorization).toBeUndefined();
+    expect(JSON.stringify(call.headers)).not.toContain("el-secret");
   });
 });

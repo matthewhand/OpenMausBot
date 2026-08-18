@@ -76,12 +76,17 @@ export function verifyKey(key: string, provider: "elevenlabs" | "openai-compatib
   return elevenlabs.verifyKey(key);
 }
 
+function openaiAuthKey(cfg: AppConfig): string | undefined {
+  const key = cfg.tts?.openaiKey?.trim();
+  return key || undefined;
+}
+
 export async function listVoices(cfg: AppConfig): Promise<elevenlabs.Voice[]> {
   const provider = getProvider(cfg);
   if (provider === "openai-compatible") {
     const baseUrl = cfg.tts?.baseUrl;
     if (!baseUrl) return [];
-    return openaiCompatible.listVoices(baseUrl, cfg.tts?.key);
+    return openaiCompatible.listVoices(baseUrl, openaiAuthKey(cfg));
   }
   const key = cfg.tts?.key;
   if (!key) return [];
@@ -98,7 +103,7 @@ export function speak(cfg: AppConfig, text: string, voiceId?: string) {
     if (!baseUrl) throw new NoVoiceConfigured("baseUrl", provider);
     const voice = voiceId || cfg.tts?.voice;
     if (!voice) throw new NoVoiceConfigured("voice", provider);
-    return openaiCompatible.synthesize(text, voice, baseUrl, cfg.tts?.key);
+    return openaiCompatible.synthesize(text, voice, baseUrl, openaiAuthKey(cfg));
   }
 
   // ElevenLabs: check key first, then voice (matches the original behavior)

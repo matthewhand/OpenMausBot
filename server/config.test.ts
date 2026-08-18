@@ -121,6 +121,32 @@ describe("TTS provider configuration", () => {
   it("rejects an unknown TTS provider", () => {
     expect(() => parseConfigPatch({ tts: { provider: "cartesia" } })).toThrow(/provider/);
   });
+
+  it("keeps the ElevenLabs key next to a separate optional openaiKey", () => {
+    expect(
+      parseStoredConfig({
+        tts: {
+          provider: "openai-compatible",
+          key: "el-key",
+          openaiKey: "sk-local",
+          baseUrl: "http://127.0.0.1:9093/v1",
+        },
+      }),
+    ).toEqual({
+      tts: {
+        provider: "openai-compatible",
+        key: "el-key",
+        openaiKey: "sk-local",
+        baseUrl: "http://127.0.0.1:9093/v1",
+      },
+    });
+  });
+
+  it("accepts a provider-only patch so a switch cannot wipe credentials", () => {
+    expect(parseConfigPatch({ tts: { provider: "openai-compatible" } })).toEqual({
+      tts: { provider: "openai-compatible" },
+    });
+  });
 });
 
 describe("OpenCode Go configuration", () => {

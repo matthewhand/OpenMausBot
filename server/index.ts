@@ -3283,7 +3283,7 @@ const server = createServer(async (req, res) => {
         const provider = newTts.provider ?? cfg.tts?.provider ?? "elevenlabs";
         // For OpenAI-compatible, verify if baseUrl is provided (key is optional)
         if (provider === "openai-compatible" && newTts.baseUrl?.trim()) {
-          const check = await tts.verifyKey(newTts.key?.trim() ?? "", provider, newTts.baseUrl.trim());
+          const check = await tts.verifyKey(newTts.openaiKey?.trim() ?? "", provider, newTts.baseUrl.trim());
           if (!check.ok) return json(res, 400, { error: check.message });
         }
         // For ElevenLabs, verify if key is provided

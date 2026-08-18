@@ -30,12 +30,14 @@ const appConfigSchema = z.object({
   opencodeGo: z.object({ apiKey: optionalText }).optional(),
   /** Voice. Supports ElevenLabs and OpenAI-compatible servers (Kokoro, etc.).
    * `provider` defaults to "elevenlabs" for backward compatibility.
-   * `key` is the credential and is never echoed back; `voice` is the chosen
-   * voice id. OpenAI-compatible servers need `baseUrl` and optionally `key`. */
+   * `key` is the ElevenLabs credential and is never echoed back; `openaiKey`
+   * is the optional OpenAI-compatible credential. `voice` is the chosen voice
+   * id. OpenAI-compatible servers need `baseUrl` and optionally `openaiKey`. */
   tts: z
     .object({
       provider: z.enum(["elevenlabs", "openai-compatible"]).optional(),
       key: optionalText,
+      openaiKey: optionalText,
       voice: optionalText,
       baseUrl: optionalText,
     })
@@ -54,9 +56,16 @@ export interface AppConfig {
   opencodeGo?: { apiKey?: string };
   /** Voice. Supports ElevenLabs and OpenAI-compatible servers (Kokoro, etc.).
    * `provider` defaults to "elevenlabs" for backward compatibility.
-   * `key` is the credential and is never echoed back; `voice` is the chosen
-   * voice id. OpenAI-compatible servers need `baseUrl` and optionally `key`. */
-  tts?: { provider?: "elevenlabs" | "openai-compatible"; key?: string; voice?: string; baseUrl?: string };
+   * `key` is the ElevenLabs credential and is never echoed back; `openaiKey`
+   * is the optional OpenAI-compatible credential. `voice` is the chosen voice
+   * id. OpenAI-compatible servers need `baseUrl` and optionally `openaiKey`. */
+  tts?: {
+    provider?: "elevenlabs" | "openai-compatible";
+    key?: string;
+    openaiKey?: string;
+    voice?: string;
+    baseUrl?: string;
+  };
   profile?: { name?: string; email?: string };
   instances?: InstanceConfigMap;
 }

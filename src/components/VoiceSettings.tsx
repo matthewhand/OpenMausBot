@@ -7,6 +7,7 @@ import { Check, Loader2, Volume2 } from "lucide-react";
 
 import { api, useStore, type ConfigStatus } from "@/state/store";
 import { speaker } from "@/lib/tts";
+import { ttsElevenLabsKeyPatch, ttsOpenaiCredentialsPatch, ttsProviderPatch } from "@/lib/tts-provider";
 import { cn } from "@/lib/cn";
 
 const SAMPLE = "Morning. Overnight the tests went green, and I left two notes for you in the thread.";
@@ -72,7 +73,8 @@ export function VoiceSettings() {
   const saveProvider = (newProvider: "elevenlabs" | "openai-compatible") => {
     setProvider(newProvider);
     setError(null);
-    void save(newProvider === "openai-compatible" ? { provider: newProvider, key: "" } : { provider: newProvider });
+    // Provider only — do not send key: "" (that wipes the other provider's secret).
+    void save(ttsProviderPatch(newProvider));
   };
 
   const saveCredentials = () => {
@@ -81,13 +83,13 @@ export function VoiceSettings() {
         setError("Base URL is required for OpenAI-compatible servers.");
         return;
       }
-      void save({ baseUrl: (baseUrl || tts.baseUrl || "").trim(), key: key.trim() || "" });
+      void save(ttsOpenaiCredentialsPatch(baseUrl || tts.baseUrl || "", key));
     } else {
       if (!key.trim()) {
         setError("ElevenLabs key is required.");
         return;
       }
-      void save({ key: key.trim() });
+      void save(ttsElevenLabsKeyPatch(key));
     }
   };
 
