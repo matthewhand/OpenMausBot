@@ -21,6 +21,7 @@ import { useStore, type Bot } from "@/state/store";
 import type { Routine } from "@/lib/routines";
 import { ApiKeyRow } from "./ApiKeys";
 import { cn } from "@/lib/cn";
+import { canOpenExternalUrl } from "@/lib/loopback-viewer";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { RoutineEditor } from "./RoutinesPage";
 
@@ -295,7 +296,13 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
     api(`/api/bots/${bot.id}/computer/${kind}`, { method: "POST" })
       .then((result) => {
         // the join URL's stream token rotates — always freshly minted, never cached
-        if (kind === "join" && result.joinUrl) window.open(result.joinUrl);
+        if (kind === "join" && result.joinUrl) {
+          if (canOpenExternalUrl(result.joinUrl, window.location.hostname)) {
+            window.open(result.joinUrl);
+          } else {
+            setError("That desktop URL is only reachable from this machine. Use Watch screen instead.");
+          }
+        }
         if (kind === "sleep") setBoxState("archived");
       })
       .catch((e) => setError(e.message))

@@ -40,6 +40,9 @@ export default defineConfig({
     proxy: {
       "/api": {
         target: `http://127.0.0.1:${process.env.OGB_PORT || 8799}`,
+        headers: process.env.OMB_AUTH_TOKEN
+          ? { Authorization: `Bearer ${process.env.OMB_AUTH_TOKEN}` }
+          : {},
       },
     },
   },
