@@ -16,11 +16,11 @@ By default, OpenMausBot binds to `127.0.0.1` (localhost only) for security. To e
 ⚠️ **IMPORTANT**: When you bind OpenMausBot to your network interface (`0.0.0.0` or a specific IP), it becomes accessible to anyone on your network. This means:
 
 - Anyone on your LAN can potentially access your bots, conversations, and connected services
-- Without authentication (`OMB_AUTH_TOKEN`), there is **NO** access control
+- A non-loopback bind **requires** `OMB_AUTH_TOKEN`; the server will refuse to start otherwise
 - Your API keys and credentials stored in OpenMausBot could be exposed
 - Bots could be instructed to perform actions on your behalf
 
-**Always set `OMB_AUTH_TOKEN` when binding to anything other than `127.0.0.1`.**
+**A non-loopback bind requires `OMB_AUTH_TOKEN`.** Loopback (`127.0.0.1`, other `127.*`, `localhost`, `::1`) still defaults to no auth.
 
 There is **no loopback exemption**. If `OMB_AUTH_TOKEN` is set, requests to `127.0.0.1` still need the token. The Vite dev proxy does **not** inject a Bearer header.
 
@@ -30,9 +30,9 @@ There is **no loopback exemption**. If `OMB_AUTH_TOKEN` is set, requests to `127
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OMB_HOST` | `127.0.0.1` | Host to bind the harness server (port 8799). Set to `0.0.0.0` for all interfaces or a specific IP for one interface. |
+| `OMB_HOST` | `127.0.0.1` | Host to bind the harness server (port 8799). Set to `0.0.0.0` for all interfaces or a specific IP for one interface. Non-loopback binds require `OMB_AUTH_TOKEN`. |
 | `OMB_PORT` | `8799` | Port for the harness server. |
-| `OMB_AUTH_TOKEN` | (none) | Bearer token required for all API requests. Set this to a strong random string when enabling LAN access. |
+| `OMB_AUTH_TOKEN` | (none) | Bearer token required for all API requests. **Required** when `OMB_HOST` is not loopback; the server will refuse to start without it. |
 | `OMB_CORS_ORIGIN` | (none) | CORS origin for the frontend. Set to `*` for any origin, or a specific origin like `http://10.0.0.32:8799`. |
 
 When `OMB_CORS_ORIGIN=*`, the server does **not** send `Access-Control-Allow-Credentials`. Use a specific origin if you need credentials.
@@ -200,6 +200,7 @@ New-NetFirewallRule -DisplayName "OpenMausBot Harness" -Direction Inbound -Proto
 - Verify environment variables are set correctly
 - Restart the server after setting variables
 - Check server logs for a bind line like `openmausbot server on http://0.0.0.0:8799`
+- A missing `OMB_AUTH_TOKEN` is a hard error: the process exits without listening and stderr names `OMB_AUTH_TOKEN`
 
 ## Production Considerations
 
