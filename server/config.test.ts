@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   instanceConfigs,
+  mergeMcpServers,
   parseConfigPatch,
   parseStoredConfig,
   withInstanceCli,
@@ -98,6 +99,28 @@ describe("Instance CLI override", () => {
     const custom = { instances: { claude: { driver: "claudeAgent", environment: { MY_FLAG: "1" } } } };
     const kept = withInstanceCli(custom, "claude", "/x");
     expect(kept.config.instances!.claude.environment).toEqual({ MY_FLAG: "1" });
+  });
+});
+
+describe("mergeMcpServers", () => {
+  it("keeps stored headers when a PUT omits them", () => {
+    const merged = mergeMcpServers(
+      [{ name: "notion", transport: "http", url: "https://n.example/mcp", headers: { Authorization: "Bearer secret" }, enabled: true }],
+      [{ name: "notion", transport: "http", url: "https://n.example/mcp", enabled: false }],
+    );
+    expect(merged[0]).toMatchObject({
+      name: "notion",
+      enabled: false,
+      headers: { Authorization: "Bearer secret" },
+    });
+  });
+
+  it("clears headers when the patch sends an empty object", () => {
+    const merged = mergeMcpServers(
+      [{ name: "notion", transport: "http", url: "https://n.example/mcp", headers: { Authorization: "Bearer secret" } }],
+      [{ name: "notion", transport: "http", url: "https://n.example/mcp", headers: {} }],
+    );
+    expect(merged[0].headers).toEqual({});
   });
 });
 

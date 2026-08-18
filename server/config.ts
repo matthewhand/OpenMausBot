@@ -89,6 +89,29 @@ export interface AppConfig {
 }
 export type ConfigPatch = z.output<typeof appConfigPatchSchema>;
 
+/** Keep stored MCP headers when a PUT omits them. GET never echoes headers,
+ * so a "save this list" from the UI would otherwise blank every secret. An
+ * explicit empty headers object still clears. */
+export function mergeMcpServers(previous: unknown, next: McpServer[]): McpServer[] {
+  const prevByName = new Map<string, McpServer>();
+  if (Array.isArray(previous)) {
+    for (const item of previous) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      if (typeof rec.name !== "string" || !rec.name) continue;
+      prevByName.set(rec.name, item as McpServer);
+    }
+  }
+  return next.map((server) => {
+    if (server.headers !== undefined) return server;
+    const prior = prevByName.get(server.name);
+    if (prior?.headers && Object.keys(prior.headers).length) {
+      return { ...server, headers: prior.headers };
+    }
+    return server;
+  });
+}
+
 export function parseStoredConfig(value: JsonValue): AppConfig {
   const parsed = appConfigSchema.safeParse(value);
   if (!parsed.success) throw new Error(schemaIssue(parsed.error, "Invalid stored configuration"));
@@ -174,9 +197,10 @@ export function saveConfig(patch: Partial<AppConfig>): void {
     }
     disk.instances = diskInstances;
   }
-  // mcpServers is an array, not an object to merge — replace wholesale
+  // mcpServers is an array. A client that does not have headers (GET never
+  // echoes them) must not wipe stored secrets when it PUTs the rest.
   if (Array.isArray(patch.mcpServers)) {
-    disk.mcpServers = patch.mcpServers;
+    disk.mcpServers = JSON.parse(JSON.stringify(mergeMcpServers(disk.mcpServers, patch.mcpServers)));
   }
   mkdirSync(DATA_DIR, { recursive: true });
   writeFileAtomic(p, JSON.stringify(disk, null, 2), { mode: 0o600 });

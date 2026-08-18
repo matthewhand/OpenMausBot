@@ -637,6 +637,18 @@ describe("harness HTTP API", () => {
       hasHeaders: false,
     });
     expect(JSON.stringify(after.body)).not.toContain("secret-token-123");
+
+    // A later save that omits headers (the UI never has them) must keep them.
+    const again = await api("PUT", "/api/config", {
+      mcpServers: [
+        { name: "notion", transport: "http", url: "https://api.example.com/mcp/notion", enabled: false },
+        { name: "deepwiki", transport: "sse", url: "https://api.example.com/mcp/deepwiki", enabled: false },
+      ],
+    });
+    expect(again.status).toBe(200);
+    expect(again.body.mcpServers[0]).toMatchObject({ name: "notion", enabled: false, hasHeaders: true });
+    const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
+    expect(disk.mcpServers[0].headers).toEqual({ Authorization: "Bearer secret-token-123" });
   });
 
   it("creates an independent webhook, accepts a delivery, deduplicates it, and rotates its secret", async () => {
