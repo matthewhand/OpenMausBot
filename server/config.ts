@@ -253,6 +253,7 @@ const appConfigSchema = z.object({
       openaiKey: optionalText,
       voice: optionalText,
       openaiVoice: optionalText,
+      openaiModel: optionalText,
       provider: z.enum(["elevenlabs", "system", "openai-compatible"]).optional(),
       baseUrl: optionalText,
     })
@@ -286,6 +287,7 @@ export interface AppConfig {
     openaiKey?: string;
     voice?: string;
     openaiVoice?: string;
+    openaiModel?: string;
     provider?: "elevenlabs" | "system" | "openai-compatible";
     baseUrl?: string;
   };

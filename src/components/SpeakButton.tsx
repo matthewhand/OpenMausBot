@@ -31,9 +31,12 @@ export function SpeakButton({
   const ready = configured && Boolean(voiceId || tts?.voice);
   const mine = speech.messageId === messageId && speech.status !== "idle";
   const preparing = mine && speech.status === "preparing";
+  const openai = state.config?.tts?.provider === "openai-compatible";
 
   const label = !configured
-    ? "Add an ElevenLabs key in an agent profile to read messages aloud"
+    ? openai
+      ? "Add a base URL in App Settings to read messages aloud"
+      : "Add an ElevenLabs key in an agent profile to read messages aloud"
     : !ready
       ? "Pick a voice in this agent's profile to read messages aloud"
     : mine

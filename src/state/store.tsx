@@ -300,6 +300,8 @@ export interface ConfigStatus {
     voice: string;
     provider?: "elevenlabs" | "system" | "openai-compatible";
     baseUrl?: string;
+    openaiKeyConfigured?: boolean;
+    openaiModel?: string;
   };
   /** Shared write-only credential for on-demand GPT Image avatars. */
   imageGen?: { configured: boolean };

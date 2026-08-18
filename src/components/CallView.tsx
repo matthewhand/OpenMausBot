@@ -75,6 +75,7 @@ export function CallTargetButton({
   const active = useOnCall() === targetId;
   const supported = capabilities.dictation.available && Boolean(window.ogb?.speechStart);
   const configured = Boolean(state.config?.tts?.configured);
+  const openai = state.config?.tts?.provider === "openai-compatible";
   const everyTargetHasVoice = voices.length > 0 && voices.every((voice) => Boolean(voice));
   const voiceReady =
     configured && (requireExplicitVoices ? everyTargetHasVoice : Boolean(state.config?.tts?.ready || everyTargetHasVoice));
@@ -103,7 +104,9 @@ export function CallTargetButton({
       : !window.ogb?.speechStart
         ? "The speech service is unavailable in this app build. Restart or update OpenMausBot."
         : !configured
-          ? "Add an ElevenLabs API key — or switch to the built-in Mac voices — so the bot can speak during calls."
+          ? openai
+            ? "Add a base URL and pick a voice in App Settings"
+            : "Add an ElevenLabs API key — or switch to the built-in Mac voices — so the bot can speak during calls."
           : !voiceReady
             ? voices.length > 1
               ? "Give every channel member a voice before starting a channel call."

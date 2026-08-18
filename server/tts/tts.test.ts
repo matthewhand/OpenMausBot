@@ -9,8 +9,14 @@ import type { AppConfig } from "../config.ts";
 let server: Server;
 /** every request the stub saw, so tests can assert on what we sent */
 const seen: Array<{ method: string; url: string; headers: Record<string, string>; body: string }> = [];
-/** flipped by tests that want ElevenLabs to refuse */
+/** flipped by tests that want the stub to refuse */
 let refuse: { status: number; body: unknown } | null = null;
+/** when set, /audio/voices returns this payload instead of 404 */
+let audioVoices: unknown = null;
+/** when true, /voices 404s so fallbacks can be tested */
+let voicesMissing = false;
+/** Content-Type on /audio/speech; null omits the header */
+let speakContentType: string | null = "audio/mpeg";
 
 const MP3 = Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x11, 0x22, 0x33, 0x44]);
 
@@ -40,8 +46,12 @@ beforeAll(async () => {
           voices: [{ voice_id: "v-1", name: "Rachel", labels: { accent: "american", description: "calm" } }],
         });
       }
+      if (path === "/audio/voices") {
+        if (audioVoices) return send(200, audioVoices);
+        return send(404, { detail: "no such stub route" });
+      }
       if (path === "/voices") {
-        // OpenAI-compatible voices endpoint
+        if (voicesMissing) return send(404, { detail: "no voices" });
         return send(200, [
           { id: "af_heart", name: "Heart", description: "Warm female voice" },
           { id: "am_adam", name: "Adam", description: "Clear male voice" },
@@ -52,8 +62,9 @@ beforeAll(async () => {
         return res.end(MP3);
       }
       if (path === "/audio/speech" || path === "/v1/audio/speech") {
-        // OpenAI-compatible speech endpoint
-        res.writeHead(200, { "content-type": "audio/mpeg" });
+        const headers: Record<string, string> = {};
+        if (speakContentType) headers["content-type"] = speakContentType;
+        res.writeHead(200, headers);
         return res.end(MP3);
       }
       send(404, { detail: "no such stub route" });
@@ -62,7 +73,6 @@ beforeAll(async () => {
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const port = (server.address() as { port: number }).port;
   process.env.OMB_ELEVENLABS_API = `http://127.0.0.1:${port}/v1`;
-  process.env.OMB_OPENAI_TTS_BASE = `http://127.0.0.1:${port}`;
 });
 
 afterAll(() => new Promise<void>((r) => server.close(() => r())));
@@ -114,6 +124,8 @@ describe("configuration", () => {
       voice: "v-1",
       provider: "elevenlabs",
       baseUrl: "",
+      openaiKeyConfigured: false,
+      openaiModel: "",
     });
     expect(JSON.stringify(described)).not.toContain("sk-secret");
   });
@@ -126,7 +138,27 @@ describe("configuration", () => {
     expect(described.baseUrl).toBe("http://localhost");
     expect(described.configured).toBe(true);
     expect(described.voice).toBe("af_heart");
+    expect(described.openaiKeyConfigured).toBe(false);
     expect(JSON.stringify(described)).not.toContain("sk-");
+  });
+
+  it("reports openaiKeyConfigured without echoing the key", async () => {
+    const { describeVoice } = await voice();
+    const described = describeVoice(
+      cfg({
+        provider: "openai-compatible",
+        baseUrl: "http://localhost",
+        openaiKey: "sk-secret",
+        openaiVoice: "af_heart",
+        openaiModel: "kokoro",
+      }),
+    );
+    expect(described.openaiKeyConfigured).toBe(true);
+    expect(described.openaiModel).toBe("kokoro");
+    expect(JSON.stringify(described)).not.toContain("sk-secret");
+    expect(describeVoice(cfg({ provider: "openai-compatible", baseUrl: "http://localhost" })).openaiKeyConfigured).toBe(
+      false,
+    );
   });
 
   it("describeVoice.voice is the active provider's voice, not the other one", async () => {
@@ -281,6 +313,8 @@ describe("built-in macOS voices", () => {
       voice: "Albert",
       provider: "system",
       baseUrl: "",
+      openaiKeyConfigured: false,
+      openaiModel: "",
     });
   });
 
@@ -353,14 +387,72 @@ describe("OpenAI-compatible", () => {
     expect(call.headers.authorization).toBe("Bearer sk-test");
   });
 
+  it("verify sends saved model/voice + response_format mp3", async () => {
+    refuse = null;
+    seen.length = 0;
+    const { verifyKey } = await voice();
+    expect(await verifyKey("sk-test", "openai-compatible", baseUrl(), { model: "kokoro", voice: "af_heart" })).toEqual({
+      ok: true,
+    });
+    expect(JSON.parse(seen.at(-1)!.body)).toEqual({
+      model: "kokoro",
+      input: "test",
+      voice: "af_heart",
+      response_format: "mp3",
+    });
+  });
+
+  it("treats 400 as reachable and 5xx as a failure", async () => {
+    const { verifyKey } = await voice();
+    refuse = { status: 400, body: { error: { message: "unknown voice" } } };
+    expect(await verifyKey("", "openai-compatible", baseUrl(), { model: "kokoro", voice: "af_heart" })).toEqual({
+      ok: true,
+    });
+    refuse = { status: 500, body: { error: { message: "boom" } } };
+    const fail = await verifyKey("", "openai-compatible", baseUrl(), { model: "kokoro", voice: "af_heart" });
+    refuse = null;
+    expect(fail.ok).toBe(false);
+    if (!fail.ok) expect(fail.message).toMatch(/boom|500/);
+  });
+
   it("lists voices from the server", async () => {
+    audioVoices = null;
+    voicesMissing = false;
     const { listVoices } = await voice();
     const voices = await listVoices(openaiCfg({ openaiVoice: "af_heart" }));
     expect(voices).toContainEqual({ id: "af_heart", label: "Heart", description: "Warm female voice" });
     expect(voices).toContainEqual({ id: "am_adam", label: "Adam", description: "Clear male voice" });
   });
 
+  it("prefers /audio/voices over /voices", async () => {
+    audioVoices = { voices: [{ id: "from-audio", name: "From Audio" }] };
+    const { listVoices } = await voice();
+    const voices = await listVoices(openaiCfg({}));
+    audioVoices = null;
+    expect(voices).toEqual([{ id: "from-audio", label: "From Audio" }]);
+  });
+
+  it("returns OpenAI names, not af_heart, when /voices 404s on api.openai.com", async () => {
+    const orig = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ detail: "no voices" }), {
+        status: 404,
+        headers: { "content-type": "application/json" },
+      });
+    try {
+      const { listVoices } = await voice();
+      const voices = await listVoices(
+        cfg({ provider: "openai-compatible", baseUrl: "https://api.openai.com/v1" }),
+      );
+      expect(voices.map((v) => v.id)).toContain("alloy");
+      expect(voices.map((v) => v.id)).not.toContain("af_heart");
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
   it("synthesizes speech with the OpenAI endpoint", async () => {
+    speakContentType = "audio/mpeg";
     seen.length = 0;
     const { speak } = await voice();
     const audio = await speak(openaiCfg({ openaiVoice: "af_heart" }), "hello there");
@@ -370,7 +462,28 @@ describe("OpenAI-compatible", () => {
     const call = seen.at(-1)!;
     expect(call.method).toBe("POST");
     expect(call.url).toContain("/audio/speech");
-    expect(JSON.parse(call.body)).toMatchObject({ model: "tts-1", input: "hello there", voice: "af_heart" });
+    expect(JSON.parse(call.body)).toMatchObject({
+      model: "tts-1",
+      input: "hello there",
+      voice: "af_heart",
+      response_format: "mp3",
+    });
+  });
+
+  it("sends the saved openaiModel instead of hardcoded tts-1", async () => {
+    seen.length = 0;
+    const { speak } = await voice();
+    await speak(openaiCfg({ openaiVoice: "af_heart", openaiModel: "kokoro" }), "hello");
+    expect(JSON.parse(seen.at(-1)!.body)).toMatchObject({ model: "kokoro", voice: "af_heart", response_format: "mp3" });
+  });
+
+  it("uses upstream Content-Type when present, else audio/mpeg", async () => {
+    speakContentType = "audio/wav";
+    const { speak } = await voice();
+    expect((await speak(openaiCfg({ openaiVoice: "af_heart" }), "hello")).mime).toBe("audio/wav");
+    speakContentType = null;
+    expect((await speak(openaiCfg({ openaiVoice: "af_heart" }), "hello")).mime).toBe("audio/mpeg");
+    speakContentType = "audio/mpeg";
   });
 
   it("sends Authorization header when openaiKey is provided", async () => {
@@ -407,6 +520,9 @@ describe("OpenAI-compatible", () => {
     seen.length = 0;
     const { speak } = await voice();
     await speak(openaiCfg({ voice: "el-voice-id", openaiVoice: "af_heart" }), "hello");
-    expect(JSON.parse(seen.at(-1)!.body)).toMatchObject({ voice: "af_heart" });
+    const body = JSON.parse(seen.at(-1)!.body);
+    expect(body).toMatchObject({ voice: "af_heart" });
+    expect(body.voice).not.toBe("el-voice-id");
+    expect(JSON.stringify(body)).not.toContain("el-voice-id");
   });
 });

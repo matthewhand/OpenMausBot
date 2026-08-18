@@ -32,7 +32,7 @@ interface SpeakOptions {
   messageId?: string;
 }
 
-type TtsPrepareBody = { ready?: boolean; utterances?: string[]; error?: string };
+type TtsPrepareBody = { ready?: boolean; utterances?: string[]; error?: string; provider?: string };
 type TtsErrorBody = { error?: string };
 
 const IDLE: SpeechSnapshot = { status: "idle" };

@@ -544,6 +544,25 @@ describe("TTS provider configuration", () => {
     });
   });
 
+  it("accepts openaiModel", () => {
+    expect(
+      parseStoredConfig({
+        tts: {
+          provider: "openai-compatible",
+          baseUrl: "http://127.0.0.1:8880/v1",
+          openaiModel: "kokoro",
+        },
+      }),
+    ).toEqual({
+      tts: {
+        provider: "openai-compatible",
+        baseUrl: "http://127.0.0.1:8880/v1",
+        openaiModel: "kokoro",
+      },
+    });
+    expect(parseConfigPatch({ tts: { openaiModel: "tts-1" } })).toEqual({ tts: { openaiModel: "tts-1" } });
+  });
+
   it("accepts a provider-only patch so a switch cannot wipe credentials or voices", () => {
     const patch = parseConfigPatch({ tts: { provider: "openai-compatible" } });
     expect(patch).toEqual({ tts: { provider: "openai-compatible" } });

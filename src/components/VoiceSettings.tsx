@@ -12,6 +12,7 @@ import { speaker } from "@/lib/tts";
 import {
   ttsElevenLabsKeyPatch,
   ttsOpenaiCredentialsPatch,
+  ttsOpenaiModelPatch,
   ttsProviderPatch,
   ttsVoicePatch,
 } from "@/lib/tts-provider";
@@ -33,6 +34,7 @@ export function VoiceSettings({
 
   const [key, setKey] = useState("");
   const [baseUrl, setBaseUrl] = useState(tts?.baseUrl ?? "");
+  const [model, setModel] = useState(tts?.openaiModel ?? "");
   const [saving, setSaving] = useState(false);
   const [switching, setSwitching] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -50,7 +52,8 @@ export function VoiceSettings({
   useEffect(() => {
     if (tts?.baseUrl !== undefined) setBaseUrl(tts.baseUrl);
     if (tts?.voice !== undefined) setCustomVoice(tts.voice);
-  }, [tts?.provider, tts?.baseUrl, tts?.voice]);
+    if (tts?.openaiModel !== undefined) setModel(tts.openaiModel);
+  }, [tts?.provider, tts?.baseUrl, tts?.voice, tts?.openaiModel]);
 
   useEffect(() => {
     if (!configured) {
@@ -228,7 +231,7 @@ export function VoiceSettings({
                 value={baseUrl || tts.baseUrl || ""}
                 onChange={(e) => setBaseUrl(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && baseUrl.trim() && void saveCredentials()}
-                placeholder="http://127.0.0.1:9093/v1"
+                placeholder="http://127.0.0.1:8880/v1"
                 aria-label="Base URL"
                 autoComplete="off"
                 className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
@@ -242,18 +245,45 @@ export function VoiceSettings({
               </button>
             </div>
             <div className="mt-1.5 text-[12px] text-ink-secondary">
-              For local Kokoro or any OpenAI-compatible TTS server. Defaults to port 9093 for local setups.
+              For local Kokoro or any OpenAI-compatible TTS server. Example: http://127.0.0.1:8880/v1 for
+              Kokoro-FastAPI.
             </div>
           </div>
           <div className="mt-4">
-            <div className="mb-1.5 text-[13px] text-ink-secondary">API Key (optional)</div>
+            <div className="mb-1.5 text-[13px] text-ink-secondary">Model</div>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && void save(ttsOpenaiModelPatch(model))}
+                placeholder="tts-1 or kokoro"
+                aria-label="Model"
+                autoComplete="off"
+                className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+              />
+              <button
+                onClick={() => void save(ttsOpenaiModelPatch(model))}
+                disabled={saving}
+                className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
+              </button>
+            </div>
+          </div>
+          <div className="mt-4">
+            <div className="mb-1.5 flex items-center gap-2 text-[13px] text-ink-secondary">
+              <span className={cn("size-1.5 rounded-full", tts.openaiKeyConfigured ? "bg-success" : "bg-raised-hover")} />
+              <span>API Key (optional)</span>
+              {tts.openaiKeyConfigured && <span className="text-[11px] text-success">Connected</span>}
+            </div>
             <div className="flex gap-2">
               <input
                 type="password"
                 value={key}
                 onChange={(e) => setKey(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && void saveCredentials()}
-                placeholder="Optional for local servers"
+                placeholder={tts.openaiKeyConfigured ? "••••••••  (paste to replace)" : "Optional for local servers"}
                 aria-label="API Key"
                 autoComplete="off"
                 className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
@@ -265,6 +295,18 @@ export function VoiceSettings({
               >
                 {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
               </button>
+              {tts.openaiKeyConfigured && (
+                <button
+                  onClick={() =>
+                    void save(ttsOpenaiCredentialsPatch(baseUrl || tts.baseUrl || "", "", { clearKey: true }))
+                  }
+                  disabled={saving}
+                  aria-label="Clear API key"
+                  className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Clear
+                </button>
+              )}
             </div>
           </div>
         </>

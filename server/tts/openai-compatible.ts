@@ -15,6 +15,14 @@ export interface Audio {
 
 export type VerifyResult = { ok: true } | { ok: false; message: string };
 
+export interface SpeechOpts {
+  model?: string;
+  voice?: string;
+}
+
+const DEFAULT_MODEL = "tts-1";
+const DEFAULT_VOICE = "alloy";
+
 async function safeJson(res: Response): Promise<any> {
   try {
     return await res.json();
@@ -40,19 +48,33 @@ function authHeader(key?: string): Record<string, string> {
   return key ? { authorization: `Bearer ${key}` } : {};
 }
 
-/** Verify the server is reachable and the key (if provided) works. We check
- * against a cheap speech request rather than a models or voices endpoint that
- * may not exist on all OpenAI-compatible servers. */
-export async function verifyKey(baseUrl: string, key?: string): Promise<VerifyResult> {
+function speechPayload(input: string, opts?: SpeechOpts) {
+  return {
+    model: opts?.model?.trim() || DEFAULT_MODEL,
+    input,
+    voice: opts?.voice?.trim() || DEFAULT_VOICE,
+    response_format: "mp3" as const,
+  };
+}
+
+function rootUrl(baseUrl: string): string {
+  return baseUrl.replace(/\/$/, "");
+}
+
+/** Verify the server is reachable and the key (if provided) works. Same
+ * payload as speak so a saved model/voice is what we probe — not a dummy
+ * alloy ping unless that is the saved or default voice. */
+export async function verifyKey(baseUrl: string, key?: string, opts?: SpeechOpts): Promise<VerifyResult> {
   try {
-    const url = `${baseUrl.replace(/\/$/, "")}/audio/speech`;
+    const url = `${rootUrl(baseUrl)}/audio/speech`;
     const res = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeader(key) },
-      body: JSON.stringify({ model: "tts-1", input: "test", voice: "alloy" }),
+      body: JSON.stringify(speechPayload("test", opts)),
       signal: AbortSignal.timeout(20_000),
     });
-    // 200 = success, 400 = server understood but rejected params (still valid), others are real failures
+    // 200 = success. 400 = server understood the route but rejected params
+    // (reachable). 5xx / anything else is a real failure.
     if (res.ok || res.status === 400) return { ok: true };
     return { ok: false, message: message(res.status, "checking that server", await safeJson(res)) };
   } catch (e) {
@@ -64,37 +86,58 @@ export async function verifyKey(baseUrl: string, key?: string): Promise<VerifyRe
   }
 }
 
-/** Try to list voices from the server. Many OpenAI-compatible servers don't
- * expose a voices endpoint, so we return a fallback list of common Kokoro
- * voices when the endpoint is missing or fails. */
-export async function listVoices(baseUrl: string, key?: string): Promise<Voice[]> {
+function parseVoiceList(body: any): Voice[] {
+  const list = Array.isArray(body) ? body : body?.voices ?? [];
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((v: any): Voice => ({
+      id: String(v.voice_id ?? v.id ?? ""),
+      label: String(v.name ?? v.label ?? v.id ?? "Voice"),
+      description: v.description || v.labels?.description || undefined,
+    }))
+    .filter((v: Voice) => v.id);
+}
+
+async function fetchVoices(url: string, key?: string): Promise<Voice[] | null> {
   try {
-    const url = `${baseUrl.replace(/\/$/, "")}/voices`;
     const res = await fetch(url, {
       headers: authHeader(key),
       signal: AbortSignal.timeout(20_000),
     });
-    if (!res.ok) return fallbackVoices();
-    const body = await safeJson(res);
-    // Try both OpenAI shape ({ voices: [...] }) and direct array shape
-    const list = Array.isArray(body) ? body : body?.voices ?? [];
-    if (!Array.isArray(list) || list.length === 0) return fallbackVoices();
-    return list
-      .map((v: any): Voice => ({
-        id: String(v.voice_id ?? v.id ?? ""),
-        label: String(v.name ?? v.label ?? v.id ?? "Voice"),
-        description: v.description || v.labels?.description || undefined,
-      }))
-      .filter((v: Voice) => v.id);
+    if (!res.ok) return null;
+    const parsed = parseVoiceList(await safeJson(res));
+    return parsed.length ? parsed : null;
   } catch {
-    return fallbackVoices();
+    return null;
   }
 }
 
-/** Fallback voices for servers that don't expose a /voices endpoint. Based on
- * common Kokoro-FastAPI voices, but generic enough for any OpenAI-compatible
- * server. Users can also type a custom voice ID. */
-function fallbackVoices(): Voice[] {
+function looksLikeOpenAi(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    return host === "api.openai.com" || host.endsWith(".api.openai.com");
+  } catch {
+    return /api\.openai\.com/i.test(baseUrl);
+  }
+}
+
+const OPENAI_VOICES: Voice[] = [
+  { id: "alloy", label: "Alloy" },
+  { id: "echo", label: "Echo" },
+  { id: "fable", label: "Fable" },
+  { id: "onyx", label: "Onyx" },
+  { id: "nova", label: "Nova" },
+  { id: "shimmer", label: "Shimmer" },
+  { id: "ash", label: "Ash" },
+  { id: "coral", label: "Coral" },
+  { id: "sage", label: "Sage" },
+];
+
+/** Fallback voices for servers that don't expose a voices endpoint. Kokoro
+ * names for local/unknown hosts; OpenAI built-ins when the base URL is
+ * api.openai.com. Users can also type a custom voice ID. */
+function fallbackVoices(baseUrl: string): Voice[] {
+  if (looksLikeOpenAi(baseUrl)) return OPENAI_VOICES;
   return [
     { id: "af_heart", label: "Heart (af)" },
     { id: "am_adam", label: "Adam (am)" },
@@ -109,19 +152,31 @@ function fallbackVoices(): Voice[] {
   ];
 }
 
+/** Try `/audio/voices` then `/voices`. If both miss, fall back by host. */
+export async function listVoices(baseUrl: string, key?: string): Promise<Voice[]> {
+  const root = rootUrl(baseUrl);
+  return (
+    (await fetchVoices(`${root}/audio/voices`, key)) ??
+    (await fetchVoices(`${root}/voices`, key)) ??
+    fallbackVoices(baseUrl)
+  );
+}
+
 export async function synthesize(
   text: string,
   voiceId: string,
   baseUrl: string,
   key?: string,
+  model?: string,
 ): Promise<Audio> {
-  const url = `${baseUrl.replace(/\/$/, "")}/audio/speech`;
+  const url = `${rootUrl(baseUrl)}/audio/speech`;
   const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeader(key) },
-    body: JSON.stringify({ model: "tts-1", input: text, voice: voiceId }),
+    body: JSON.stringify(speechPayload(text, { model, voice: voiceId })),
     signal: AbortSignal.timeout(60_000),
   });
   if (!res.ok) throw new Error(message(res.status, "speaking", await safeJson(res)));
-  return { bytes: new Uint8Array(await res.arrayBuffer()), mime: "audio/mpeg" };
+  const mime = res.headers.get("content-type")?.trim() || "audio/mpeg";
+  return { bytes: new Uint8Array(await res.arrayBuffer()), mime };
 }
