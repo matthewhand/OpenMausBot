@@ -186,4 +186,73 @@ describe("LAN access authentication", () => {
     expect(res.status).toBe(204);
     expect(res.headers.get("access-control-allow-origin")).toBe(CORS_ORIGIN);
   });
+
+  it("does not treat OMB_AUTH_TOKEN as COMMS_TOKEN on /api/internal", async () => {
+    const res = await api("GET", "/api/internal/agents?self=ghost");
+    expect(res.status).toBe(401);
+    expect(res.body.error).toContain("unauthorized");
+  });
+});
+
+describe("whitespace-only OMB_AUTH_TOKEN on loopback", () => {
+  const port = 28_000 + Math.floor(Math.random() * 10_000);
+  const base = `http://127.0.0.1:${port}`;
+  let blank: ChildProcess;
+  let blankHome: string;
+  let blankStderr = "";
+
+  beforeAll(async () => {
+    blankHome = mkdtempSync(join(tmpdir(), "omb-lan-blank-"));
+    mkdirSync(join(blankHome, ".openmausbot"), { recursive: true });
+    writeFileSync(
+      join(blankHome, ".openmausbot", "config.json"),
+      JSON.stringify({ instances: { ghost: { driver: "not-a-real-driver", displayName: "Ghost" } } }),
+    );
+
+    blank = spawn(process.execPath, ["--experimental-strip-types", join(SERVER_DIR, "index.ts")], {
+      cwd: ROOT,
+      env: {
+        ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
+        ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+        HOME: blankHome,
+        USERPROFILE: blankHome,
+        OMB_PORT: String(port),
+        OMB_HOST: "127.0.0.1",
+        OMB_AUTH_TOKEN: "   ",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    blank.stderr!.on("data", (c) => (blankStderr += c));
+
+    const deadline = Date.now() + 20_000;
+    for (;;) {
+      try {
+        const res = await fetch(`${base}/api/health`);
+        if (res.ok) break;
+      } catch {
+        /* not up yet */
+      }
+      if (Date.now() > deadline) throw new Error(`server never came up. stderr:\n${blankStderr}`);
+      if (blank.exitCode !== null) throw new Error(`server exited ${blank.exitCode}. stderr:\n${blankStderr}`);
+      await new Promise((r) => setTimeout(r, 150));
+    }
+  }, 30_000);
+
+  afterAll(async () => {
+    blank?.kill("SIGTERM");
+    await new Promise<void>((resolve) => {
+      if (!blank || blank.exitCode !== null) return resolve();
+      blank.on("close", () => resolve());
+      setTimeout(() => (blank.kill("SIGKILL"), resolve()), 5_000).unref?.();
+    });
+    rmSync(blankHome, { recursive: true, force: true });
+  });
+
+  it("does not enable auth — health and /api/instances are open without Bearer", async () => {
+    const health = await fetch(`${base}/api/health`);
+    expect(health.status).toBe(200);
+    const instances = await fetch(`${base}/api/instances`);
+    expect(instances.status).toBe(200);
+    expect(Array.isArray(((await instances.json()) as { instances: unknown }).instances)).toBe(true);
+  });
 });

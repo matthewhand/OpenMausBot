@@ -299,6 +299,8 @@ export interface AppState {
    * same message be focused twice in a row */
   focusMessage: { threadId: string; messageId: string; nonce: number; consumed: boolean } | null;
   connected: boolean;
+  /** /api/bots or /api/config returned 401 — missing LAN token, not a down server */
+  unauthorized: boolean;
   error: string | null;
   mascotMotion: {
     botId: string;
@@ -376,6 +378,7 @@ export type Action =
   | { type: "setModel"; botId: string; selection: ModelSelection }
   | { type: "interrupt"; botId: string }
   | { type: "connected"; value: boolean }
+  | { type: "unauthorized" }
   | { type: "error"; message: string | null }
   | { type: "toggleSettings"; open?: boolean }
   | { type: "togglePlugins"; open?: boolean }
@@ -444,7 +447,7 @@ export function reducer(state: AppState, action: Action): AppState {
       const known = (id: string) => action.bots.some((b) => b.id === id) || action.groups.some((g) => g.id === id);
       const selectedId =
         state.selectedId && known(state.selectedId) ? state.selectedId : (action.bots[0]?.id ?? "");
-      return { ...state, bots: action.bots, groups: action.groups, selectedId };
+      return { ...state, bots: action.bots, groups: action.groups, selectedId, unauthorized: false };
     }
     case "showRoutines":
       return {
@@ -693,6 +696,8 @@ export function reducer(state: AppState, action: Action): AppState {
       return updateBot(state, action.botId, (b) => ({ ...b, modelSelection: action.selection }));
     case "connected":
       return { ...state, connected: action.value };
+    case "unauthorized":
+      return { ...state, unauthorized: true };
     case "error":
       return {
         ...(action.message && state.selectedId
@@ -872,6 +877,7 @@ export const initialState: AppState = {
   provisioning: {},
   focusMessage: null,
   connected: false,
+  unauthorized: false,
   error: null,
   mascotMotion: null,
 };
@@ -883,8 +889,16 @@ export async function api(path: string, init?: RequestInit): Promise<any> {
     headers: { "content-type": "application/json", ...lanAuthHeaders(), ...(init?.headers ?? {}) },
   });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error ?? `${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const err = new Error(body.error ?? `${res.status} ${res.statusText}`) as Error & { status: number };
+    err.status = res.status;
+    throw err;
+  }
   return body;
+}
+
+function isUnauthorized(e: unknown): boolean {
+  return Boolean(e && typeof e === "object" && "status" in e && (e as { status: unknown }).status === 401);
 }
 
 /** Per-frame stream state lives in its OWN context: token frames update only
@@ -1217,17 +1231,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // ── initial load + SSE fold ──────────────────────────────────────────
   useEffect(() => {
     let alive = true;
+    const markUnauthorized = (e: unknown) => {
+      if (alive && isUnauthorized(e)) rawDispatch({ type: "unauthorized" });
+    };
     const loadAll = () =>
       Promise.all([
         api("/api/bots")
           .then(({ bots, groups }) => alive && rawDispatch({ type: "hydrate", bots, groups: groups ?? [] }))
-          .catch(() => {}),
+          .catch(markUnauthorized),
         api("/api/instances")
           .then(({ instances }) => alive && rawDispatch({ type: "instances", instances }))
           .catch(() => {}),
         api("/api/config")
           .then((config) => alive && rawDispatch({ type: "configStatus", config }))
-          .catch(() => {}),
+          .catch(markUnauthorized),
         api("/api/routines")
           .then(({ routines, runs }) => alive && rawDispatch({ type: "routinesHydrated", routines, runs }))
           .catch(() => {}),

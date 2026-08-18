@@ -6,9 +6,19 @@
 
 const STORAGE_KEY = "ombAuthToken";
 
+type TokenStorage = Pick<Storage, "getItem" | "setItem">;
+
+function defaultTokenStorage(): TokenStorage | null {
+  return typeof localStorage === "undefined" ? null : localStorage;
+}
+
+function resolveTokenStorage(storage?: TokenStorage | null): TokenStorage | null {
+  return storage === undefined ? defaultTokenStorage() : storage;
+}
+
 export function readLanAuthToken(
   search = typeof window === "undefined" ? "" : window.location.search,
-  storage: Pick<Storage, "getItem" | "setItem"> | null = typeof localStorage === "undefined" ? null : localStorage,
+  storage: TokenStorage | null = defaultTokenStorage(),
 ): string {
   try {
     const fromQuery = new URLSearchParams(search.startsWith("?") ? search.slice(1) : search).get("access_token");
@@ -22,13 +32,13 @@ export function readLanAuthToken(
   }
 }
 
-export function lanAuthHeaders(): Record<string, string> {
-  const token = readLanAuthToken();
+export function lanAuthHeaders(storage?: TokenStorage | null): Record<string, string> {
+  const token = readLanAuthToken(typeof window === "undefined" ? "" : window.location.search, resolveTokenStorage(storage));
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-export function eventsUrl(path = "/api/events"): string {
-  const token = readLanAuthToken();
+export function eventsUrl(path = "/api/events", storage?: TokenStorage | null): string {
+  const token = readLanAuthToken(typeof window === "undefined" ? "" : window.location.search, resolveTokenStorage(storage));
   if (!token) return path;
   const join = path.includes("?") ? "&" : "?";
   return `${path}${join}access_token=${encodeURIComponent(token)}`;

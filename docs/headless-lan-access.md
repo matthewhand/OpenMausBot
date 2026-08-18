@@ -43,14 +43,22 @@ When `OMB_CORS_ORIGIN=*`, the server does **not** send `Access-Control-Allow-Cre
 
 For development with `pnpm dev` and `pnpm dev:server`:
 
-1. **Create a `.env` file** in the project root (or export the variables in the shell that starts the server):
+1. **Set process environment variables** in the shell (or service) that starts the server. The harness does **not** load a root `.env` file.
 
-```env
-# Server (harness) configuration
-OMB_HOST=0.0.0.0
-OMB_PORT=8799
-OMB_AUTH_TOKEN=your-strong-random-token-here
-OMB_CORS_ORIGIN=*
+```powershell
+# PowerShell (this session only)
+$env:OMB_HOST="0.0.0.0"
+$env:OMB_PORT="8799"
+$env:OMB_AUTH_TOKEN="your-strong-random-token-here"
+$env:OMB_CORS_ORIGIN="*"
+```
+
+```bash
+# bash / zsh (this session only)
+export OMB_HOST=0.0.0.0
+export OMB_PORT=8799
+export OMB_AUTH_TOKEN=your-strong-random-token-here
+export OMB_CORS_ORIGIN=*
 ```
 
 The Vite UI still binds `127.0.0.1:5199` in this PR. For LAN development, access the packaged/static harness on `OMB_PORT`, or run the UI on the same machine as Vite.
@@ -208,5 +216,5 @@ New-NetFirewallRule -DisplayName "OpenMausBot Harness" -Direction Inbound -Proto
 2. **HTTPS**: Consider putting OpenMausBot behind a reverse proxy (nginx, Caddy) with HTTPS
 3. **Restrict origins**: Set `OMB_CORS_ORIGIN` to your specific frontend URL instead of `*`
 4. **Network isolation**: Use a VPN or restrict firewall rules to trusted IPs only
-5. **Monitor logs**: Check `%APPDATA%\OpenMausBot\logs\server.log` regularly
+5. **Monitor logs**: `pnpm dev:server` writes to stderr (not `%APPDATA%\OpenMausBot\logs\server.log`)
 6. **Backup**: Regularly backup `%USERPROFILE%\.openmausbot\` directory

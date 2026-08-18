@@ -87,7 +87,8 @@ const HOST = process.env.OMB_HOST || "127.0.0.1";
 // LAN access auth token. When set, all /api/ requests (except /api/health and
 // /api/internal/* which has COMMS_TOKEN) require the Authorization header.
 // Defaults to disabled for backward compatibility and local-only use.
-const AUTH_TOKEN = process.env.OMB_AUTH_TOKEN || null;
+// Trim once: whitespace-only is unset (no auth, no lanMode CSRF relaxation).
+const AUTH_TOKEN = (process.env.OMB_AUTH_TOKEN ?? "").trim() || null;
 // CORS origin for LAN access. Set to "*" or a specific origin (e.g., "http://10.0.0.32:5199").
 // Defaults to null (no CORS headers) for localhost-only setups.
 const CORS_ORIGIN = process.env.OMB_CORS_ORIGIN || null;
