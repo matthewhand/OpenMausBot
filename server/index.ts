@@ -198,6 +198,14 @@ import {
 import { createGracefulShutdown } from "./graceful-shutdown.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
+const HOST = process.env.OMB_HOST || "127.0.0.1";
+// LAN access auth token. When set, all /api/ requests (except /api/health and
+// /api/internal/* which has COMMS_TOKEN) require the Authorization header.
+// Defaults to disabled for backward compatibility and local-only use.
+const AUTH_TOKEN = process.env.OMB_AUTH_TOKEN || null;
+// CORS origin for LAN access. Set to "*" or a specific origin (e.g., "http://10.0.0.32:5199").
+// Defaults to null (no CORS headers) for localhost-only setups.
+const CORS_ORIGIN = process.env.OMB_CORS_ORIGIN || null;
 const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
 const STATIC_DIR = process.env.OMB_STATIC_DIR || null;
 const MIME: Record<string, string> = {
@@ -269,6 +277,19 @@ const COMMS_TOKEN = randomBytes(24).toString("hex");
 /** Constant-time bearer check for the internal comms endpoints. The token
  * is high-entropy and loopback-only, so a timing oracle is a long shot —
  * but the compare costs nothing to make safe. */
+function tokenEquals(got: string, expected: string): boolean {
+  const a = Buffer.from(got);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function authorizedLan(header: string | string[] | undefined, queryToken: string | null): boolean {
+  if (!AUTH_TOKEN) return true;
+  const raw = Array.isArray(header) ? header[0] : header;
+  const fromHeader = raw?.startsWith("Bearer ") ? raw.slice("Bearer ".length) : "";
+  return tokenEquals(fromHeader || queryToken || "", AUTH_TOKEN);
+}
+
 function authorizedComms(header: string | string[] | undefined): boolean {
   const expected = Buffer.from(`Bearer ${COMMS_TOKEN}`);
   const got = Buffer.from(Array.isArray(header) ? "" : (header ?? ""));
@@ -4041,14 +4062,41 @@ const server = createServer(async (req, res) => {
   const method = req.method ?? "GET";
   /** scratch for route matches, shared by every `path.match` below */
   let m: RegExpMatchArray | null = null;
+
+  // CORS headers for LAN access
+  if (CORS_ORIGIN) {
+    res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Last-Event-ID");
+    if (CORS_ORIGIN !== "*") {
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+      res.setHeader("Vary", "Origin");
+    }
+
+    // Handle preflight requests
+    if (method === "OPTIONS") {
+      res.writeHead(204);
+      return res.end();
+    }
+  }
+
   try {
-    // loopback-host + loopback-origin gate before any route (DNS rebinding / CSRF)
-    if (!isLoopbackHost(req.headers.host)) {
+    // loopback-host + loopback-origin gate before any route (DNS rebinding / CSRF).
+    // LAN mode (OMB_AUTH_TOKEN) is the explicit exception: the Host is a LAN
+    // address and the origin is whatever CORS_ORIGIN allows. Auth is checked
+    // after the internal-comms routes. Loopback is not exempt from the token.
+    const lanMode = Boolean(AUTH_TOKEN);
+    if (!lanMode && !isLoopbackHost(req.headers.host)) {
       return json(res, 403, { error: "forbidden: loopback host required" });
     }
     const origin = req.headers.origin;
     if (origin && !isAllowedOrigin(origin)) {
-      return json(res, 403, { error: "forbidden: cross-origin request" });
+      if (!lanMode) {
+        return json(res, 403, { error: "forbidden: cross-origin request" });
+      }
+      if (CORS_ORIGIN && CORS_ORIGIN !== "*" && origin !== CORS_ORIGIN) {
+        return json(res, 403, { error: "forbidden: cross-origin request" });
+      }
     }
     // ── internal peer-agent comms (localhost + shared token only) ──────
     // The agents-proxy (spawned inside a bot's agent process) calls these to
@@ -4524,6 +4572,16 @@ const server = createServer(async (req, res) => {
         return json(res, 200, { messageIds });
       }
       return json(res, 404, { error: "unknown internal endpoint" });
+    }
+
+    // ── LAN access authentication ──────────────────────────────────────
+    // When OMB_AUTH_TOKEN is set, all public /api/ endpoints (except /api/health)
+    // require the token. EventSource cannot send headers, so GET also accepts
+    // ?access_token= (same value). Compare is constant-time like /api/internal.
+    if (AUTH_TOKEN && path.startsWith("/api/") && path !== "/api/health") {
+      if (!authorizedLan(req.headers.authorization, url.searchParams.get("access_token"))) {
+        return json(res, 401, { error: "unauthorized: valid OMB_AUTH_TOKEN required" });
+      }
     }
 
     // Live Team Map metadata. Prompts and replies never leave their
@@ -7337,8 +7395,20 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`openmausbot server on http://127.0.0.1:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`openmausbot server on http://${HOST}:${PORT}`);
+  if (AUTH_TOKEN) {
+    console.log("⚠️  LAN authentication enabled (OMB_AUTH_TOKEN is set)");
+  }
+  if (CORS_ORIGIN) {
+    console.log(`✓ CORS enabled for origin: ${CORS_ORIGIN}`);
+  }
+  if (HOST !== "127.0.0.1") {
+    console.log(`⚠️  Server bound to ${HOST} — accessible from the network`);
+    if (!AUTH_TOKEN) {
+      console.log("⚠️  WARNING: No OMB_AUTH_TOKEN set. Consider setting one for LAN security.");
+    }
+  }
 });
 
 const gracefulShutdown = createGracefulShutdown({

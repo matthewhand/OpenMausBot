@@ -6,6 +6,8 @@
  * this supervisor uses it as liveness, owns reconnects itself, and carries an
  * explicit replay cursor whenever it replaces the native EventSource.
  */
+import { eventsUrl } from "./lan-auth";
+
 export const LIVE_EVENTS_PATH = "/api/events";
 export const LIVE_EVENTS_STALE_MS = 40_000;
 export const LIVE_EVENTS_RETRY_MIN_MS = 500;
@@ -234,7 +236,7 @@ export function openLiveEvents(
     let current: LiveEventSourceLike;
     try {
       current = platform.createEventSource(
-        liveEventsUrl({ since: cursor, screens: handlers.screens }),
+        eventsUrl(liveEventsUrl({ since: cursor, screens: handlers.screens })),
       );
     } catch {
       handlers.onError?.();

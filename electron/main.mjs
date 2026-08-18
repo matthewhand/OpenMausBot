@@ -1476,10 +1476,16 @@ function createWindow() {
     });
   }
 
+  const withToken = (base) => {
+    const token = process.env.OMB_AUTH_TOKEN;
+    if (!token || !base.startsWith("http")) return base;
+    const join = base.includes("?") ? "&" : "?";
+    return `${base}${join}access_token=${encodeURIComponent(token)}`;
+  };
   if (app.isPackaged) {
-    win.loadURL(serverReady ? `http://127.0.0.1:${SERVER_PORT}` : buildErrorPage({ allPortsOccupied: serverStartConflictOnly }));
+    win.loadURL(serverReady ? withToken(`http://127.0.0.1:${SERVER_PORT}`) : buildErrorPage({ allPortsOccupied: serverStartConflictOnly }));
   } else {
-    win.loadURL(DEV_URL);
+    win.loadURL(withToken(DEV_URL));
   }
   return win;
 }

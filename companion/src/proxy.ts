@@ -194,9 +194,9 @@ const endpointSnapshot = (options: ProxyOptions): CompanionEndpointSnapshot => {
 };
 
 /** Headers worth carrying to the harness. An allowlist rather than a
- * blocklist: `host` and `origin` must not travel (see above), `authorization`
- * is the sidecar's credential and means nothing to the harness, and hop-by-hop
- * headers are by definition not ours to relay. */
+ * blocklist: `host` and `origin` must not travel (see above). The phone
+ * bearer authenticates the sidecar; if the harness is LAN-gated we attach
+ * OMB_AUTH_TOKEN instead. Hop-by-hop headers are not ours to relay. */
 const forwardHeaders = (req: IncomingMessage): Record<string, string> => {
   const out: Record<string, string> = {
     accept: String(req.headers.accept ?? "*/*"),
@@ -211,6 +211,10 @@ const forwardHeaders = (req: IncomingMessage): Record<string, string> => {
   // would turn every resume into a full re-hydration, silently.
   const lastEventId = req.headers["last-event-id"];
   if (lastEventId) out["last-event-id"] = String(lastEventId);
+  // Phone token authenticates the sidecar, not the harness. If the harness
+  // itself is LAN-gated, the sidecar must present the machine token.
+  const harnessToken = process.env.OMB_AUTH_TOKEN?.trim();
+  if (harnessToken) out.authorization = `Bearer ${harnessToken}`;
   return out;
 };
 
