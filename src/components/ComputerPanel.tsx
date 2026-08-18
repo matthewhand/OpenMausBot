@@ -4,7 +4,7 @@
 // come from the Electron main process (desktopCapturer over the preload
 // bridge — box endpoints are never touched); off → parked. Auto (unset)
 // prefers the cloud box when one exists, else local inside the app.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   CalendarDays,
   CalendarClock,
@@ -205,14 +205,14 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   // cloud preview: SSE frames win while the bot works; otherwise poll
   const live = state.screens[bot.id];
   const sseFlowing = Boolean(bot.busy && live);
-  const inFlight = useRef(false);
   useEffect(() => {
     if (phase !== "ready" || sseFlowing) return;
     let alive = true;
+    let inFlight = false;
     let controller: AbortController | undefined;
     const shoot = async () => {
-      if (inFlight.current) return;
-      inFlight.current = true;
+      if (inFlight) return;
+      inFlight = true;
       controller = new AbortController();
       try {
         const { png, format } = await api(`/api/bots/${bot.id}/computer/screenshot`, {
@@ -224,13 +224,14 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
         if (e instanceof DOMException && e.name === "AbortError") return;
         /* box mid-command or asleep — next tick */
       } finally {
-        inFlight.current = false;
+        inFlight = false;
       }
     };
     void shoot();
     const timer = setInterval(shoot, 4000);
     return () => {
       alive = false;
+      inFlight = false;
       controller?.abort();
       clearInterval(timer);
     };
@@ -238,14 +239,14 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
 
   // Local VM preview comes directly from Cua Driver through the harness. It
   // does not use the password-protected noVNC viewer or cloud endpoints.
-  const vmInFlight = useRef(false);
   useEffect(() => {
     if (phase !== "vm") return;
     let alive = true;
+    let inFlight = false;
     let controller: AbortController | undefined;
     const shoot = async () => {
-      if (vmInFlight.current) return;
-      vmInFlight.current = true;
+      if (inFlight) return;
+      inFlight = true;
       controller = new AbortController();
       try {
         const { image } = await api("/api/local-computer/screenshot", { method: "POST", signal: controller.signal });
@@ -254,13 +255,14 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
         if (e instanceof DOMException && e.name === "AbortError") return;
         if (alive) setError(e instanceof Error ? e.message : String(e));
       } finally {
-        vmInFlight.current = false;
+        inFlight = false;
       }
     };
     void shoot();
     const timer = window.setInterval(() => void shoot(), 3000);
     return () => {
       alive = false;
+      inFlight = false;
       controller?.abort();
       window.clearInterval(timer);
     };
