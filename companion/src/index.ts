@@ -84,8 +84,10 @@ const machineName = (): string => cachedName || "OpenMausBot";
 async function refreshMachineName(): Promise<void> {
   if (cachedName) return; // an explicit override is not ours to second-guess
   try {
+    const token = process.env.OMB_AUTH_TOKEN?.trim();
     const res = await fetch(`http://127.0.0.1:${HARNESS_PORT}/api/config`, {
       signal: AbortSignal.timeout(3000),
+      headers: token ? { authorization: `Bearer ${token}` } : undefined,
     });
     if (!res.ok) return;
     const config = (await res.json()) as { profile?: { name?: string } };

@@ -186,6 +186,45 @@ describe("Instance CLI override", () => {
   });
 });
 
+describe("reserved MCP names", () => {
+  it("rejects a server named after a built-in mount", () => {
+    expect(() => parseConfigPatch({ mcpServers: [{ name: "agents", transport: "http", url: "https://x.example/mcp" }] })).toThrow(
+      /reserved/,
+    );
+    expect(() =>
+      parseConfigPatch({
+        mcpServers: [
+          { name: "notion", transport: "http", url: "https://x.example/mcp" },
+          { name: "notion", transport: "sse", url: "https://y.example/sse" },
+        ],
+      }),
+    ).toThrow(/duplicate/);
+    expect(() => parseConfigPatch({ mcpServers: [{ name: "bad name", transport: "http", url: "https://x.example/mcp" }] })).toThrow();
+  });
+});
+
+describe("mergeMcpServers", () => {
+  it("keeps stored headers when a PUT omits them", () => {
+    const merged = mergeMcpServers(
+      [{ name: "notion", transport: "http", url: "https://n.example/mcp", headers: { Authorization: "Bearer secret" }, enabled: true }],
+      [{ name: "notion", transport: "http", url: "https://n.example/mcp", enabled: false }],
+    );
+    expect(merged[0]).toMatchObject({
+      name: "notion",
+      enabled: false,
+      headers: { Authorization: "Bearer secret" },
+    });
+  });
+
+  it("clears headers when the patch sends an empty object", () => {
+    const merged = mergeMcpServers(
+      [{ name: "notion", transport: "http", url: "https://n.example/mcp", headers: { Authorization: "Bearer secret" } }],
+      [{ name: "notion", transport: "http", url: "https://n.example/mcp", headers: {} }],
+    );
+    expect(merged[0].headers).toEqual({});
+  });
+});
+
 describe("OpenCode Go configuration", () => {
   it("injects the key only into OpenCode Go instances", () => {
     const cfg: AppConfig = {
