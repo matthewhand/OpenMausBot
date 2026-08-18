@@ -29,12 +29,27 @@
 //                        core.ts has something to catch
 //   FAKE_ACP_USAGE_ROOT  put the prompt result's usage at the root instead of
 //                        under _meta (what opencode 1.18.18 actually does)
+//   OMB_FAKE_ACP_MCP     comma-separated extra MCP transports to advertise on
+//                        initialize (http, sse). Default is none — existing
+//                        tests still prove the driver strips custom HTTP/SSE
+//                        when the agent did not advertise them.
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
 import { spawn } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 
 const mode = process.env.FAKE_ACP_MODE ?? "happy";
+// Opt-in extra transports for initialize.agentCapabilities.mcpCapabilities.
+// Empty by default so a custom HTTP server is stripped — the attach test
+// sets OMB_FAKE_ACP_MCP=http,sse to prove the other side of the filter.
+const mcpCapabilities = (() => {
+  const advertised: { http?: boolean; sse?: boolean } = {};
+  for (const token of (process.env.OMB_FAKE_ACP_MCP ?? "").split(",")) {
+    const kind = token.trim().toLowerCase();
+    if (kind === "http" || kind === "sse") advertised[kind] = true;
+  }
+  return advertised.http || advertised.sse ? advertised : undefined;
+})();
 // opencode-shaped surface: the session carries its own model catalog and the
 // model is chosen with session/set_config_option, because `opencode acp` takes
 // no -m. Off unless FAKE_ACP_MODELS is set, so every existing mode is byte-
@@ -64,6 +79,7 @@ if (process.env.FAKE_ACP_DUMP) {
       "SystemRoot",
       "FAKE_ACP_MODE",
       "FAKE_ACP_RPC_DUMP",
+      "OMB_FAKE_ACP_MCP",
       "TEST_POLICY",
       "OPENCODE_API_KEY",
       "OPENAI_API_KEY",
@@ -190,7 +206,12 @@ function handle(msg: any) {
         process.exit(3);
       }
       const authMethods = mode === "no-auth" ? [] : [{ id: "cached_token" }];
-      result(msg.id, { protocolVersion: 1, authMethods, _meta: { modelState: { currentModelId: "fake-acp-model" } } });
+      result(msg.id, {
+        protocolVersion: 1,
+        authMethods,
+        ...(mcpCapabilities ? { agentCapabilities: { mcpCapabilities } } : {}),
+        _meta: { modelState: { currentModelId: "fake-acp-model" } },
+      });
       break;
     }
     case "authenticate":
