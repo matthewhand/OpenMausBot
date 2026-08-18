@@ -6872,9 +6872,18 @@ const server = createServer(async (req, res) => {
       // patch SELECTS, not the one already saved, or pasting a Cartesia key
       // while switching from ElevenLabs validates against the wrong service
       const newTts = patch.tts;
-      if (newTts?.key?.trim()) {
-        const check = await tts.verifyKey(newTts.key.trim());
-        if (!check.ok) return json(res, 400, { error: check.message });
+      if (newTts) {
+        const provider = newTts.provider ?? cfg.tts?.provider ?? "elevenlabs";
+        // For OpenAI-compatible, verify if baseUrl is provided (key is optional)
+        if (provider === "openai-compatible" && newTts.baseUrl?.trim()) {
+          const check = await tts.verifyKey(newTts.key?.trim() ?? "", provider, newTts.baseUrl.trim());
+          if (!check.ok) return json(res, 400, { error: check.message });
+        }
+        // For ElevenLabs, verify if key is provided
+        else if (provider === "elevenlabs" && newTts.key?.trim()) {
+          const check = await tts.verifyKey(newTts.key.trim(), provider);
+          if (!check.ok) return json(res, 400, { error: check.message });
+        }
       }
       if (patch.browserProfiles !== undefined) {
         // Provider/credential validation above may await the network. A turn

@@ -244,9 +244,17 @@ const appConfigSchema = z.object({
   /** Optional OpenCode key; persisted write-only and passed only to its child. */
   opencodeGo: z.object({ apiKey: optionalText }).optional(),
   /** Voice credentials and the selected voice id. `provider` picks the
-   * engine: "elevenlabs" (default; needs a key) or "system" (the Mac's
-   * built-in voices, no key). */
-  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["elevenlabs", "system"]).optional() }).optional(),
+   * engine: "elevenlabs" (default; needs a key), "system" (the Mac's
+   * built-in voices, no key), or "openai-compatible" (Kokoro-style
+   * servers; needs a base URL, key optional). */
+  tts: z
+    .object({
+      key: optionalText,
+      voice: optionalText,
+      provider: z.enum(["elevenlabs", "system", "openai-compatible"]).optional(),
+      baseUrl: optionalText,
+    })
+    .optional(),
   /** OpenAI key used only by the in-process avatar image generator. */
   imageGen: z.object({ key: optionalText }).optional(),
   /** Non-secret profile details shown in the sidebar. */
@@ -271,7 +279,12 @@ export interface AppConfig {
   /** A named host from the user's SSH config. Authentication stays with SSH. */
   vps?: { sshAlias?: string };
   opencodeGo?: { apiKey?: string };
-  tts?: { key?: string; voice?: string; provider?: "elevenlabs" | "system" };
+  tts?: {
+    key?: string;
+    voice?: string;
+    provider?: "elevenlabs" | "system" | "openai-compatible";
+    baseUrl?: string;
+  };
   imageGen?: { key?: string };
   profile?: { name?: string; email?: string };
   rooms?: { turnTimeoutMinutes: number };
