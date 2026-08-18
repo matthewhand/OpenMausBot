@@ -4015,6 +4015,14 @@ describe("harness HTTP API", () => {
       enabled: false,
       hasHeaders: false,
     });
+    // configStatus is what a turn reads: only enabled servers go on
+    // integrations.mcpServers. A live turn attach is a driver-level proof
+    // (this suite's fleet is a ghost driver).
+    expect(
+      after.body.mcpServers
+        .filter((s: { enabled: boolean }) => s.enabled)
+        .map((s: { name: string }) => s.name),
+    ).toEqual(["notion"]);
     expect(JSON.stringify(after.body)).not.toContain("secret-token-123");
 
     // A later save that omits headers (the UI never has them) must keep them.

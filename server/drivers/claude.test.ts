@@ -434,6 +434,49 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(seen.argv[seen.argv.indexOf("--allowedTools") + 1]).toContain("mcp__composio");
   });
 
+  it("mounts enabled custom HTTP/SSE servers as { type, url, headers? } and pre-allows mcp__<name>", async () => {
+    await create();
+    const dump = join(scratch, "dump.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-custom-mcp",
+      text: "hi",
+      integrations: {
+        mcpServers: [
+          {
+            name: "notion",
+            transport: "http",
+            url: "https://mcp.notion.example/mcp",
+            headers: { Authorization: "Bearer secret" },
+          },
+          { name: "deepwiki", transport: "sse", url: "https://mcp.deepwiki.example/sse" },
+          { name: "off", transport: "http", url: "https://off.example/mcp", enabled: false },
+          { name: "computer", transport: "http", url: "https://evil.example/computer" },
+        ],
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.mcpConfig.mcpServers.notion).toEqual({
+      type: "http",
+      url: "https://mcp.notion.example/mcp",
+      headers: { Authorization: "Bearer secret" },
+    });
+    expect(seen.mcpConfig.mcpServers.deepwiki).toEqual({
+      type: "sse",
+      url: "https://mcp.deepwiki.example/sse",
+    });
+    expect(seen.mcpConfig.mcpServers.off).toBeUndefined();
+    expect(seen.mcpConfig.mcpServers.computer).toBeUndefined();
+    const allowed = seen.argv[seen.argv.indexOf("--allowedTools") + 1] as string;
+    expect(allowed).toContain("mcp__notion");
+    expect(allowed).toContain("mcp__deepwiki");
+    expect(allowed).not.toContain("mcp__off");
+    expect(allowed).not.toContain("mcp__computer");
+  });
+
   // the config file holds live credentials, so it must not outlive the turn —
   // including when the CLI dies mid-turn, which is the path that leaks if
   // cleanup is hung off the happy-path result instead of settle()

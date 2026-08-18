@@ -15,6 +15,29 @@ interface EditingServer extends Omit<McpServer, "hasHeaders"> {
   headers: Array<{ key: string; value: string }>;
 }
 
+/** Only include `headers` when the operator typed at least one complete pair.
+ * Editing a `hasHeaders` row starts with a blank pair so Save omits `headers`
+ * and mergeMcpServers keeps the stored secret. An explicit filled pair replaces. */
+export function customMcpSavePayload(editing: EditingServer): {
+  name: string;
+  transport: "http" | "sse";
+  url: string;
+  enabled: boolean;
+  headers?: Record<string, string>;
+} {
+  const headers: Record<string, string> = {};
+  for (const header of editing.headers) {
+    if (header.key.trim() && header.value.trim()) headers[header.key.trim()] = header.value.trim();
+  }
+  return {
+    name: editing.name.trim(),
+    transport: editing.transport,
+    url: editing.url.trim(),
+    enabled: editing.enabled,
+    ...(Object.keys(headers).length ? { headers } : {}),
+  };
+}
+
 export function CustomMcpTab() {
   const [servers, setServers] = useState<McpServer[]>([]);
   const [editing, setEditing] = useState<EditingServer | null>(null);
@@ -58,8 +81,9 @@ export function CustomMcpTab() {
       setError("Name must contain only letters, numbers, dash, and underscore");
       return;
     }
-    // Same reserved set as server/config.ts RESERVED_MCP_NAMES — reject here
-    // so the operator sees why before a 400 from parse.
+    // Must match server/config.ts RESERVED_MCP_NAMES. That module imports
+    // node:fs, so this tab cannot import it without pulling fs into the UI
+    // bundle. Reject here so the operator sees why before a 400 from parse.
     if (["agents", "computer", "composio", "dweb", "ogb"].includes(editing.name.trim())) {
       setError(`"${editing.name.trim()}" is reserved for a built-in mount`);
       return;
@@ -68,17 +92,7 @@ export function CustomMcpTab() {
     setSaving(true);
     setError(null);
     try {
-      const headers: Record<string, string> = {};
-      for (const h of editing.headers) {
-        if (h.key.trim() && h.value.trim()) headers[h.key.trim()] = h.value.trim();
-      }
-      const next = {
-        name: editing.name.trim(),
-        transport: editing.transport,
-        url: editing.url.trim(),
-        enabled: editing.enabled,
-        ...(Object.keys(headers).length ? { headers } : {}),
-      };
+      const next = customMcpSavePayload(editing);
       const payload = [
         ...servers.filter((s) => s.name !== next.name).map(({ hasHeaders: _h, ...rest }) => rest),
         next,
