@@ -33,6 +33,7 @@ import {
 } from "@/state/store";
 import { EngineSetup } from "./EngineSetup";
 import { MausAvatar } from "./Avatar";
+import { isCommChipMessage } from "@/lib/comm-popup";
 import { stateForBot } from "@/lib/mascot";
 import { showWorkingDots } from "@/lib/turn-tail";
 import { ChatMarkdown } from "./ChatMarkdown";
@@ -439,8 +440,8 @@ function Bubble({
 /** A tool run: spinner while live, check/cross once settled. */
 function ActivityChip({ message }: { message: Message }) {
   const tool = message.tool;
+  if (isCommChipMessage(message)) return <CommChip message={message} />;
   if (!tool) return null;
-  if (message.comm) return <CommChip message={message} />;
   const failed = tool.ok === false;
   return (
     <div className="flex justify-start">

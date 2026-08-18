@@ -3,7 +3,7 @@ import { ChevronRight, ExternalLink, X } from "lucide-react";
 import { formatTime, useStore, type Message } from "@/state/store";
 import { MausAvatar } from "./Avatar";
 import { ChatMarkdown } from "./ChatMarkdown";
-import { commPopupMessages } from "@/lib/comm-popup";
+import { commPopupMessages, isCommChipMessage } from "@/lib/comm-popup";
 import { cn } from "@/lib/cn";
 import { focusable, wrapTab } from "@/lib/focus-trap";
 import type { MausColor } from "@/lib/mascot";
@@ -12,8 +12,6 @@ import type { MausColor } from "@/lib/mascot";
 export function CommChip({ message }: { message: Message }) {
   const [open, setOpen] = useState(false);
   const chipRef = useRef<HTMLButtonElement>(null);
-  const comm = message.comm;
-
   useEffect(() => {
     if (!open) return;
     return () => {
@@ -21,7 +19,8 @@ export function CommChip({ message }: { message: Message }) {
     };
   }, [open]);
 
-  if (!comm || !message.tool) return null;
+  if (!isCommChipMessage(message)) return null;
+  const comm = message.comm;
   return (
     <div className="flex justify-start">
       <button
