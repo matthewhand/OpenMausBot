@@ -216,7 +216,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       // an injected stdio proxy — e.g. the peer-agent comms tool — attaches
       // fine here. env is the ACP {name,value}[] shape.
       const acpMcpServers = (turn: SendTurnInput) => {
-        const servers: Array<{ name: string; command: string; args: string[]; env: Array<{ name: string; value: string }> }> = [];
+        const servers: Array<Record<string, unknown>> = [];
         const acpEnv = (env: Record<string, string>) =>
           Object.entries(env).map(([name, value]) => ({ name, value: String(value) }));
         const agents = turn.integrations?.agents;
@@ -241,6 +241,19 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             command: local.command,
             args: local.args,
             env: acpEnv(local.env ?? {}),
+          });
+        }
+        // User-configured HTTP/SSE MCP servers (Plugins → Custom MCP). ACP
+        // agents that advertise mcpCapabilities.http/.sse accept these
+        // alongside the stdio proxies above.
+        for (const server of turn.integrations?.mcpServers ?? []) {
+          if (server.enabled === false) continue;
+          const headers = Object.entries(server.headers ?? {}).map(([name, value]) => ({ name, value }));
+          servers.push({
+            name: server.name,
+            type: server.transport,
+            url: server.url,
+            ...(headers.length ? { headers } : {}),
           });
         }
         return servers;

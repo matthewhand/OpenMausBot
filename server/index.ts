@@ -115,6 +115,19 @@ const COMMS_TOKEN = randomBytes(24).toString("hex");
 /** Constant-time bearer check for the internal comms endpoints. The token
  * is high-entropy and loopback-only, so a timing oracle is a long shot —
  * but the compare costs nothing to make safe. */
+function tokenEquals(got: string, expected: string): boolean {
+  const a = Buffer.from(got);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function authorizedLan(header: string | string[] | undefined, queryToken: string | null): boolean {
+  if (!AUTH_TOKEN) return true;
+  const raw = Array.isArray(header) ? header[0] : header;
+  const fromHeader = raw?.startsWith("Bearer ") ? raw.slice("Bearer ".length) : "";
+  return tokenEquals(fromHeader || queryToken || "", AUTH_TOKEN);
+}
+
 function authorizedComms(header: string | string[] | undefined): boolean {
   const expected = Buffer.from(`Bearer ${COMMS_TOKEN}`);
   const got = Buffer.from(Array.isArray(header) ? "" : (header ?? ""));
@@ -2007,10 +2020,10 @@ const server = createServer(async (req, res) => {
 
     // ── LAN access authentication ──────────────────────────────────────
     // When OMB_AUTH_TOKEN is set, all public /api/ endpoints (except /api/health)
-    // require Bearer token authentication. Health check is always open for probes.
+    // require the token. EventSource cannot send headers, so GET also accepts
+    // ?access_token= (same value). Compare is constant-time like /api/internal.
     if (AUTH_TOKEN && path.startsWith("/api/") && path !== "/api/health") {
-      const authHeader = req.headers.authorization;
-      if (!authHeader || authHeader !== `Bearer ${AUTH_TOKEN}`) {
+      if (!authorizedLan(req.headers.authorization, url.searchParams.get("access_token"))) {
         return json(res, 401, { error: "unauthorized: valid OMB_AUTH_TOKEN required" });
       }
     }

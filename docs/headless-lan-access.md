@@ -88,7 +88,13 @@ http://10.0.0.32:5199
 
 Replace `10.0.0.32` with your server's actual IP address.
 
-5. **Configure your client**: The UI will automatically include the `Authorization: Bearer <token>` header when making requests to the harness server API, but only if you configure it in the UI settings or via the config file.
+5. **Open the UI with the token once.** The browser cannot put a header on `EventSource`, so the first visit should be:
+
+```
+http://10.0.0.32:5199/?access_token=your-strong-random-token-here
+```
+
+The UI stores that value in `localStorage.ombAuthToken` and sends it as `Authorization: Bearer …` on every `fetch`. The SSE stream uses the same token as `?access_token=` on `/api/events`. Later visits to `http://10.0.0.32:5199` reuse the stored token.
 
 ### Option 2: Packaged App (Headless Windows Server)
 

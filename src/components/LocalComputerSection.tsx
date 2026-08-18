@@ -16,6 +16,7 @@ import {
 import { Card, CommandLine } from "./SettingsPrimitives";
 import { cn } from "@/lib/cn";
 import { loopbackViewerUsable } from "@/lib/loopback-viewer";
+import { lanAuthHeaders } from "@/lib/lan-auth";
 
 type Action = "pull" | "run" | "start" | "stop" | "remove" | "recreate";
 
@@ -112,7 +113,7 @@ export function LocalComputerSection() {
   const [watchError, setWatchError] = useState<string | null>(null);
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
-    const response = await fetch("/api/local-computer", { signal });
+    const response = await fetch("/api/local-computer", { signal, headers: lanAuthHeaders() });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error ?? `Status request failed (${response.status})`);
     setStatus(body as Status);
@@ -155,7 +156,7 @@ export function LocalComputerSection() {
       if (inFlight) return;
       inFlight = true;
       try {
-        const response = await fetch("/api/local-computer/screenshot", { method: "POST" });
+        const response = await fetch("/api/local-computer/screenshot", { method: "POST", headers: lanAuthHeaders() });
         const body = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(body.error ?? `screenshot failed (${response.status})`);
         if (alive && typeof body.image === "string") {
@@ -179,7 +180,7 @@ export function LocalComputerSection() {
   const post = async (action: Exclude<Action, "recreate">) => {
     const response = await fetch(`/api/local-computer/${action}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...lanAuthHeaders() },
       body: "{}",
     });
     const body = await response.json().catch(() => ({}));
@@ -392,7 +393,7 @@ export function LocalComputerSection() {
             <div className="min-h-[240px] overflow-auto bg-black p-3">
               {watchFrame ? (
                 <img
-                  src={`data:image/png;base64,${watchFrame}`}
+                  src={watchFrame.startsWith("data:") ? watchFrame : `data:image/png;base64,${watchFrame}`}
                   alt="Local VM screen"
                   className="mx-auto max-h-[70vh] w-auto max-w-full"
                 />

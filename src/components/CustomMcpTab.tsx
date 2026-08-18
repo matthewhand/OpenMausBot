@@ -104,8 +104,8 @@ export function CustomMcpTab() {
   return (
     <div className="flex min-h-0 flex-1 flex-col px-6 pb-7 pt-2 sm:px-8">
       <p className="mb-3 text-[13px] text-ink-secondary">
-        Add your own HTTP or SSE MCP servers. Claude bots pick them up on the next turn. Headers are
-        write-only.
+        Add your own HTTP or SSE MCP servers. Claude and ACP engines (Grok, Kimi, …) pick them up on
+        the next turn. Headers are write-only.
       </p>
       {error && <div className="mb-3 rounded-lg bg-danger/10 px-3 py-2 text-[12px] text-danger">{error}</div>}
 

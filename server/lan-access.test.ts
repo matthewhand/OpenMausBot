@@ -150,6 +150,18 @@ describe("LAN access authentication", () => {
     expect(res.headers.get("access-control-allow-headers")).toContain("Authorization");
   });
 
+  it("accepts the token as ?access_token= for EventSource", async () => {
+    const denied = await fetch(`${BASE}/api/events`);
+    expect(denied.status).toBe(401);
+    denied.body?.cancel();
+    const ac = new AbortController();
+    const allowed = await fetch(`${BASE}/api/events?access_token=${encodeURIComponent(AUTH_TOKEN)}`, {
+      signal: ac.signal,
+    });
+    expect(allowed.status).toBe(200);
+    ac.abort();
+  });
+
   it("handles OPTIONS preflight requests", async () => {
     const res = await fetch(`${BASE}/api/instances`, {
       method: "OPTIONS",

@@ -20,6 +20,7 @@ import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib
 import { currentCall } from "@/lib/call";
 import { showNotification } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
+import { eventsUrl, lanAuthHeaders } from "@/lib/lan-auth";
 
 export type { MausColor } from "@/lib/mascot";
 
@@ -812,8 +813,8 @@ const initialState: AppState = {
 // ── API client ─────────────────────────────────────────────────────────
 export async function api(path: string, init?: RequestInit): Promise<any> {
   const res = await fetch(path, {
-    headers: { "content-type": "application/json" },
     ...init,
+    headers: { "content-type": "application/json", ...lanAuthHeaders(), ...(init?.headers ?? {}) },
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error ?? `${res.status} ${res.statusText}`);
@@ -1205,7 +1206,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // gap before that connection opened.
     const hydrationFallback = setTimeout(hydrate, 1_000);
 
-    const es = new EventSource("/api/events");
+    const es = new EventSource(eventsUrl("/api/events"));
     // The hydrate decision belongs to the hello frame, not to onopen: the
     // server replays what we missed when it can, and re-downloading every
     // transcript on a reconnect it already covered is pure waste.

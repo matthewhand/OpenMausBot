@@ -1,7 +1,10 @@
 /** noVNC is bound to 127.0.0.1:6080 on purpose. Opening that URL from a
  *  LAN browser hits the *client's* loopback, which has no viewer. */
 export function loopbackViewerUsable(hostname: string): boolean {
-  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]";
+  const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (host === "localhost" || host === "localhost.") return true;
+  if (host === "::1" || host === "0:0:0:0:0:0:0:1") return true;
+  return host === "127.0.0.1" || host.startsWith("127.");
 }
 
 /** Remote (cloud) URLs are fine from anywhere. A loopback URL is only
