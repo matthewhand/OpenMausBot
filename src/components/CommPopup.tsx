@@ -50,11 +50,16 @@ export function CommPopup({
   const group = state.groups.find((g) => g.id === groupId);
   const messages = commPopupMessages(group?.messages ?? []);
   const tailRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
   const [draft, setDraft] = useState("");
 
   useEffect(() => {
     tailRef.current?.scrollTo({ top: tailRef.current.scrollHeight });
   }, [messages.length, group?.busyBotId]);
+
+  useEffect(() => {
+    dialogRef.current?.focus();
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -80,10 +85,12 @@ export function CommPopup({
       onMouseDown={(e) => e.target === e.currentTarget && onClose()}
     >
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-labelledby="comm-popup-title"
-        className="animate-pop-in flex max-h-[min(640px,calc(100dvh-2rem))] w-full max-w-[560px] flex-col overflow-hidden rounded-2xl border border-hairline/50 bg-panel shadow-2xl"
+        className="animate-pop-in flex max-h-[min(640px,calc(100dvh-2rem))] w-full max-w-[560px] flex-col overflow-hidden rounded-2xl border border-hairline/50 bg-panel shadow-2xl outline-none"
       >
         <header className="flex items-start justify-between gap-3 border-b border-hairline/30 px-5 py-4">
           <div className="min-w-0">
