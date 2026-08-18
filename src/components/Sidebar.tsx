@@ -1,6 +1,8 @@
 import { track } from "@/lib/analytics";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
+  Archive,
   ArrowDownToLine,
   BellDot,
   Bot as BotIcon,
@@ -9,8 +11,8 @@ import {
   ClipboardCopy,
   Copy,
   Crown,
-  EyeOff,
   FolderPlus,
+  Library,
   Loader2,
   Pencil,
   Pin,
@@ -22,13 +24,30 @@ import {
   Puzzle,
   Trash2,
   Users,
+  X,
 } from "lucide-react";
-import { useStore, formatTime, visibleMessages, type Bot, type Group } from "@/state/store";
+import { api, useStore, formatTime, visibleMessages, type Bot, type Group } from "@/state/store";
+
+/** One /api/search result: a text message somewhere in a transcript. */
+interface MessageHit {
+  threadId: string;
+  messageId: string;
+  at: number;
+  role: string;
+  snippet: string;
+  name: string;
+  botId?: string;
+  groupId?: string;
+  task?: string;
+}
 import { MausAvatar, InitialsAvatar } from "./Avatar";
 import { stateForBot } from "@/lib/mascot";
 import { useUpdaterState } from "@/lib/updater";
 import { cn } from "@/lib/cn";
+import { downloadAllBots } from "@/lib/team-files";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
+import { TeamLibraryPanel, type TeamImportResult } from "./TeamLibraryPanel";
+import { RenameTitle } from "./RenameTitle";
 
 /** "Milind Soni" → "MS", "milind" → "M", "you@x.dev" → "Y", unset → "?" */
 function profileInitials(profile?: { name?: string; email?: string }): string {
@@ -52,6 +71,11 @@ function UpdateButton() {
   const s = useUpdaterState();
   const [checkedAt, setCheckedAt] = useState(0);
   const updater = window.ogb?.updater;
+  const status = s?.status ?? "idle";
+  // download and install both round-trip through main before the status
+  // changes — spin on the click itself, and let the new status clear it
+  const [pending, setPending] = useState(false);
+  useEffect(() => setPending(false), [status]);
   // a check that found nothing lands back on idle — acknowledge it for 3s
   const upToDate = Boolean(checkedAt) && (!s || s.status === "idle") && Date.now() - checkedAt < 3000;
   useEffect(() => {
@@ -61,26 +85,36 @@ function UpdateButton() {
   }, [upToDate]);
   if (!updater) return null;
 
-  const status = s?.status ?? "idle";
-  const working = status === "checking" || status === "downloading";
+  const working =
+    pending || status === "checking" || status === "downloading" || status === "installing";
   const label =
     status === "available"
       ? `Version ${s?.version ?? ""} available — download`
       : status === "downloading"
-        ? `Downloading… ${Math.round(s?.percent ?? 0)}%`
+        ? s?.percent == null
+          ? "Starting download…"
+          : `Downloading… ${Math.round(s.percent)}%`
         : status === "downloaded"
           ? `Version ${s?.version ?? ""} ready — restart to update`
-          : status === "checking"
-            ? "Checking for updates…"
-            : upToDate
-              ? "You're up to date"
-              : "Check for updates";
+          : status === "installing"
+            ? "Restarting to update…"
+            : status === "checking"
+              ? "Checking for updates…"
+              : upToDate
+                ? "You're up to date"
+                : "Check for updates";
 
   return (
     <button
       onClick={() => {
-        if (status === "downloaded") return void updater.install();
-        if (status === "available") return void updater.download();
+        if (status === "downloaded") {
+          setPending(true);
+          return void updater.install();
+        }
+        if (status === "available") {
+          setPending(true);
+          return void updater.download();
+        }
         setCheckedAt(Date.now());
         void updater.check();
       }}
@@ -106,6 +140,7 @@ function UpdateButton() {
 }
 
 function preview(bot: Bot): string {
+  if (bot.activity === "waiting-on-you") return "Waiting for you…";
   if (bot.busy) return "Working…";
   // the visible branch's tail — bot.messages holds every fork, so its last
   // entry can belong to a version the user switched away from
@@ -196,7 +231,13 @@ function GroupListItem({ group, onMenu }: { group: Group; onMenu: (menu: { group
   );
 }
 
-function RoomContextMenu({ menu, onClose }: { menu: { groupId: string; x: number; y: number }; onClose: () => void }) {
+function RoomContextMenu({
+  menu,
+  onClose,
+}: {
+  menu: { groupId: string; x: number; y: number };
+  onClose: () => void;
+}) {
   const { state, dispatch } = useStore();
   const group = state.groups.find((g) => g.id === menu.groupId);
 
@@ -216,9 +257,9 @@ function RoomContextMenu({ menu, onClose }: { menu: { groupId: string; x: number
   }, [onClose]);
 
   if (!group) return null;
-  const top = Math.min(menu.y, window.innerHeight - 120);
+  const top = Math.min(menu.y, window.innerHeight - 164);
   const left = Math.min(menu.x, window.innerWidth - 240);
-  return (
+  return createPortal(
     <div
       data-room-menu
       style={{ top, left }}
@@ -244,7 +285,8 @@ function RoomContextMenu({ menu, onClose }: { menu: { groupId: string; x: number
         <Trash2 size={16} />
         Delete Room
       </button>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -320,7 +362,15 @@ function NewRoomPanel({ onClose }: { onClose: () => void }) {
   );
 }
 
-function BotContextMenu({ menu, onClose }: { menu: MenuState; onClose: () => void }) {
+function BotContextMenu({
+  menu,
+  onClose,
+  onArchive,
+}: {
+  menu: MenuState;
+  onClose: () => void;
+  onArchive: (bot: Bot) => void;
+}) {
   const { state, dispatch } = useStore();
   const bot = state.bots.find((b) => b.id === menu.botId);
 
@@ -342,6 +392,13 @@ function BotContextMenu({ menu, onClose }: { menu: MenuState; onClose: () => voi
   if (!bot) return null;
   const engine = state.instances.find((instance) => instance.instanceId === bot.modelSelection.instanceId);
   const canCoordinate = engine?.capabilities?.agentsMcp === true;
+  const visibleBotCount = state.bots.filter((candidate) => !candidate.hidden).length;
+  const archiveBlocked = Boolean(bot.chiefOfStaff) || visibleBotCount <= 1;
+  const archiveHint = bot.chiefOfStaff
+    ? "Choose another Chief of Staff first"
+    : visibleBotCount <= 1
+      ? "Keep at least one active bot"
+      : undefined;
   // keep the menu on-screen near the click
   const top = Math.max(8, Math.min(menu.y, window.innerHeight - 380));
   const left = Math.min(menu.x, window.innerWidth - 240);
@@ -414,12 +471,12 @@ function BotContextMenu({ menu, onClose }: { menu: MenuState; onClose: () => voi
         }),
         divider("d3"),
         item(
-          <EyeOff size={16} className="text-ink-secondary" />,
-          "Hide from sidebar",
-          () => dispatch({ type: "updateBot", botId: bot.id, patch: { hidden: true } }),
+          <Archive size={16} className="text-ink-secondary" />,
+          "Archive",
+          () => onArchive(bot),
           {
-            disabled: Boolean(bot.chiefOfStaff),
-            hint: bot.chiefOfStaff ? "Choose another Chief of Staff first" : undefined,
+            disabled: archiveBlocked,
+            hint: archiveHint,
           },
         ),
         item(<Trash2 size={16} />, "Delete", () => dispatch({ type: "deleteBot", botId: bot.id }), {
@@ -430,31 +487,36 @@ function BotContextMenu({ menu, onClose }: { menu: MenuState; onClose: () => voi
   );
 }
 
-function BotListItem({ bot, onMenu }: { bot: Bot; onMenu: (menu: MenuState) => void }) {
+function BotListItem({
+  bot,
+  onMenu,
+  onArchive,
+  archiveDisabled,
+}: {
+  bot: Bot;
+  onMenu: (menu: MenuState) => void;
+  onArchive: (bot: Bot) => void;
+  archiveDisabled: boolean;
+}) {
   const { state, dispatch } = useStore();
+  const [renaming, setRenaming] = useState(false);
   const selected = state.activeView === "chat" && state.selectedId === bot.id;
   const mascotMotion = selected && state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
   // the visible branch, so a version switch changes the row with the chat
   const visible = visibleMessages(bot);
   const last = visible.at(-1);
-  return (
-    <button
-      onClick={() => dispatch({ type: "select", id: bot.id })}
-      onContextMenu={(e) => {
-        e.preventDefault();
-        onMenu({ botId: bot.id, x: e.clientX, y: e.clientY });
-      }}
-      className={cn(
-        "flex w-full items-center gap-3 rounded-xl border px-3 py-2.5 text-left",
-        bot.chiefOfStaff
-          ? selected
-            ? "border-accent/40 bg-accent/15"
-            : "border-accent/25 bg-accent/5 hover:bg-accent/10"
-          : selected
-            ? "border-transparent bg-raised"
-            : "border-transparent hover:bg-raised/50",
-      )}
-    >
+  const rowClass = cn(
+    "flex w-full items-center gap-3 rounded-xl border px-3 py-2.5 pr-10 text-left",
+    bot.chiefOfStaff
+      ? selected
+        ? "border-accent/40 bg-accent/15"
+        : "border-accent/25 bg-accent/5 hover:bg-accent/10"
+      : selected
+        ? "border-transparent bg-raised"
+        : "border-transparent hover:bg-raised/50",
+  );
+  const body = (
+    <>
       <MausAvatar
         color={bot.color}
         state={stateForBot({ ...bot, messages: visible })}
@@ -466,10 +528,16 @@ function BotListItem({ bot, onMenu }: { bot: Bot; onMenu: (menu: MenuState) => v
         <div className="flex items-baseline justify-between gap-2">
           <span className="flex min-w-0 items-center gap-1.5 truncate text-[15px] font-semibold text-ink">
             {bot.pinned && <Pin size={12} className="shrink-0 text-ink-secondary" />}
-            <span className="truncate">{bot.name}</span>
+            <RenameTitle
+              value={bot.name}
+              onCommit={(name) => dispatch({ type: "updateBot", botId: bot.id, patch: { name } })}
+              onEditingChange={setRenaming}
+              className="truncate"
+              inputClassName="w-full rounded bg-inset px-1 py-0.5 text-[15px] font-semibold"
+            />
           </span>
-          {selected && last && (
-            <span className="shrink-0 text-xs text-ink-secondary">
+          {selected && last && !renaming && (
+            <span className="shrink-0 text-xs text-ink-secondary transition-opacity group-hover:opacity-0 group-focus-within:opacity-0">
               {formatTime(last.at)}
             </span>
           )}
@@ -489,22 +557,355 @@ function BotListItem({ bot, onMenu }: { bot: Bot; onMenu: (menu: MenuState) => v
           )}
         </div>
       </div>
-    </button>
+    </>
+  );
+  const onContextMenu = (event: React.MouseEvent) => {
+    event.preventDefault();
+    onMenu({ botId: bot.id, x: event.clientX, y: event.clientY });
+  };
+
+  // Keep the rename <input> out of role="button" — a button's descendants
+  // are presentational, which hides the field from assistive tech.
+  if (renaming) {
+    return (
+      <div className={rowClass} onContextMenu={onContextMenu}>
+        {body}
+      </div>
+    );
+  }
+
+  return (
+    <div className="group relative">
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => dispatch({ type: "select", id: bot.id })}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            dispatch({ type: "select", id: bot.id });
+          }
+        }}
+        onContextMenu={onContextMenu}
+        className={rowClass}
+      >
+        {body}
+      </div>
+      <button
+        type="button"
+        disabled={archiveDisabled}
+        onClick={() => onArchive(bot)}
+        aria-label={`Archive ${bot.name}`}
+        title={
+          bot.chiefOfStaff
+            ? "Choose another Chief of Staff first"
+            : archiveDisabled
+              ? "Keep at least one active bot"
+              : `Archive ${bot.name}`
+        }
+        className="absolute right-2 top-2.5 flex size-7 items-center justify-center rounded-lg bg-card/90 text-ink-secondary opacity-0 shadow-sm transition hover:bg-raised hover:text-ink focus:opacity-100 disabled:cursor-default disabled:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 max-md:opacity-100"
+      >
+        <Archive size={14} />
+      </button>
+    </div>
   );
 }
 
-export function Sidebar() {
+function ArchivedBotsPanel({
+  bots,
+  onClose,
+  onRestored,
+}: {
+  bots: Bot[];
+  onClose: () => void;
+  onRestored: (message: string) => void;
+}) {
+  const { dispatch } = useStore();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [restoringAll, setRestoringAll] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    dialogRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busyId && !restoringAll) onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [busyId, onClose, restoringAll]);
+
+  const restore = async (bot: Bot) => {
+    setBusyId(bot.id);
+    setError("");
+    try {
+      const response = await api(`/api/bots/${bot.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ hidden: false }),
+      });
+      dispatch({ type: "botPatched", bot: response.bot });
+      dispatch({ type: "select", id: bot.id });
+      onRestored(`${bot.name} restored`);
+      if (bots.length === 1) onClose();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const restoreAll = async () => {
+    setRestoringAll(true);
+    setError("");
+    try {
+      const responses = await Promise.all(
+        bots.map((bot) =>
+          api(`/api/bots/${bot.id}`, {
+            method: "PATCH",
+            body: JSON.stringify({ hidden: false }),
+          }),
+        ),
+      );
+      for (const response of responses) dispatch({ type: "botPatched", bot: response.bot });
+      const first = bots[0];
+      if (first) dispatch({ type: "select", id: first.id });
+      onRestored(`${bots.length} ${bots.length === 1 ? "bot" : "bots"} restored`);
+      onClose();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRestoringAll(false);
+    }
+  };
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px] sm:p-6"
+      onMouseDown={(event) => event.target === event.currentTarget && !busyId && !restoringAll && onClose()}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="archived-bots-title"
+        tabIndex={-1}
+        className="animate-pop-in flex max-h-[min(680px,calc(100dvh-2rem))] w-full max-w-[760px] flex-col overflow-hidden rounded-[24px] border border-hairline/50 bg-panel shadow-2xl shadow-black/50 outline-none"
+      >
+        <header className="flex items-start justify-between gap-4 px-6 pb-4 pt-6 sm:px-8 sm:pt-7">
+          <div>
+            <h2 id="archived-bots-title" className="text-[22px] font-semibold tracking-[-0.01em] text-ink">Archived bots</h2>
+            <p className="mt-1 text-[13px] text-ink-secondary">Conversations are kept until you choose to delete a bot.</p>
+          </div>
+          <div className="flex items-center gap-1">
+            {bots.length > 1 && (
+              <button
+                onClick={() => void restoreAll()}
+                disabled={restoringAll || Boolean(busyId)}
+                className="flex items-center gap-1.5 rounded-full bg-raised px-3.5 py-2 text-[12.5px] text-ink hover:bg-raised-hover disabled:opacity-40"
+              >
+                {restoringAll && <Loader2 size={13} className="animate-spin" />}
+                Restore all
+              </button>
+            )}
+            <button
+              onClick={onClose}
+              disabled={restoringAll || Boolean(busyId)}
+              className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-40"
+              aria-label="Close archived bots"
+            >
+              <X size={21} />
+            </button>
+          </div>
+        </header>
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-7 pt-3 sm:px-8">
+          <div className="mb-3 text-[12px] font-medium text-ink-secondary">{bots.length} archived</div>
+          <div className="grid grid-cols-1 gap-x-8 md:grid-cols-2">
+            {bots.map((bot) => (
+              <div key={bot.id} className="flex min-h-[82px] items-center gap-3 border-b border-hairline/35 px-1 py-3">
+                <MausAvatar color={bot.color} state="happy" size={42} />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[14px] font-medium text-ink">{bot.name}</div>
+                  <div className="mt-0.5 truncate text-[12.5px] text-ink-secondary">{bot.title || "Bot"}</div>
+                </div>
+                <button
+                  onClick={() => void restore(bot)}
+                  disabled={restoringAll || Boolean(busyId)}
+                  className="flex min-w-[78px] items-center justify-center gap-1.5 rounded-full bg-raised px-3.5 py-2 text-[12.5px] text-ink hover:bg-raised-hover disabled:opacity-40"
+                >
+                  {busyId === bot.id && <Loader2 size={13} className="animate-spin" />}
+                  Restore
+                </button>
+              </div>
+            ))}
+          </div>
+          {error && <div role="alert" className="mt-4 rounded-lg bg-danger/10 px-3 py-2 text-[12.5px] text-danger">{error}</div>}
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { state, dispatch } = useStore();
   const { capabilities } = useDesktopCapabilities();
+  const importReturnRef = useRef<HTMLButtonElement>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [roomMenu, setRoomMenu] = useState<{ groupId: string; x: number; y: number } | null>(null);
   const [plusOpen, setPlusOpen] = useState(false);
   const [newRoom, setNewRoom] = useState(false);
+  const [teamLibraryOpen, setTeamLibraryOpen] = useState(false);
+  const [archivedBotsOpen, setArchivedBotsOpen] = useState(false);
+  const [exportingTeam, setExportingTeam] = useState(false);
+  const [teamFeedback, setTeamFeedback] = useState<{
+    error: boolean;
+    text: string;
+    undo?: TeamImportResult;
+    restoreBot?: { id: string; name: string };
+  } | null>(null);
   const [query, setQuery] = useState("");
+  const [messageHits, setMessageHits] = useState<MessageHit[]>([]);
+
+  // Esc closes the drawer, mirroring ApiKeys.tsx:75-85. Bound only while the
+  // drawer is open — on mobile, exactly when a bot/room context menu or the
+  // New Room panel can be open on top of it, so the same Escape press closes
+  // them together. Fine, since both directions are "get me out of here."
+  useEffect(() => {
+    if (!open) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [open, onClose]);
+
+  useEffect(() => {
+    if (!teamFeedback) return;
+    const timer = window.setTimeout(() => setTeamFeedback(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [teamFeedback]);
+
+  const exportAllBots = async () => {
+    setExportingTeam(true);
+    setTeamFeedback(null);
+    try {
+      const exported = await downloadAllBots();
+      track("team_exported", { members: exported.members, scope: "all_visible" });
+      setTeamFeedback({ error: false, text: `${exported.members} bots exported` });
+    } catch (cause) {
+      setTeamFeedback({
+        error: true,
+        text: cause instanceof Error ? cause.message : String(cause),
+      });
+    } finally {
+      setExportingTeam(false);
+    }
+  };
+
+  const undoTeamLoad = async (result: TeamImportResult) => {
+    setTeamFeedback(null);
+    try {
+      const archiveNew = await Promise.all(
+        result.importedBotIds.map((botId) =>
+          api(`/api/bots/${botId}`, {
+            method: "PATCH",
+            body: JSON.stringify({ hidden: true, chiefOfStaff: false }),
+          }),
+        ),
+      );
+      for (const response of archiveNew) dispatch({ type: "botPatched", bot: response.bot });
+
+      const previousChief = result.archived.find((bot) => bot.chiefOfStaff);
+      const restoreOthers = await Promise.all(
+        result.archived
+          .filter((bot) => !bot.chiefOfStaff)
+          .map((bot) =>
+            api(`/api/bots/${bot.id}`, {
+              method: "PATCH",
+              body: JSON.stringify({ hidden: false }),
+            }),
+          ),
+      );
+      for (const response of restoreOthers) dispatch({ type: "botPatched", bot: response.bot });
+      if (previousChief) {
+        const response = await api(`/api/bots/${previousChief.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ hidden: false, chiefOfStaff: true }),
+        });
+        dispatch({ type: "botPatched", bot: response.bot });
+      }
+      const first = result.archived[0];
+      if (first) dispatch({ type: "select", id: first.id });
+      setTeamFeedback({ error: false, text: "Previous team restored" });
+    } catch (cause) {
+      setTeamFeedback({ error: true, text: cause instanceof Error ? cause.message : String(cause) });
+    }
+  };
+
+  const archiveBot = async (bot: Bot) => {
+    const activeBots = state.bots.filter((candidate) => !candidate.hidden);
+    if (bot.chiefOfStaff || activeBots.length <= 1) return;
+    setTeamFeedback(null);
+    try {
+      const response = await api(`/api/bots/${bot.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ hidden: true }),
+      });
+      dispatch({ type: "botPatched", bot: response.bot });
+      if (state.selectedId === bot.id) {
+        const next = activeBots.find((candidate) => candidate.id !== bot.id);
+        if (next) dispatch({ type: "select", id: next.id });
+      }
+      setTeamFeedback({
+        error: false,
+        text: `${bot.name} archived`,
+        restoreBot: { id: bot.id, name: bot.name },
+      });
+    } catch (cause) {
+      setTeamFeedback({ error: true, text: cause instanceof Error ? cause.message : String(cause) });
+    }
+  };
+
+  const undoBotArchive = async (bot: { id: string; name: string }) => {
+    setTeamFeedback(null);
+    try {
+      const response = await api(`/api/bots/${bot.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ hidden: false }),
+      });
+      dispatch({ type: "botPatched", bot: response.bot });
+      dispatch({ type: "select", id: bot.id });
+      setTeamFeedback({ error: false, text: `${bot.name} restored` });
+    } catch (cause) {
+      setTeamFeedback({ error: true, text: cause instanceof Error ? cause.message : String(cause) });
+    }
+  };
+
   const macInset = capabilities.windowChrome === "mac-inset";
   const browser = capabilities.host.label === "Browser";
 
   const q = query.trim().toLowerCase();
+
+  // Message search rides the same box as the name filter: names match
+  // instantly from local state; transcript hits arrive from /api/search a
+  // debounce later. A stale response for an outdated query is dropped.
+  useEffect(() => {
+    if (!q) {
+      setMessageHits([]);
+      return;
+    }
+    let alive = true;
+    const timer = setTimeout(() => {
+      api(`/api/search?q=${encodeURIComponent(q)}&limit=12`)
+        .then((result: { hits?: MessageHit[] }) => alive && setMessageHits(result.hits ?? []))
+        .catch(() => alive && setMessageHits([]));
+    }, 250);
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+    };
+  }, [q]);
+
   const matchingBots = state.bots
     .filter((b) => !b.hidden)
     .filter(
@@ -519,9 +920,27 @@ export function Sidebar() {
     .filter((bot) => !bot.chiefOfStaff)
     .sort((a, b) => Number(b.pinned ?? false) - Number(a.pinned ?? false));
   const visibleGroups = state.groups.filter((g) => !q || g.name.toLowerCase().includes(q));
+  const activeBotCount = state.bots.filter((bot) => !bot.hidden).length;
+  const archivedBots = state.bots.filter((bot) => bot.hidden);
+  const pendingTeamUndo = teamFeedback?.undo;
+  const pendingBotUndo = teamFeedback?.restoreBot;
 
   return (
-    <aside className="flex h-full w-[320px] shrink-0 flex-col border-r border-hairline/40 bg-panel">
+    <aside
+      className={cn(
+        "flex h-full w-[320px] shrink-0 flex-col border-r border-hairline/40 bg-panel",
+        // Below md only: the sidebar leaves the flow and slides in over the chat.
+        // Scoped with max-md: rather than cancelled with md: on purpose — Tailwind
+        // v4 emits the native `translate` property, and any value other than
+        // `none` turns this element into a containing block for its `fixed`
+        // descendants. Cancelling it with an `md:` prefix still emits a value, which
+        // silently reparents NewRoomPanel's overlay and the "+" menu backdrop on
+        // desktop.
+        "max-md:absolute max-md:inset-y-0 max-md:left-0 max-md:z-40",
+        "max-md:transition-transform max-md:duration-200",
+        open ? "max-md:translate-x-0" : "max-md:-translate-x-full",
+      )}
+    >
       {/* macOS owns inset traffic lights; Linux/Windows use native chrome. */}
       <div
         className="flex items-center justify-between px-4 pt-3.5 pb-1"
@@ -541,9 +960,10 @@ export function Sidebar() {
           style={macInset ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined}
         >
           <button
+            ref={importReturnRef}
             onClick={() => setPlusOpen((o) => !o)}
             className="rounded-md p-1 text-ink-secondary hover:bg-raised hover:text-ink"
-            title="New bot or room"
+            title="New or share"
           >
             <Plus size={20} strokeWidth={2} />
           </button>
@@ -572,6 +992,40 @@ export function Sidebar() {
                   <Users size={16} className="text-ink-secondary" />
                   New Room
                 </button>
+                <button
+                  onClick={() => {
+                    setPlusOpen(false);
+                    void exportAllBots();
+                  }}
+                  disabled={exportingTeam}
+                  className="flex w-full items-center gap-3 px-3.5 py-2 text-left text-[14px] text-ink hover:bg-raised/70"
+                >
+                  {exportingTeam ? <Loader2 size={16} className="animate-spin text-ink-secondary" /> : <ArrowDownToLine size={16} className="text-ink-secondary" />}
+                  {exportingTeam ? "Exporting…" : "Export all bots"}
+                </button>
+                <button
+                  onClick={() => {
+                    setPlusOpen(false);
+                    setTeamLibraryOpen(true);
+                  }}
+                  className="flex w-full items-center gap-3 px-3.5 py-2 text-left text-[14px] text-ink hover:bg-raised/70"
+                >
+                  <Library size={16} className="text-ink-secondary" />
+                  Teams
+                </button>
+                {archivedBots.length > 0 && (
+                  <button
+                    onClick={() => {
+                      setPlusOpen(false);
+                      setArchivedBotsOpen(true);
+                    }}
+                    className="flex w-full items-center gap-3 px-3.5 py-2 text-left text-[14px] text-ink hover:bg-raised/70"
+                  >
+                    <Archive size={16} className="text-ink-secondary" />
+                    <span className="flex-1">Archived bots</span>
+                    <span className="text-[11.5px] text-ink-secondary">{archivedBots.length}</span>
+                  </button>
+                )}
               </div>
             </>
           )}
@@ -596,20 +1050,60 @@ export function Sidebar() {
       {/* Bot list */}
       <div className="flex-1 overflow-y-auto px-2">
         <div className="flex flex-col gap-0.5">
-          {!chiefBot && visibleBots.length === 0 && visibleGroups.length === 0 && q && (
+          {!chiefBot && visibleBots.length === 0 && visibleGroups.length === 0 && messageHits.length === 0 && q && (
             <div className="px-3 py-6 text-center text-[13px] text-ink-secondary">Nothing matches “{query}”</div>
           )}
           {chiefBot && (
             <div className="mb-1.5">
-              <BotListItem bot={chiefBot} onMenu={setMenu} />
+              <BotListItem
+                bot={chiefBot}
+                onMenu={setMenu}
+                onArchive={(bot) => void archiveBot(bot)}
+                archiveDisabled
+              />
             </div>
           )}
           {visibleGroups.map((g) => (
             <GroupListItem key={g.id} group={g} onMenu={setRoomMenu} />
           ))}
           {visibleBots.map((b) => (
-            <BotListItem key={b.id} bot={b} onMenu={setMenu} />
+            <BotListItem
+              key={b.id}
+              bot={b}
+              onMenu={setMenu}
+              onArchive={(bot) => void archiveBot(bot)}
+              archiveDisabled={activeBotCount <= 1}
+            />
           ))}
+          {q && messageHits.length > 0 && (
+            <div className="mt-3">
+              <div className="px-3 pb-1 text-[11px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
+                In conversations
+              </div>
+              {messageHits.map((hit) => (
+                <button
+                  key={`${hit.threadId}:${hit.messageId}`}
+                  onClick={() => {
+                    const targetBot = hit.botId ? state.bots.find((b) => b.id === hit.botId) : undefined;
+                    dispatch({ type: "select", id: hit.botId ?? hit.groupId ?? "" });
+                    // a hit on a non-active task opens THAT task, not
+                    // whichever one the bot happens to have in front
+                    if (targetBot && targetBot.threadId !== hit.threadId) {
+                      dispatch({ type: "switchTask", botId: targetBot.id, threadId: hit.threadId });
+                    }
+                    setQuery("");
+                  }}
+                  className="flex w-full flex-col gap-0.5 rounded-xl px-3 py-2 text-left hover:bg-raised/50"
+                >
+                  <span className="truncate text-[13px] font-medium text-ink">
+                    {hit.name}
+                    {hit.task ? <span className="font-normal text-ink-secondary"> · {hit.task}</span> : null}
+                  </span>
+                  <span className="line-clamp-2 text-[12.5px] text-ink-secondary">{hit.snippet}</span>
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       </div>
 
@@ -623,7 +1117,7 @@ export function Sidebar() {
           )}
         >
           <CalendarDays size={20} className={state.activeView === "routines" ? "text-accent" : "text-ink-secondary"} />
-          <span className="flex-1 text-[14px]">Routines</span>
+          <span className="flex-1 text-[14px]">Automations</span>
           {state.routineRuns.some((run) => ["failed", "missed"].includes(run.status) && !run.seenAt) && (
             <span className="size-2 rounded-full bg-danger" />
           )}
@@ -656,9 +1150,75 @@ export function Sidebar() {
         </div>
       </div>
 
-      {menu && <BotContextMenu menu={menu} onClose={() => setMenu(null)} />}
-      {roomMenu && <RoomContextMenu menu={roomMenu} onClose={() => setRoomMenu(null)} />}
+      {menu && <BotContextMenu menu={menu} onClose={() => setMenu(null)} onArchive={(bot) => void archiveBot(bot)} />}
+      {roomMenu && (
+        <RoomContextMenu
+          menu={roomMenu}
+          onClose={() => setRoomMenu(null)}
+        />
+      )}
       {newRoom && <NewRoomPanel onClose={() => setNewRoom(false)} />}
+      {archivedBotsOpen && (
+        <ArchivedBotsPanel
+          bots={archivedBots}
+          onClose={() => setArchivedBotsOpen(false)}
+          onRestored={(message) => setTeamFeedback({ error: false, text: message })}
+        />
+      )}
+      {teamLibraryOpen && (
+        <TeamLibraryPanel
+          returnFocusRef={importReturnRef}
+          onClose={() => setTeamLibraryOpen(false)}
+          onImported={(result) => {
+            setTeamLibraryOpen(false);
+            setTeamFeedback(
+              result.archived.length > 0
+                ? {
+                    error: false,
+                    text: `${result.name} loaded · ${result.members} ${result.members === 1 ? "bot" : "bots"}`,
+                    undo: result,
+                  }
+                : {
+                    error: false,
+                    text: `${result.name} loaded · ${result.members} ${result.members === 1 ? "bot" : "bots"}`,
+                  },
+            );
+          }}
+        />
+      )}
+      {teamFeedback &&
+        createPortal(
+          <div
+            role="status"
+            className={cn(
+              "fixed bottom-4 left-4 z-[60] max-w-[300px] rounded-xl border px-3.5 py-2.5 text-[13px] shadow-xl",
+              teamFeedback.error
+                ? "border-danger/30 bg-card text-danger"
+                : "border-hairline/50 bg-card text-ink",
+            )}
+          >
+            <div className="flex items-center gap-3">
+              <span>{teamFeedback.text}</span>
+              {pendingTeamUndo && (
+                <button
+                  onClick={() => void undoTeamLoad(pendingTeamUndo)}
+                  className="rounded-md px-1.5 py-0.5 font-medium text-accent hover:bg-raised"
+                >
+                  Undo
+                </button>
+              )}
+              {pendingBotUndo && (
+                <button
+                  onClick={() => void undoBotArchive(pendingBotUndo)}
+                  className="rounded-md px-1.5 py-0.5 font-medium text-accent hover:bg-raised"
+                >
+                  Undo
+                </button>
+              )}
+            </div>
+          </div>,
+          document.body,
+        )}
     </aside>
   );
 }
