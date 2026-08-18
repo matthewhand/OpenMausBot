@@ -250,6 +250,7 @@ const appConfigSchema = z.object({
   tts: z
     .object({
       key: optionalText,
+      openaiKey: optionalText,
       voice: optionalText,
       provider: z.enum(["elevenlabs", "system", "openai-compatible"]).optional(),
       baseUrl: optionalText,
@@ -281,6 +282,7 @@ export interface AppConfig {
   opencodeGo?: { apiKey?: string };
   tts?: {
     key?: string;
+    openaiKey?: string;
     voice?: string;
     provider?: "elevenlabs" | "system" | "openai-compatible";
     baseUrl?: string;

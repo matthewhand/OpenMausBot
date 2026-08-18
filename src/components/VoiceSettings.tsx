@@ -9,6 +9,7 @@ import { Check, Loader2, Volume2 } from "lucide-react";
 import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { useDesktopCapabilities } from "@/components/DesktopCapabilities";
 import { speaker } from "@/lib/tts";
+import { ttsElevenLabsKeyPatch, ttsOpenaiCredentialsPatch, ttsProviderPatch } from "@/lib/tts-provider";
 import { cn } from "@/lib/cn";
 
 const SAMPLE = "Morning. Overnight the tests went green, and I left two notes for you in the thread.";

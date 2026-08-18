@@ -34,9 +34,11 @@ should not look like one.
 
 For **ElevenLabs**: `configured` means a key is saved; `ready` means key + voice.
 
-For **OpenAI-compatible**: `configured` means a base URL is saved (key is
+For **OpenAI-compatible**: `configured` means a base URL is saved (`openaiKey` is
 optional for local unauthenticated servers like Kokoro); `ready` means base URL
-+ voice.
++ voice. The ElevenLabs `key` and the OpenAI-compatible `openaiKey` are stored
+separately. Switching the provider dropdown must not wipe or send the other
+provider's secret.
 
 ## The spoken register
 
