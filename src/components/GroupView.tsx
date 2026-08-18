@@ -32,10 +32,12 @@ import { AttachedImageGallery } from "./AttachmentPreview";
 import { GroupCallButton, GroupCallOverlay } from "./GroupCallView";
 import { ReactionBar, ReactionChips } from "./Reactions";
 import { ApprovalCard } from "./ApprovalCard";
+import { CommChip } from "./CommPopup";
 import { ManageMembersPanel } from "./ManageMembersPanel";
 import { groupActivityRuns } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
+import { isCommChipMessage } from "@/lib/comm-popup";
 import { cn } from "@/lib/cn";
 import { useFocusMessage } from "@/lib/focus-message";
 import { shortPath } from "@/lib/short-path";
@@ -209,6 +211,8 @@ const Transcript = memo(function Transcript({
                   : undefined}
               />
             </div>
+          ) : m.kind === "activity" && isCommChipMessage(m) ? (
+            <CommChip message={m} />
           ) : m.kind === "activity" && m.tool ? (
             m.tool.ok === false || m.tool.name.startsWith("error:") || showToolCalls ? (
               <RoomToolChip message={m} />

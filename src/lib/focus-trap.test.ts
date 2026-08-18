@@ -2,9 +2,21 @@ import { describe, expect, it } from "vitest";
 
 import { focusable, wrapTab } from "./focus-trap";
 
-type FakeEl = { disabled?: boolean; tabIndex: number };
+type FakeEl = {
+  disabled?: boolean;
+  hidden?: boolean;
+  tabIndex: number;
+  getAttribute: (name: string) => string | null;
+};
 
-const el = (partial: Partial<FakeEl> = {}): FakeEl => ({ tabIndex: 0, ...partial });
+const el = (
+  partial: { disabled?: boolean; hidden?: boolean; tabIndex?: number; ariaHidden?: string | null } = {},
+): FakeEl => ({
+  disabled: partial.disabled,
+  hidden: partial.hidden,
+  tabIndex: partial.tabIndex ?? 0,
+  getAttribute: (name) => (name === "aria-hidden" ? (partial.ariaHidden ?? null) : null),
+});
 
 function rootOf(nodes: FakeEl[]): ParentNode {
   return { querySelectorAll: () => nodes } as unknown as ParentNode;
@@ -23,6 +35,19 @@ describe("focusable", () => {
 
   it("skips tabindex=-1 sentinels like the dialog itself", () => {
     expect(focusable(rootOf([el({ tabIndex: -1 }), el()]))).toHaveLength(1);
+  });
+
+  it("skips hidden elements", () => {
+    expect(focusable(rootOf([el({ hidden: true })]))).toEqual([]);
+  });
+
+  it("skips aria-hidden=true even when the control is otherwise tabbable", () => {
+    expect(focusable(rootOf([el({ tabIndex: 0, ariaHidden: "true" })]))).toEqual([]);
+  });
+
+  it("keeps aria-hidden=false", () => {
+    const keep = el({ ariaHidden: "false" });
+    expect(focusable(rootOf([keep]))).toEqual([keep]);
   });
 });
 

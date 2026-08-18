@@ -1,10 +1,15 @@
 const FOCUSABLE_SELECTOR = "a[href], button, input, textarea, select, [tabindex]";
 
-function canTakeTab(el: { disabled?: boolean; tabIndex: number }): boolean {
-  return !el.disabled && el.tabIndex >= 0;
+function canTakeTab(el: {
+  disabled?: boolean;
+  hidden?: boolean;
+  tabIndex: number;
+  getAttribute(name: string): string | null;
+}): boolean {
+  return !el.disabled && !el.hidden && el.tabIndex >= 0 && el.getAttribute("aria-hidden") !== "true";
 }
 
-/** Tab-cycle candidates under `root`. Disabled controls and tabindex=-1 are out. */
+/** Tab-cycle candidates under `root`. Disabled, hidden, aria-hidden, and tabindex=-1 are out. */
 export function focusable(root: ParentNode): HTMLElement[] {
   return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(canTakeTab);
 }

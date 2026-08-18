@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { commPopupMessages } from "./comm-popup";
+import { commPopupMessages, isCommChipMessage } from "./comm-popup";
 import type { Message } from "@/state/store";
 
 const msg = (partial: Partial<Message> & Pick<Message, "kind">): Message => ({
@@ -11,6 +11,7 @@ const msg = (partial: Partial<Message> & Pick<Message, "kind">): Message => ({
   text: partial.text,
   tool: partial.tool,
   from: partial.from,
+  comm: partial.comm,
 });
 
 describe("commPopupMessages", () => {
@@ -51,5 +52,17 @@ describe("commPopupMessages", () => {
 
   it("returns an empty list for an empty thread", () => {
     expect(commPopupMessages([])).toEqual([]);
+  });
+});
+
+describe("isCommChipMessage", () => {
+  const comm = { groupId: "g", withBotId: "b", withName: "Ben", withColor: "orange" as const };
+
+  // GroupView used to render <CommChip> on activity+comm even without a
+  // tool; the chip returned null and left an empty cluster row.
+  it("is not a popup chip when a comm activity has no tool", () => {
+    expect(isCommChipMessage(msg({ kind: "activity", comm }))).toBe(false);
+    expect(isCommChipMessage(msg({ kind: "activity", comm, tool: { name: "Messaged @Ben" } }))).toBe(true);
+    expect(isCommChipMessage(msg({ kind: "activity", tool: { name: "Read" } }))).toBe(false);
   });
 });
