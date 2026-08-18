@@ -1,6 +1,6 @@
 // The bot's computer, in the right-side slot. Where it runs decides the
 // whole flow: cloud → provision the box on open (idempotent) and preview
-// via SSE frames or a ~4s screenshot poll; local ("This Mac") → frames
+// via SSE frames or a ~4s screenshot poll; local ("This computer") → frames
 // come from the Electron main process (desktopCapturer over the preload
 // bridge — box endpoints are never touched); off → parked. Auto (unset)
 // prefers the cloud box when one exists, else local inside the app.
@@ -21,6 +21,7 @@ import { useStore, type Bot } from "@/state/store";
 import type { Routine } from "@/lib/routines";
 import { ApiKeyRow } from "./ApiKeys";
 import { cn } from "@/lib/cn";
+import { frameSrc } from "@/lib/frame-src";
 import { canOpenExternalUrl } from "@/lib/loopback-viewer";
 import { lanAuthHeaders } from "@/lib/lan-auth";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
@@ -296,14 +297,14 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
     live ??
     polledFrame ??
     (lastScreenMessage ? { png: lastScreenMessage.png!, mime: lastScreenMessage.mime ?? "image/png" } : null);
-  const frameSrc =
+  const previewSrc =
     phase === "vm"
-      ? vmFrame
+      ? frameSrc(vmFrame)
       : phase === "local"
-      ? localFrame
-      : phase === "ready" || phase === "starting"
-        ? cloudFrame && `data:${cloudFrame.mime};base64,${cloudFrame.png}`
-        : null;
+        ? frameSrc(localFrame)
+        : phase === "ready" || phase === "starting"
+          ? cloudFrame && frameSrc(cloudFrame.png, cloudFrame.mime)
+          : null;
 
   const run = (kind: "join" | "sleep") => {
     setPending(kind);
@@ -317,7 +318,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
             return;
           }
           if (!canOpenExternalUrl(result.joinUrl, window.location.hostname)) {
-            setError("That desktop URL is only reachable from this machine. Use Watch screen instead.");
+            setError("That desktop URL is only reachable from this machine. Use the live preview in this panel, or open the app on the host.");
             return;
           }
           if (window.ogb?.openExternal) {
@@ -381,8 +382,8 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
             {phase === "vm" && <span className="text-[11px]">Local VM</span>}
         </div>
         <div className="flex aspect-[16/10] w-full items-center justify-center overflow-hidden rounded-xl bg-card">
-          {frameSrc ? (
-            <img src={frameSrc} alt={`${bot.name}'s screen`} className="h-full w-full object-contain" />
+          {previewSrc ? (
+            <img src={previewSrc} alt={`${bot.name}'s screen`} className="h-full w-full object-contain" />
           ) : (
             <div className="flex flex-col items-center gap-2 px-6 text-center text-ink-secondary">
               {phase === "checking" || phase === "starting" || phase === "local" || phase === "vm" ? (

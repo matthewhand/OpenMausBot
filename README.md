@@ -52,7 +52,7 @@ already have:
 - **Local first.** One small harness server on `127.0.0.1` owns every agent process. Transcripts, keys, and
   events live in `~/.openmausbot`, not a cloud.
 - **Agents with hands.** Each bot can get a real computer — a cloud Linux desktop it drives while you watch
-  live, or your own Mac — plus 500+ apps through Composio, or your own
+  live, this computer, or a Local VM on this machine — plus 500+ apps through Composio, or your own
   remote MCP servers (HTTP or SSE).
 
 ## Features
@@ -63,8 +63,8 @@ already have:
 
 ### 🧠 Pick a brain per bot
 
-A model picker with a provider rail — Claude and Codex models side by side, defaults marked, unavailable
-providers dimmed with the reason. Switch a bot's model mid-conversation.
+A model picker with a Cloud / Local provider rail — official models, local injects, and a setup card
+when an engine is not signed in. Switch a bot's model mid-conversation.
 
 <img src="docs/screenshots/model-picker.png" alt="Model picker with provider rail" width="100%">
 
@@ -74,9 +74,9 @@ providers dimmed with the reason. Switch a bot's model mid-conversation.
 ### 🖥️ Every bot gets a computer
 
 Open the Computer panel and the bot's cloud desktop spins up on its own — live screen preview while it
-works, "Open desktop" to take over in your browser, or point the bot at *this Mac* instead.
+works, "Open desktop" to take over in your browser, or point the bot at this computer or a Local VM.
 
-<img src="docs/screenshots/computer-panel.png" alt="Computer panel with live screen preview" width="100%">
+<img src="docs/screenshots/computer-panel.png" alt="Computer panel with live screen preview, Local VM, and scheduled tasks" width="100%">
 
 </td>
 </tr>
@@ -88,7 +88,7 @@ works, "Open desktop" to take over in your browser, or point the bot at *this Ma
 Shell commands, file edits, and questions surface as inline cards — Allow / Deny / answer in chat. A
 permission broker turns every risky action into a decision you make, for cloud and local computers alike.
 
-<img src="docs/screenshots/approval-card.png" alt="Approval and question cards in chat" width="100%">
+<img src="docs/screenshots/approval-card.png" alt="Onboarding question card in chat" width="100%">
 
 </td>
 <td width="50%" valign="top">
@@ -96,10 +96,10 @@ permission broker turns every risky action into a decision you make, for cloud a
 ### 🔌 Connected apps and custom MCP
 
 A one-click marketplace over Composio Sessions: Gmail, Slack, GitHub, Notion, Linear and hundreds more.
-OAuth once, and every bot can use them as tools. You can also add your own HTTP or SSE MCP servers in
-the Plugins panel.
+OAuth once, and every bot can use them as tools. You can also add your own HTTP or SSE MCP servers on
+the Plugins panel's Custom MCP tab.
 
-<img src="docs/screenshots/marketplace.png" alt="Remote MCP servers panel" width="100%">
+<img src="docs/screenshots/marketplace.png" alt="Plugins marketplace for Composio connected apps" width="100%">
 
 </td>
 </tr>
@@ -108,7 +108,7 @@ the Plugins panel.
 
 ### 🗂 Manage bots like chats
 
-Right-click any bot: pin, mark unread, edit profile, duplicate, copy conversation ID, hide, delete. It's a
+Right-click any bot: pin, archive, mark unread, edit profile, duplicate, copy conversation ID, delete. It's a
 messaging app — your agents behave like contacts.
 
 <img src="docs/screenshots/context-menu.png" alt="Bot context menu" width="100%">
@@ -236,14 +236,14 @@ in the sidebar footer) when you want to enable its integration:
 | Composio project key (`ak_…`) | Connect Gmail, GitHub, Slack, Notion, and other apps to your bots | [OpenMausBot Composio setup](docs/composio.md) |
 | Box API key | Give bots an isolated remote Linux computer with a desktop and terminal | [Box API key guide](https://docs.ascii.dev/box/api-keys) |
 | TTS provider | Read replies aloud and call your bots — choose ElevenLabs or OpenAI-compatible (Kokoro, etc.) | [ElevenLabs keys](https://elevenlabs.io/app/settings/api-keys) or [local Kokoro setup](docs/voice-mode.md) |
-**Custom MCP servers** are configured in the Plugins panel (puzzle icon in the chat header). No account
-or API key required — just point at your HTTP or SSE MCP server URL. See the [MCP servers
-directory](https://github.com/modelcontextprotocol/servers) for examples.
+**Custom MCP servers** are configured in the sidebar **Plugins** panel (puzzle icon in the footer), on the
+**Custom MCP** tab. No account or API key required — just point at your HTTP or SSE MCP server URL. See the
+[MCP servers directory](https://github.com/modelcontextprotocol/servers) for examples.
 
 ### Adding a custom remote MCP server
 
-1. Click the puzzle icon (🧩) in the chat header to open the Plugins panel
-2. Click "Add Server"
+1. Click **Plugins** in the sidebar footer to open the Plugins panel
+2. Open the **Custom MCP** tab and click **Add server**
 3. Fill in:
    - **Name**: A unique identifier (lowercase, alphanumeric, dash, underscore) — used as `mcp__<name>` in tool allowlists
    - **Transport**: HTTP (streamable HTTP) or SSE (Server-Sent Events)

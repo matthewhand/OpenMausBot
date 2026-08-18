@@ -17,6 +17,7 @@ import { Card, CommandLine } from "./SettingsPrimitives";
 import { cn } from "@/lib/cn";
 import { loopbackViewerUsable } from "@/lib/loopback-viewer";
 import { lanAuthHeaders } from "@/lib/lan-auth";
+import { frameSrc } from "@/lib/frame-src";
 
 type Action = "pull" | "run" | "start" | "stop" | "remove" | "recreate";
 
@@ -402,7 +403,7 @@ export function LocalComputerSection() {
             <div className="min-h-[240px] overflow-auto bg-black p-3">
               {watchFrame ? (
                 <img
-                  src={watchFrame.startsWith("data:") ? watchFrame : `data:image/png;base64,${watchFrame}`}
+                  src={frameSrc(watchFrame) ?? undefined}
                   alt="Local VM screen"
                   className="mx-auto max-h-[70vh] w-auto max-w-full"
                 />

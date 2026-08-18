@@ -8,7 +8,7 @@ OpenMausBot uses one Composio project API key and one reusable Composio Session.
 2. Select **Platform**, select or create a project, then open **Settings → API Keys**.
 3. Copy a project key beginning with `ak_`.
 4. In OpenMausBot, open **App Settings → Connections** and save it under **Composio project key**.
-5. Open **Connected apps** and choose Gmail, GitHub, Slack, or another service. Authentication happens in your normal browser.
+5. Open **Plugins** in the sidebar footer and choose Gmail, GitHub, Slack, or another service on the Marketplace tab. Authentication happens in your normal browser.
 
 The desktop app validates the key before saving it. The key is encrypted using Electron's operating-system-backed `safeStorage`; the local JSON configuration stores only the non-secret Composio user and Session identifiers.
 
