@@ -23,6 +23,8 @@ describe("isLoopbackBindHost", () => {
     expect(isLoopbackBindHost("::1")).toBe(true);
     expect(isLoopbackBindHost("[::1]")).toBe(true);
     expect(isLoopbackBindHost("0:0:0:0:0:0:0:1")).toBe(true);
+    expect(isLoopbackBindHost("::ffff:127.0.0.1")).toBe(true);
+    expect(isLoopbackBindHost("[::ffff:7f00:1]")).toBe(true);
   });
 
   it("rejects unspecified and off-machine addresses", () => {
