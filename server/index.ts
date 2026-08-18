@@ -207,6 +207,15 @@ const AUTH_TOKEN = process.env.OMB_AUTH_TOKEN || null;
 // Defaults to null (no CORS headers) for localhost-only setups.
 const CORS_ORIGIN = process.env.OMB_CORS_ORIGIN || null;
 const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
+
+// Fail before webhook ingress or the public listen — an off-machine bind
+// without a token must not open any port.
+if (!lanBindAllowed(HOST, AUTH_TOKEN)) {
+  console.error(
+    `error: refusing to bind ${HOST}: OMB_AUTH_TOKEN is required for a non-loopback listen`,
+  );
+  process.exit(1);
+}
 const STATIC_DIR = process.env.OMB_STATIC_DIR || null;
 const MIME: Record<string, string> = {
   ".html": "text/html",
@@ -7398,13 +7407,6 @@ const server = createServer(async (req, res) => {
     return json(res, status, { error: e instanceof Error ? e.message : String(e) });
   }
 });
-
-if (!lanBindAllowed(HOST, AUTH_TOKEN)) {
-  console.error(
-    `error: refusing to bind ${HOST}: OMB_AUTH_TOKEN is required for a non-loopback listen`,
-  );
-  process.exit(1);
-}
 
 server.listen(PORT, HOST, () => {
   console.log(`openmausbot server on http://${HOST}:${PORT}`);
