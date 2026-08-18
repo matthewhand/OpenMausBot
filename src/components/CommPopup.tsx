@@ -5,16 +5,27 @@ import { MausAvatar } from "./Avatar";
 import { ChatMarkdown } from "./ChatMarkdown";
 import { commPopupMessages } from "@/lib/comm-popup";
 import { cn } from "@/lib/cn";
+import { focusable, wrapTab } from "@/lib/focus-trap";
 import type { MausColor } from "@/lib/mascot";
 
 /** Clickable "Messaged @X" pill — used in 1:1 and rooms. */
 export function CommChip({ message }: { message: Message }) {
   const [open, setOpen] = useState(false);
+  const chipRef = useRef<HTMLButtonElement>(null);
   const comm = message.comm;
+
+  useEffect(() => {
+    if (!open) return;
+    return () => {
+      chipRef.current?.focus();
+    };
+  }, [open]);
+
   if (!comm || !message.tool) return null;
   return (
     <div className="flex justify-start">
       <button
+        ref={chipRef}
         onClick={() => setOpen(true)}
         title={`View the conversation with ${comm.withName}`}
         className="flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink"
@@ -58,18 +69,37 @@ export function CommPopup({
   }, [messages.length, group?.busyBotId]);
 
   useEffect(() => {
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     dialogRef.current?.focus();
-  }, []);
 
-  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
         onClose();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const root = dialogRef.current;
+      if (!root) return;
+      const items = focusable(root);
+      const current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      const inCycle = current != null && items.includes(current);
+      if (items.length === 0) {
+        e.preventDefault();
+        root.focus();
+        return;
+      }
+      if (!inCycle || (e.shiftKey ? current === items[0] : current === items[items.length - 1])) {
+        e.preventDefault();
+        wrapTab(items, inCycle ? current : null, e.shiftKey)?.focus();
       }
     };
+
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      previous?.focus();
+    };
   }, [onClose]);
 
   const send = () => {
