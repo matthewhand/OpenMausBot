@@ -21,6 +21,7 @@ import { Composer } from "./Composer";
 import { GroupCallButton, GroupCallOverlay } from "./GroupCallView";
 import { ReactionBar, ReactionChips } from "./Reactions";
 import { ApprovalCard } from "./ApprovalCard";
+import { CommChip } from "./CommPopup";
 import { cn } from "@/lib/cn";
 import { BOTTOM_FOLLOW_THRESHOLD, shouldResumeBottomFollow } from "@/lib/bottom-follow";
 import { showWorkingDots } from "@/lib/turn-tail";
@@ -82,6 +83,8 @@ const Transcript = memo(function Transcript({
             <div className="flex justify-start">
               <ApprovalCard bot={memberOf(m.from?.botId)} message={m} />
             </div>
+          ) : m.kind === "activity" && m.comm ? (
+            <CommChip message={m} />
           ) : m.kind === "activity" && m.tool ? (
             <div className="flex justify-start">
               <div

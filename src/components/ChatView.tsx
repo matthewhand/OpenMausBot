@@ -35,7 +35,7 @@ import { showWorkingDots } from "@/lib/turn-tail";
 import { ChatMarkdown } from "./ChatMarkdown";
 import { OptionCard } from "./OptionCard";
 import { ApprovalCard } from "./ApprovalCard";
-import { CommPopup } from "./CommPopup";
+import { CommChip } from "./CommPopup";
 import { Composer } from "./Composer";
 import { ModelPicker } from "./ModelPicker";
 import { RenameTitle } from "./RenameTitle";
@@ -420,34 +420,9 @@ function Bubble({
 
 /** A tool run: spinner while live, check/cross once settled. */
 function ActivityChip({ message }: { message: Message }) {
-  const [commOpen, setCommOpen] = useState(false);
   const tool = message.tool;
   if (!tool) return null;
-  // bot⇄bot comm chip: opens a popup of the exchange (Grok Bot-style)
-  const comm = message.comm;
-  if (comm) {
-    return (
-      <div className="flex justify-start">
-        <button
-          onClick={() => setCommOpen(true)}
-          title={`View the conversation with ${comm.withName}`}
-          className="flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink"
-        >
-          <MausAvatar color={comm.withColor} state="happy" size={16} />
-          <span className="max-w-[480px] truncate">{tool.name}</span>
-          <ChevronRight size={13} />
-        </button>
-        {commOpen && (
-          <CommPopup
-            groupId={comm.groupId}
-            withName={comm.withName}
-            withColor={comm.withColor}
-            onClose={() => setCommOpen(false)}
-          />
-        )}
-      </div>
-    );
-  }
+  if (message.comm) return <CommChip message={message} />;
   const failed = tool.ok === false;
   return (
     <div className="flex justify-start">

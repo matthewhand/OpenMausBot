@@ -1,11 +1,39 @@
 import { useEffect, useRef, useState } from "react";
-import { ExternalLink, X } from "lucide-react";
+import { ChevronRight, ExternalLink, X } from "lucide-react";
 import { formatTime, useStore, type Message } from "@/state/store";
 import { MausAvatar } from "./Avatar";
 import { ChatMarkdown } from "./ChatMarkdown";
 import { commPopupMessages } from "@/lib/comm-popup";
 import { cn } from "@/lib/cn";
 import type { MausColor } from "@/lib/mascot";
+
+/** Clickable "Messaged @X" pill — used in 1:1 and rooms. */
+export function CommChip({ message }: { message: Message }) {
+  const [open, setOpen] = useState(false);
+  const comm = message.comm;
+  if (!comm || !message.tool) return null;
+  return (
+    <div className="flex justify-start">
+      <button
+        onClick={() => setOpen(true)}
+        title={`View the conversation with ${comm.withName}`}
+        className="flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink"
+      >
+        <MausAvatar color={comm.withColor} state="happy" size={16} />
+        <span className="max-w-[480px] truncate">{message.tool.name}</span>
+        <ChevronRight size={13} />
+      </button>
+      {open && (
+        <CommPopup
+          groupId={comm.groupId}
+          withName={comm.withName}
+          withColor={comm.withColor}
+          onClose={() => setOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
 
 export function CommPopup({
   groupId,

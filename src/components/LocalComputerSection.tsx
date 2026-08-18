@@ -152,11 +152,17 @@ export function LocalComputerSection() {
     if (!watching) return;
     let alive = true;
     let inFlight = false;
+    let controller: AbortController | undefined;
     const shoot = async () => {
       if (inFlight) return;
       inFlight = true;
+      controller = new AbortController();
       try {
-        const response = await fetch("/api/local-computer/screenshot", { method: "POST", headers: lanAuthHeaders() });
+        const response = await fetch("/api/local-computer/screenshot", {
+          method: "POST",
+          headers: lanAuthHeaders(),
+          signal: controller.signal,
+        });
         const body = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(body.error ?? `screenshot failed (${response.status})`);
         if (alive && typeof body.image === "string") {
@@ -164,7 +170,9 @@ export function LocalComputerSection() {
           setWatchError(null);
         }
       } catch (e) {
-        if (alive) setWatchError(e instanceof Error ? e.message : String(e));
+        if (alive && !(e instanceof DOMException && e.name === "AbortError")) {
+          setWatchError(e instanceof Error ? e.message : String(e));
+        }
       } finally {
         inFlight = false;
       }
@@ -173,6 +181,7 @@ export function LocalComputerSection() {
     const timer = window.setInterval(() => void shoot(), 3000);
     return () => {
       alive = false;
+      controller?.abort();
       window.clearInterval(timer);
     };
   }, [watching]);
