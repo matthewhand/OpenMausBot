@@ -641,6 +641,68 @@ describe("harness HTTP API", () => {
     expect(after.body.profile).toEqual({ name: "Ada Lovelace", email: "Ada@Example.com" });
   });
 
+  it("saves custom MCP servers and never echoes headers back", async () => {
+    const servers = [
+      {
+        name: "notion",
+        transport: "http",
+        url: "https://api.example.com/mcp/notion",
+        headers: { Authorization: "Bearer secret-token-123" },
+        enabled: true,
+      },
+      {
+        name: "deepwiki",
+        transport: "sse",
+        url: "https://api.example.com/mcp/deepwiki",
+        enabled: false,
+      },
+    ];
+
+    const put = await api("PUT", "/api/config", { mcpServers: servers });
+    expect(put.status).toBe(200);
+    expect(put.body.mcpServers).toHaveLength(2);
+    expect(put.body.mcpServers[0]).toMatchObject({
+      name: "notion",
+      transport: "http",
+      url: "https://api.example.com/mcp/notion",
+      enabled: true,
+      hasHeaders: true,
+    });
+    expect(put.body.mcpServers[0].headers).toBeUndefined();
+    expect(JSON.stringify(put.body)).not.toContain("secret-token-123");
+    expect(JSON.stringify(put.body)).not.toContain("Bearer");
+
+    const after = await api("GET", "/api/config");
+    expect(after.body.mcpServers).toHaveLength(2);
+    expect(after.body.mcpServers[0]).toMatchObject({
+      name: "notion",
+      transport: "http",
+      url: "https://api.example.com/mcp/notion",
+      enabled: true,
+      hasHeaders: true,
+    });
+    expect(after.body.mcpServers[1]).toMatchObject({
+      name: "deepwiki",
+      transport: "sse",
+      url: "https://api.example.com/mcp/deepwiki",
+      enabled: false,
+      hasHeaders: false,
+    });
+    expect(JSON.stringify(after.body)).not.toContain("secret-token-123");
+
+    // A later save that omits headers (the UI never has them) must keep them.
+    const again = await api("PUT", "/api/config", {
+      mcpServers: [
+        { name: "notion", transport: "http", url: "https://api.example.com/mcp/notion", enabled: false },
+        { name: "deepwiki", transport: "sse", url: "https://api.example.com/mcp/deepwiki", enabled: false },
+      ],
+    });
+    expect(again.status).toBe(200);
+    expect(again.body.mcpServers[0]).toMatchObject({ name: "notion", enabled: false, hasHeaders: true });
+    const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
+    expect(disk.mcpServers[0].headers).toEqual({ Authorization: "Bearer secret-token-123" });
+  });
+
   it("creates an independent webhook, accepts a delivery, deduplicates it, and rotates its secret", async () => {
     const bots = await api("GET", "/api/bots");
     const created = await api("POST", "/api/webhooks", {
