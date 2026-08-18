@@ -31,3 +31,18 @@ export function eventsUrl(path = "/api/events"): string {
   const join = path.includes("?") ? "&" : "?";
   return `${path}${join}access_token=${encodeURIComponent(token)}`;
 }
+
+/** Persist ?access_token= then drop it from the address bar so it is not
+ *  copied, bookmarked, or sent as a Referer. */
+export function consumeLanAuthTokenFromLocation(
+  loc: Pick<Location, "search" | "pathname" | "hash"> | null = typeof window === "undefined" ? null : window.location,
+  hist: Pick<History, "replaceState"> | null = typeof history === "undefined" ? null : history,
+): void {
+  if (!loc || !hist) return;
+  const params = new URLSearchParams(loc.search.startsWith("?") ? loc.search.slice(1) : loc.search);
+  if (!params.has("access_token")) return;
+  readLanAuthToken(loc.search);
+  params.delete("access_token");
+  const next = params.toString();
+  hist.replaceState(null, "", `${loc.pathname}${next ? `?${next}` : ""}${loc.hash}`);
+}

@@ -11,6 +11,11 @@ import type { InstanceConfigMap } from "./contracts.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 
 const optionalText = z.string().optional();
+
+/** Names the harness already mounts (agents proxy, computer, Composio, dweb,
+ *  permission broker). A user server with one of these would overwrite the
+ *  built-in and break comms or computer-use. */
+export const RESERVED_MCP_NAMES = new Set(["agents", "computer", "composio", "dweb", "ogb"]);
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
   displayName: optionalText,
@@ -46,13 +51,36 @@ const appConfigSchema = z.object({
   mcpServers: z
     .array(
       z.object({
-        name: z.string().min(1),
+        name: z.string().regex(/^[\w-]+$/, "letters, numbers, dash, and underscore only"),
         transport: z.enum(["http", "sse"]),
-        url: z.string().min(1),
+        url: z
+          .string()
+          .url()
+          .refine((u) => /^https?:\/\//i.test(u), "must be an http(s) URL"),
         headers: z.record(z.string(), z.string()).optional(),
         enabled: z.boolean().optional(),
       }),
     )
+    .superRefine((servers, ctx) => {
+      const seen = new Set<string>();
+      for (const [i, server] of servers.entries()) {
+        if (RESERVED_MCP_NAMES.has(server.name)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [i, "name"],
+            message: `"${server.name}" is reserved`,
+          });
+        }
+        if (seen.has(server.name)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [i, "name"],
+            message: "duplicate server name",
+          });
+        }
+        seen.add(server.name);
+      }
+    })
     .optional(),
   instances: instanceConfigMapSchema.optional(),
 });

@@ -22,6 +22,18 @@ describe("readLanAuthToken", () => {
   });
 });
 
+describe("consumeLanAuthTokenFromLocation", () => {
+  it("strips access_token from the query after persisting it", async () => {
+    const { consumeLanAuthTokenFromLocation } = await import("./lan-auth");
+    const replaced: string[] = [];
+    consumeLanAuthTokenFromLocation(
+      { search: "?access_token=abc&x=1", pathname: "/", hash: "#room" },
+      { replaceState: (_s, _t, url) => replaced.push(String(url)) },
+    );
+    expect(replaced).toEqual(["/?x=1#room"]);
+  });
+});
+
 describe("eventsUrl", () => {
   it("leaves the path alone when there is no token", () => {
     const storage = { getItem: () => null, setItem: () => {} };

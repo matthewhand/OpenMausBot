@@ -1,3 +1,5 @@
+import { lanAuthHeaders } from "@/lib/lan-auth";
+
 // The speaker — one voice for the whole window.
 //
 // Deliberately a singleton: two bots talking over each other is never what
@@ -161,7 +163,7 @@ export class Speaker {
   private async prepare(text: string, voiceId: string | undefined, signal: AbortSignal): Promise<string[]> {
     const res = await fetch("/api/tts/prepare", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...lanAuthHeaders() },
       body: JSON.stringify({ text, voiceId }),
       signal,
     });
@@ -174,7 +176,7 @@ export class Speaker {
   private async render(text: string, voiceId: string | undefined, signal: AbortSignal): Promise<Blob> {
     const res = await fetch("/api/tts/speak", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...lanAuthHeaders() },
       body: JSON.stringify({ text, voiceId }),
       signal,
     });

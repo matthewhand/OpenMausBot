@@ -102,6 +102,23 @@ describe("Instance CLI override", () => {
   });
 });
 
+describe("reserved MCP names", () => {
+  it("rejects a server named after a built-in mount", () => {
+    expect(() => parseConfigPatch({ mcpServers: [{ name: "agents", transport: "http", url: "https://x.example/mcp" }] })).toThrow(
+      /reserved/,
+    );
+    expect(() =>
+      parseConfigPatch({
+        mcpServers: [
+          { name: "notion", transport: "http", url: "https://x.example/mcp" },
+          { name: "notion", transport: "sse", url: "https://y.example/sse" },
+        ],
+      }),
+    ).toThrow(/duplicate/);
+    expect(() => parseConfigPatch({ mcpServers: [{ name: "bad name", transport: "http", url: "https://x.example/mcp" }] })).toThrow();
+  });
+});
+
 describe("mergeMcpServers", () => {
   it("keeps stored headers when a PUT omits them", () => {
     const merged = mergeMcpServers(

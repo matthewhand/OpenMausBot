@@ -19,7 +19,7 @@ export function VoiceSettings() {
     (tts?.provider as "elevenlabs" | "openai-compatible") ?? "elevenlabs",
   );
   const [key, setKey] = useState("");
-  const [baseUrl, setBaseUrl] = useState("");
+  const [baseUrl, setBaseUrl] = useState(tts?.baseUrl ?? "");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [voices, setVoices] = useState<Array<{ id: string; label: string; description?: string }>>([]);
@@ -32,7 +32,8 @@ export function VoiceSettings() {
     if (tts?.provider) {
       setProvider(tts.provider as "elevenlabs" | "openai-compatible");
     }
-  }, [tts?.provider]);
+    if (tts?.baseUrl !== undefined) setBaseUrl(tts.baseUrl);
+  }, [tts?.provider, tts?.baseUrl]);
 
   useEffect(() => {
     if (!configured) {
@@ -71,7 +72,7 @@ export function VoiceSettings() {
   const saveProvider = (newProvider: "elevenlabs" | "openai-compatible") => {
     setProvider(newProvider);
     setError(null);
-    void save({ provider: newProvider });
+    void save(newProvider === "openai-compatible" ? { provider: newProvider, key: "" } : { provider: newProvider });
   };
 
   const saveCredentials = () => {
@@ -80,7 +81,7 @@ export function VoiceSettings() {
         setError("Base URL is required for OpenAI-compatible servers.");
         return;
       }
-      void save({ baseUrl: baseUrl.trim(), key: key.trim() || undefined });
+      void save({ baseUrl: (baseUrl || tts.baseUrl || "").trim(), key: key.trim() || "" });
     } else {
       if (!key.trim()) {
         setError("ElevenLabs key is required.");

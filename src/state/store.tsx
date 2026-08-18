@@ -20,7 +20,7 @@ import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib
 import { currentCall } from "@/lib/call";
 import { showNotification } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
-import { eventsUrl, lanAuthHeaders } from "@/lib/lan-auth";
+import { consumeLanAuthTokenFromLocation, eventsUrl, lanAuthHeaders } from "@/lib/lan-auth";
 
 export type { MausColor } from "@/lib/mascot";
 
@@ -846,6 +846,7 @@ const StoreContext = createContext<{
 } | null>(null);
 
 export function StoreProvider({ children }: { children: ReactNode }) {
+  consumeLanAuthTokenFromLocation();
   const [state, rawDispatch] = useReducer(reducer, initialState);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -901,9 +902,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     };
     // fire-and-forget card persistence; the route is optional server-side
     const persistCard = (botId: string, messageId: string, patch: Partial<OptionCardData>) => {
-      fetch(`/api/bots/${botId}/cards/${messageId}`, {
+      api(`/api/bots/${botId}/cards/${messageId}`, {
         method: "PATCH",
-        headers: { "content-type": "application/json" },
         body: JSON.stringify(patch),
       }).catch(() => {});
     };
@@ -1248,9 +1248,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // reading the selected chat clears its badge immediately
           if (bot.unread && bot.id === stateRef.current.selectedId) {
             bot.unread = false;
-            fetch(`/api/bots/${bot.id}`, {
+            api(`/api/bots/${bot.id}`, {
               method: "PATCH",
-              headers: { "content-type": "application/json" },
               body: JSON.stringify({ unread: false }),
             }).catch(() => {});
           }
@@ -1262,9 +1261,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // reading the selected room clears its badge immediately
           if (group.unread && group.id === stateRef.current.selectedId) {
             group.unread = false;
-            fetch(`/api/groups/${group.id}`, {
+            api(`/api/groups/${group.id}`, {
               method: "PATCH",
-              headers: { "content-type": "application/json" },
               body: JSON.stringify({ unread: false }),
             }).catch(() => {});
           }

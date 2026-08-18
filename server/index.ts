@@ -1514,8 +1514,13 @@ async function runGroupMemberTurn(
   // same workspace + memory as a 1:1 turn — the room is a different
   // conversation, not a different bot
   const worksInWorkspace = instance.driverKind !== "grok" && instance.driverKind !== "boxAgent";
-  const cwd = worksInWorkspace ? ensureWorkspace(bot.id) : undefined;
+  const privateWorkspace = worksInWorkspace ? ensureWorkspace(bot.id) : undefined;
+  const cwd = worksInWorkspace ? (bot.cwd ?? privateWorkspace) : undefined;
   const roomSystem = cwd ? `${system}\n${memorySystemPrompt(bot.id).trim()}` : system;
+  const roomIntegrations =
+    cfg.mcpServers?.length
+      ? { mcpServers: cfg.mcpServers.filter((s) => s.enabled !== false) }
+      : undefined;
 
   // run the turn and wait for it to settle, folding the reply text so a
   // chained @mention can be routed afterwards
@@ -1551,6 +1556,7 @@ async function runGroupMemberTurn(
         text,
         system: roomSystem,
         cwd,
+        integrations: roomIntegrations,
         ...memberTurnSelection(bot.modelSelection),
       })
       .catch((err) => {
@@ -1855,9 +1861,12 @@ const server = createServer(async (req, res) => {
   // CORS headers for LAN access
   if (CORS_ORIGIN) {
     res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Last-Event-ID");
+    if (CORS_ORIGIN !== "*") {
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+      res.setHeader("Vary", "Origin");
+    }
 
     // Handle preflight requests
     if (method === "OPTIONS") {

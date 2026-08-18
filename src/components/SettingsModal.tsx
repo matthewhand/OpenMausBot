@@ -4,7 +4,7 @@
 // machine your bots can borrow.
 import { useEffect, useRef, useState } from "react";
 import { KeyRound, Monitor, Smartphone, Terminal, User, Volume2, X } from "lucide-react";
-import { useStore, type AppSettingsSection } from "@/state/store";
+import { api, useStore, type AppSettingsSection } from "@/state/store";
 import { ApiKeyRow } from "./ApiKeys";
 import { useUpdaterState } from "@/lib/updater";
 import { EnginesSettings } from "./EnginesSettings";
@@ -34,12 +34,10 @@ function ProfileFields() {
   }, [state.config?.profile?.name, state.config?.profile?.email]);
 
   const save = () => {
-    void fetch("/api/config", {
+    void api("/api/config", {
       method: "PUT",
-      headers: { "content-type": "application/json" },
       body: JSON.stringify({ profile: { name: name.trim(), email: email.trim().toLowerCase() } }),
     })
-      .then((r) => r.json())
       .then((config) => dispatch({ type: "configStatus", config }))
       .catch(() => {});
   };

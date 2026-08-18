@@ -146,8 +146,10 @@ describe("LAN access authentication", () => {
   it("includes CORS headers in responses", async () => {
     const res = await fetch(`${BASE}/api/health`);
     expect(res.headers.get("access-control-allow-origin")).toBe(CORS_ORIGIN);
-    expect(res.headers.get("access-control-allow-methods")).toContain("GET");
+    expect(res.headers.get("access-control-allow-methods")).toContain("PATCH");
     expect(res.headers.get("access-control-allow-headers")).toContain("Authorization");
+    expect(res.headers.get("access-control-allow-headers")).toContain("Last-Event-ID");
+    expect(res.headers.get("access-control-allow-credentials")).toBeNull();
   });
 
   it("accepts the token as ?access_token= for EventSource", async () => {

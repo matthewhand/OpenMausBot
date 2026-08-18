@@ -14,7 +14,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { DATA_DIR } from "../config.ts";
+import { DATA_DIR, RESERVED_MCP_NAMES } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
 import { brokerSocketPath, describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
 
@@ -384,6 +384,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       if (turn.integrations?.mcpServers) {
         for (const server of turn.integrations.mcpServers) {
           if (server.enabled === false) continue;
+          if (RESERVED_MCP_NAMES.has(server.name)) continue;
           const headers = server.headers ?? {};
           mcpServers[server.name] = {
             type: server.transport,
