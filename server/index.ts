@@ -7399,6 +7399,13 @@ const server = createServer(async (req, res) => {
   }
 });
 
+if (!lanBindAllowed(HOST, AUTH_TOKEN)) {
+  console.error(
+    `error: refusing to bind ${HOST}: OMB_AUTH_TOKEN is required for a non-loopback listen`,
+  );
+  process.exit(1);
+}
+
 server.listen(PORT, HOST, () => {
   console.log(`openmausbot server on http://${HOST}:${PORT}`);
   if (AUTH_TOKEN) {
@@ -7407,11 +7414,8 @@ server.listen(PORT, HOST, () => {
   if (CORS_ORIGIN) {
     console.log(`✓ CORS enabled for origin: ${CORS_ORIGIN}`);
   }
-  if (HOST !== "127.0.0.1") {
+  if (!isLoopbackBindHost(HOST)) {
     console.log(`⚠️  Server bound to ${HOST} — accessible from the network`);
-    if (!AUTH_TOKEN) {
-      console.log("⚠️  WARNING: No OMB_AUTH_TOKEN set. Consider setting one for LAN security.");
-    }
   }
 });
 
