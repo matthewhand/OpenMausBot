@@ -216,5 +216,5 @@ New-NetFirewallRule -DisplayName "OpenMausBot Harness" -Direction Inbound -Proto
 2. **HTTPS**: Consider putting OpenMausBot behind a reverse proxy (nginx, Caddy) with HTTPS
 3. **Restrict origins**: Set `OMB_CORS_ORIGIN` to your specific frontend URL instead of `*`
 4. **Network isolation**: Use a VPN or restrict firewall rules to trusted IPs only
-5. **Monitor logs**: `pnpm dev:server` writes to stderr (not `%APPDATA%\OpenMausBot\logs\server.log`)
+5. **Monitor logs**: `pnpm dev:server` writes to stderr (not `%APPDATA%\OpenMausBot\logs\server.log`). The Windows NSSM service writes `%PROGRAMDATA%\OpenMausBot\logs\`. See [windows-service.md](./windows-service.md).
 6. **Backup**: Regularly backup `%USERPROFILE%\.openmausbot\` directory
