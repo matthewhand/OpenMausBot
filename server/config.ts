@@ -263,6 +263,16 @@ const storedAppConfigSchema = appConfigSchema.extend({
 const appConfigPatchSchema = appConfigSchema.omit({ instances: true });
 const jsonObjectSchema = z.record(z.string(), z.json());
 
+export interface McpServer {
+  name: string;
+  transport: "http" | "sse";
+  url: string;
+  /** Optional headers (e.g. Authorization, API keys) — stored on the harness,
+   * never echoed back in GET /api/config (same write-only rule as other secrets). */
+  headers?: Record<string, string>;
+  enabled?: boolean;
+}
+
 export interface AppConfig {
   xai?: { key?: string; url?: string };
   openaiCompat?: { key?: string; url?: string; model?: string; provider?: string };
@@ -358,6 +368,29 @@ export function browserProfilePartitionTarget(
 ): BrowserProfilePartitionTarget | null {
   const profile = config.browserProfiles?.find((candidate) => candidate.id === profileId);
   return profile ? { profileId: profile.id, partitionId: browserProfilePartitionId(profile) } : null;
+}
+
+/** Keep stored MCP headers when a PUT omits them. GET never echoes headers,
+ * so a "save this list" from the UI would otherwise blank every secret. An
+ * explicit empty headers object still clears. */
+export function mergeMcpServers(previous: unknown, next: McpServer[]): McpServer[] {
+  const prevByName = new Map<string, McpServer>();
+  if (Array.isArray(previous)) {
+    for (const item of previous) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      if (typeof rec.name !== "string" || !rec.name) continue;
+      prevByName.set(rec.name, item as McpServer);
+    }
+  }
+  return next.map((server) => {
+    if (server.headers !== undefined) return server;
+    const prior = prevByName.get(server.name);
+    if (prior?.headers && Object.keys(prior.headers).length) {
+      return { ...server, headers: prior.headers };
+    }
+    return server;
+  });
 }
 
 export function parseStoredConfig(value: JsonValue): AppConfig {
@@ -610,6 +643,11 @@ export function saveConfig(patch: Partial<AppConfig>): void {
       diskInstances[instanceId] = merged;
     }
     disk.instances = diskInstances;
+  }
+  // mcpServers is an array. A client that does not have headers (GET never
+  // echoes them) must not wipe stored secrets when it PUTs the rest.
+  if (Array.isArray(patch.mcpServers)) {
+    disk.mcpServers = JSON.parse(JSON.stringify(mergeMcpServers(disk.mcpServers, patch.mcpServers)));
   }
   mkdirSync(DATA_DIR, { recursive: true });
   writeFileAtomic(p, JSON.stringify(disk, null, 2), { mode: 0o600 });

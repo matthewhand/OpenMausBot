@@ -7,6 +7,7 @@ import { Check, Loader2, RefreshCw, Search, TriangleAlert, X } from "lucide-reac
 import { api, useStore } from "@/state/store";
 import { cn } from "@/lib/cn";
 import { readCachedInventory, writeCachedInventory } from "@/lib/connected-apps-cache";
+import { CustomMcpTab } from "@/components/CustomMcpTab";
 
 interface ToolkitCard {
   slug: string;
@@ -217,7 +218,7 @@ export function PluginsPanel() {
   );
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
-  const [tab, setTab] = useState<"marketplace" | "connected">("marketplace");
+  const [tab, setTab] = useState<"marketplace" | "connected" | "mcp">("marketplace");
 
   const pollTimers = useRef(new Map<string, ReturnType<typeof setInterval>>());
   const statusGenerations = useRef(new Map<string, number>());
@@ -540,19 +541,36 @@ export function PluginsPanel() {
             >
               Connected{connectedCount > 0 ? ` ${connectedCount}` : ""}
             </button>
+            <button
+              role="tab"
+              aria-selected={tab === "mcp"}
+              onClick={() => setTab("mcp")}
+              className={cn(
+                "rounded-lg px-4 py-2 text-[13.5px] transition-colors",
+                tab === "mcp" ? "bg-card text-ink shadow-sm" : "text-ink-secondary hover:text-ink",
+              )}
+            >
+              Custom MCP
+            </button>
           </div>
-          <label className="flex h-11 w-full items-center gap-2.5 rounded-xl bg-raised/70 px-3.5 sm:w-[320px]">
-            <Search size={17} className="shrink-0 text-ink-secondary" />
-            <input
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="Search apps"
-              aria-label="Search apps"
-              className="min-w-0 flex-1 bg-transparent text-[14px] text-ink placeholder:text-ink-secondary focus:outline-none"
-            />
-          </label>
+          {tab !== "mcp" && (
+            <label className="flex h-11 w-full items-center gap-2.5 rounded-xl bg-raised/70 px-3.5 sm:w-[320px]">
+              <Search size={17} className="shrink-0 text-ink-secondary" />
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="Search apps"
+                aria-label="Search apps"
+                className="min-w-0 flex-1 bg-transparent text-[14px] text-ink placeholder:text-ink-secondary focus:outline-none"
+              />
+            </label>
+          )}
         </div>
 
+        {tab === "mcp" ? (
+          <CustomMcpTab />
+        ) : (
+          <>
         {/* Two notices about the same fact is one too many: the stale banner
             above already explains this launch, and "configure your own
             connection service" is advice for someone who never set one up. */}
@@ -741,6 +759,8 @@ export function PluginsPanel() {
             </div>
           )}
         </div>
+          </>
+        )}
       </div>
     </div>
   );

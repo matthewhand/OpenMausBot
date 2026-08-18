@@ -2305,6 +2305,10 @@ async function startTurn(
         const connection = await connectedAppsIntegration(bot.id, threadId);
         if (connection) integrations.composio = connection;
       }
+      // Custom remote MCP servers (enabled servers only)
+      if (cfg.mcpServers?.length) {
+        integrations.mcpServers = cfg.mcpServers.filter((s) => s.enabled !== false);
+      }
       // CLI engines work inside the bot's own workspace directory rather
       // than the user's home: a bot with file tools and acceptEdits gets a
       // desk, not the whole house — and the workspace is where its
@@ -3127,6 +3131,9 @@ async function runGroupMemberTurn(
     if (bot.composio !== false && composio.configured(cfg) && instance.adapter.capabilities.composioMcp === true) {
       const connection = await connectedAppsIntegration(bot.id, threadId);
       if (connection) integrations.composio = connection;
+    }
+    if (cfg.mcpServers?.length) {
+      integrations.mcpServers = cfg.mcpServers.filter((s) => s.enabled !== false);
     }
   } catch (error) {
     const message = `connected apps are unavailable — ${error instanceof Error ? error.message : String(error)}`;
