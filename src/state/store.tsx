@@ -211,10 +211,11 @@ export interface ConfigStatus {
   composio: { configured: boolean; mode?: "managed" | "self-hosted" | "unavailable" };
   box: { configured: boolean };
   opencodeGo?: { configured: boolean };
-  /** Voice (ElevenLabs). `configured` = a key is saved; `ready` = a key AND
-   * a voice, which is what it takes to actually speak. The key itself is
-   * never echoed back. */
-  tts?: { configured: boolean; ready: boolean; voice: string };
+  /** Voice. Supports ElevenLabs and OpenAI-compatible providers.
+   * `provider` = which provider is selected; `configured` = credentials are
+   * saved; `ready` = credentials AND a voice. Secrets are never echoed back.
+   * `baseUrl` is echoed for OpenAI-compatible (not a secret). */
+  tts?: { provider: "elevenlabs" | "openai-compatible"; configured: boolean; ready: boolean; voice: string; baseUrl: string };
   /** who's using the app — collected in onboarding, shown in the sidebar */
   profile?: { name: string; email: string };
 }
