@@ -1,447 +1,434 @@
-// Custom remote MCP servers panel. Users can add their own HTTP/SSE MCP
-// servers with optional auth headers. Composio Connect shows as one optional
-// preset when a key is configured, not the primary path.
-import { useCallback, useEffect, useState } from "react";
-import { ExternalLink, Loader2, Plus, RefreshCw, Settings2, Trash2, X } from "lucide-react";
-import { api, useStore, type ConfigStatus } from "@/state/store";
+// Connected apps marketplace, backed by Composio Sessions. Catalog comes
+// from /api/connectors/catalog — the full toolkit list with logos when a
+// Composio API key is configured, a curated set otherwise. Icons resolve
+// logo → favicon → monogram.
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Check, Loader2, RefreshCw, Search, X } from "lucide-react";
+import { api, useStore } from "@/state/store";
 import { cn } from "@/lib/cn";
+import { CustomMcpTab } from "@/components/CustomMcpTab";
 
-interface McpServer {
-  name: string;
-  transport: "http" | "sse";
-  url: string;
-  enabled: boolean;
-  hasHeaders: boolean;
+interface ToolkitCard {
+  slug: string;
+  label: string;
+  blurb: string;
+  logo: string | null;
+  domain: string | null;
 }
 
-interface EditingServer extends Omit<McpServer, "hasHeaders"> {
-  headers: Array<{ key: string; value: string }>;
+export interface ConnectorStatus {
+  connected: boolean;
+  pending?: boolean;
+  status?: string;
+}
+
+export function mergeCurrentConnectorStatus(
+  current: Record<string, ConnectorStatus>,
+  incoming: Record<string, ConnectorStatus>,
+  latestGenerations: ReadonlyMap<string, number>,
+  requestGenerations: ReadonlyMap<string, number>,
+) {
+  const next = { ...current };
+  for (const [slug, state] of Object.entries(incoming)) {
+    if ((latestGenerations.get(slug) ?? 0) !== (requestGenerations.get(slug) ?? 0)) continue;
+    next[slug] = state;
+  }
+  return next;
+}
+
+function ServiceIcon({ card }: { card: ToolkitCard }) {
+  // 0 = official logo, 1 = favicon by domain, 2 = monogram
+  const [stage, setStage] = useState(card.logo ? 0 : card.domain ? 1 : 2);
+  if (stage === 0 && card.logo) {
+    return <img src={card.logo} alt="" className="size-11 rounded-xl object-contain" onError={() => setStage(1)} />;
+  }
+  if (stage === 1 && card.domain) {
+    return (
+      <img
+        src={`https://www.google.com/s2/favicons?domain=${card.domain}&sz=64`}
+        alt=""
+        className="size-11 rounded-xl object-contain"
+        onError={() => setStage(2)}
+      />
+    );
+  }
+  return (
+    <div className="flex size-11 items-center justify-center rounded-xl bg-raised text-[15px] font-semibold text-ink-secondary">
+      {card.label.slice(0, 1).toUpperCase()}
+    </div>
+  );
 }
 
 export function PluginsPanel() {
   const { dispatch } = useStore();
-  const [servers, setServers] = useState<McpServer[]>([]);
-  const [composioConfigured, setComposioConfigured] = useState(false);
-  const [editing, setEditing] = useState<EditingServer | null>(null);
-  const [saving, setSaving] = useState(false);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const [cards, setCards] = useState<ToolkitCard[] | null>(null);
+  const [source, setSource] = useState<"api" | "curated">("curated");
+  const [configured, setConfigured] = useState(true);
+  const [status, setStatus] = useState<Record<string, ConnectorStatus>>({});
+  const [pendingUrls, setPendingUrls] = useState<Record<string, string>>({});
+  const [busySlug, setBusySlug] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [tab, setTab] = useState<"marketplace" | "connected" | "mcp">("marketplace");
 
-  const loadServers = useCallback(() => {
-    api("/api/config")
-      .then((cfg: ConfigStatus) => {
-        setServers(cfg.mcpServers ?? []);
-        setComposioConfigured(cfg.composio.configured);
+  const pollTimers = useRef(new Map<string, ReturnType<typeof setInterval>>());
+  const statusGenerations = useRef(new Map<string, number>());
+
+  const refreshStatus = useCallback((slugs: string[]): Promise<Record<string, ConnectorStatus>> => {
+    if (!slugs.length) return Promise.resolve({});
+    const requestGenerations = new Map(slugs.map((slug) => [slug, statusGenerations.current.get(slug) ?? 0]));
+    setRefreshing(true);
+    return api(`/api/connectors?services=${slugs.join(",")}`)
+      .then((r) => {
+        const services: Record<string, ConnectorStatus> = r.services ?? {};
+        // A one-service OAuth poll must not erase every other app's state.
+        // A request that began before Connect must also not erase the newer
+        // local INITIATED state when its stale not_connected result arrives.
+        setStatus((current) => mergeCurrentConnectorStatus(
+          current,
+          services,
+          statusGenerations.current,
+          requestGenerations,
+        ));
+        for (const [slug, state] of Object.entries(services)) {
+          const isCurrent = (statusGenerations.current.get(slug) ?? 0) === (requestGenerations.get(slug) ?? 0);
+          if (isCurrent && state.connected) setPendingUrls((current) => {
+            if (!current[slug]) return current;
+            const next = { ...current };
+            delete next[slug];
+            return next;
+          });
+        }
+        return services;
       })
-      .catch((e) => setError(e.message));
+      .catch(() => ({}))
+      .finally(() => setRefreshing(false));
+  }, []);
+
+  useEffect(() => () => {
+    for (const timer of pollTimers.current.values()) clearInterval(timer);
+    pollTimers.current.clear();
   }, []);
 
   useEffect(() => {
-    loadServers();
-  }, [loadServers]);
+    let alive = true;
+    api("/api/connectors/catalog")
+      .then((r) => {
+        if (!alive) return;
+        setCards(r.cards ?? []);
+        setSource(r.source ?? "curated");
+        setConfigured(Boolean(r.configured));
+        if (r.configured) void refreshStatus((r.cards ?? []).map((c: ToolkitCard) => c.slug).slice(0, 40));
+      })
+      .catch((e) => alive && setError(e.message));
+    return () => {
+      alive = false;
+    };
+  }, [refreshStatus]);
 
-  const openEditor = (server?: McpServer) => {
-    if (server) {
-      setEditing({
-        name: server.name,
-        transport: server.transport,
-        url: server.url,
-        enabled: server.enabled,
-        headers: [],
-      });
-    } else {
-      setEditing({
-        name: "",
-        transport: "http",
-        url: "",
-        enabled: true,
-        headers: [],
-      });
-    }
-    setError(null);
-  };
+  useEffect(() => {
+    const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const dialog = dialogRef.current;
+    const focusable = () =>
+      Array.from(
+        dialog?.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      );
 
-  const closeEditor = () => {
-    setEditing(null);
-    setError(null);
-  };
+    (dialog?.querySelector<HTMLElement>("input") ?? focusable()[0] ?? dialog)?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        dispatch({ type: "togglePlugins", open: false });
+        return;
+      }
+      if (event.key !== "Tab" || !dialog) return;
+      const items = focusable();
+      if (items.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items.at(-1)!;
+      if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
 
-  const saveServer = async () => {
-    if (!editing) return;
-    if (!editing.name.trim() || !editing.url.trim()) {
-      setError("Name and URL are required");
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      returnFocus?.focus();
+    };
+  }, [dispatch]);
+
+  const openConnectUrl = async (url: string) => {
+    if (window.ogb?.openExternal) {
+      await window.ogb.openExternal(url);
       return;
     }
-    // Validate name: alphanumeric + dash/underscore only
-    if (!/^[\w-]+$/.test(editing.name.trim())) {
-      setError("Name must contain only letters, numbers, dash, and underscore");
-      return;
-    }
+    // Browser development fallback. If a popup blocker rejects the first
+    // asynchronous open, the visible Continue button retries from a direct
+    // user gesture using the URL retained in pendingUrls.
+    const opened = window.open("", "_blank");
+    if (!opened) throw new Error("Your browser blocked the connection page. Click Continue to open it.");
+    // Open a same-origin blank page first so the OAuth origin never receives
+    // an opener reference, while a real null remains a reliable blocked signal.
+    opened.opener = null;
+    opened.location.replace(url);
+  };
 
-    setSaving(true);
-    setError(null);
-    try {
-      // Build the server object with headers only if they exist
-      const headers: Record<string, string> = {};
-      for (const h of editing.headers) {
-        if (h.key.trim() && h.value.trim()) {
-          headers[h.key.trim()] = h.value.trim();
+  const startPolling = (slug: string) => {
+    const old = pollTimers.current.get(slug);
+    if (old) clearInterval(old);
+    let tries = 0;
+    const timer = setInterval(() => {
+      void refreshStatus([slug]).then((services) => {
+        const state = services[slug];
+        if (++tries >= 24 || state?.connected || (state?.status && /^(expired|failed)$/i.test(state.status))) {
+          clearInterval(timer);
+          pollTimers.current.delete(slug);
         }
-      }
-
-      const updatedServers = [...servers];
-      const existingIndex = updatedServers.findIndex((s) => s.name === editing.name);
-      const newServer: McpServer = {
-        name: editing.name.trim(),
-        transport: editing.transport,
-        url: editing.url.trim(),
-        enabled: editing.enabled,
-        hasHeaders: Object.keys(headers).length > 0,
-      };
-
-      if (existingIndex >= 0) {
-        updatedServers[existingIndex] = newServer;
-      } else {
-        updatedServers.push(newServer);
-      }
-
-      // Save to backend (with headers in the payload, but they won't be echoed back)
-      const serverPayload = {
-        ...newServer,
-        headers: Object.keys(headers).length ? headers : undefined,
-      };
-      delete (serverPayload as any).hasHeaders;
-
-      const updatedPayload = updatedServers.map((s) => {
-        if (s.name === newServer.name) return serverPayload;
-        // For other servers, keep their existing state (we don't have their headers)
-        const { hasHeaders, ...rest } = s;
-        return rest;
       });
-
-      await api("/api/config", {
-        method: "PUT",
-        body: JSON.stringify({ mcpServers: updatedPayload }),
-      });
-
-      loadServers();
-      closeEditor();
-    } catch (e: any) {
-      setError(e.message);
-    } finally {
-      setSaving(false);
-    }
+    }, 5000);
+    pollTimers.current.set(slug, timer);
   };
 
-  const deleteServer = async (name: string) => {
-    if (!confirm(`Delete MCP server "${name}"?`)) return;
-    setSaving(true);
+  const connect = async (slug: string) => {
+    statusGenerations.current.set(slug, (statusGenerations.current.get(slug) ?? 0) + 1);
+    setBusySlug(slug);
     setError(null);
     try {
-      const updated = servers.filter((s) => s.name !== name);
-      const payload = updated.map(({ hasHeaders, ...rest }) => rest);
-      await api("/api/config", {
-        method: "PUT",
-        body: JSON.stringify({ mcpServers: payload }),
-      });
-      loadServers();
-    } catch (e: any) {
-      setError(e.message);
+      const { url } = await api(`/api/connectors/${slug}/authorize`, { method: "POST" });
+      setPendingUrls((current) => ({ ...current, [slug]: url }));
+      setStatus((current) => ({ ...current, [slug]: { connected: false, pending: true, status: "INITIATED" } }));
+      startPolling(slug);
+      await openConnectUrl(url);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setSaving(false);
+      setBusySlug(null);
     }
   };
 
-  const toggleEnabled = async (name: string) => {
-    setSaving(true);
-    setError(null);
-    try {
-      const updated = servers.map((s) => (s.name === name ? { ...s, enabled: !s.enabled } : s));
-      const payload = updated.map(({ hasHeaders, ...rest }) => rest);
-      await api("/api/config", {
-        method: "PUT",
-        body: JSON.stringify({ mcpServers: payload }),
-      });
-      loadServers();
-    } catch (e: any) {
-      setError(e.message);
-    } finally {
-      setSaving(false);
-    }
+  const disconnect = (slug: string) => {
+    setBusySlug(slug);
+    api(`/api/connectors/${slug}`, { method: "DELETE" })
+      .then(() => refreshStatus([slug]))
+      .catch((e) => setError(e.message))
+      .finally(() => setBusySlug(null));
   };
+
+  const matching = (cards ?? []).filter(
+    (c) => !search || `${c.label} ${c.slug} ${c.blurb}`.toLowerCase().includes(search.toLowerCase()),
+  );
+  const visible = matching.filter((card) => tab === "marketplace" || status[card.slug]?.connected);
+  const connectedCount = Object.values(status).filter((service) => service.connected).length;
+  const close = () => dispatch({ type: "togglePlugins", open: false });
 
   return (
     <div
-      className="absolute inset-0 z-20 flex items-center justify-center bg-black/40"
-      onClick={() => dispatch({ type: "togglePlugins", open: false })}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px] sm:p-6"
+      onMouseDown={(event) => event.target === event.currentTarget && close()}
     >
       <div
-        className="animate-pop-in flex max-h-[85%] w-[640px] flex-col rounded-2xl border border-hairline/50 bg-panel p-5 shadow-2xl"
-        onClick={(e) => e.stopPropagation()}
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="connected-apps-title"
+        tabIndex={-1}
+        className="animate-pop-in flex h-[min(780px,calc(100dvh-2rem))] w-full max-w-[1040px] flex-col overflow-hidden rounded-[24px] border border-hairline/50 bg-panel shadow-2xl shadow-black/50"
       >
-        <div className="flex items-center justify-between">
-          <div className="text-[17px] font-semibold text-ink">Remote MCP Servers</div>
+        <header className="flex items-start justify-between gap-4 px-6 pb-3 pt-6 sm:px-8 sm:pt-7">
+          <div>
+            <h2 id="connected-apps-title" className="text-[22px] font-semibold tracking-[-0.01em] text-ink">Plugins</h2>
+            <p className="mt-1 text-[13px] text-ink-secondary">Connect the apps your bots can use.</p>
+          </div>
           <div className="flex items-center gap-1">
             <button
-              onClick={loadServers}
-              className="rounded-md p-1 text-ink-secondary hover:bg-raised hover:text-ink"
-              title="Refresh"
+              onClick={() => refreshStatus(matching.map((c) => c.slug).slice(0, 40))}
+              className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"
+              title="Refresh connection status"
             >
-              <RefreshCw size={15} />
+              <RefreshCw size={17} className={cn(refreshing && "animate-spin")} />
             </button>
             <button
-              onClick={() => dispatch({ type: "togglePlugins", open: false })}
-              className="rounded-md p-1 text-ink-secondary hover:bg-raised hover:text-ink"
+              onClick={close}
+              aria-label="Close plugins"
+              className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"
             >
-              <X size={18} />
+              <X size={21} />
             </button>
           </div>
-        </div>
-        <div className="mt-1 text-[13px] text-ink-secondary">
-          Connect your own remote MCP servers (HTTP or SSE). Works with Claude.
-        </div>
+        </header>
 
-        {error && <div className="mt-3 rounded-lg bg-danger/10 px-3 py-2 text-[12px] text-danger">{error}</div>}
-
-        {!editing && (
-          <>
-            <div className="mt-4 flex items-center justify-between">
-              <div className="text-[14px] font-medium text-ink">Your Servers</div>
-              <button
-                onClick={() => openEditor()}
-                className="flex items-center gap-1.5 rounded-lg bg-raised px-3 py-1.5 text-[13px] text-ink hover:bg-raised-hover"
-              >
-                <Plus size={14} />
-                Add Server
-              </button>
-            </div>
-
-            <div className="mt-3 min-h-0 flex-1 overflow-y-auto rounded-xl border border-hairline/40">
-              {servers.length === 0 ? (
-                <div className="flex flex-col items-center justify-center gap-2 py-12 text-center">
-                  <div className="text-[14px] text-ink-secondary">No MCP servers configured yet</div>
-                  <div className="text-[12px] text-ink-secondary">
-                    Add your own HTTP or SSE MCP servers to give your bots access to custom tools.
-                  </div>
-                </div>
-              ) : (
-                servers.map((server, i) => (
-                  <div
-                    key={server.name}
-                    className={cn("flex items-center gap-3 bg-card px-4 py-3", i > 0 && "border-t border-hairline/40")}
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2 text-[14px] font-medium text-ink">
-                        {server.name}
-                        {server.enabled && <span className="size-1.5 rounded-full bg-success" />}
-                        {!server.enabled && <span className="text-[11px] text-ink-secondary">(disabled)</span>}
-                      </div>
-                      <div className="truncate text-[12px] text-ink-secondary">
-                        {server.transport.toUpperCase()} · {server.url}
-                        {server.hasHeaders && " · has headers"}
-                      </div>
-                    </div>
-                    <button
-                      onClick={() => openEditor(server)}
-                      className="rounded-md p-1.5 text-ink-secondary hover:bg-raised hover:text-ink"
-                      title="Edit"
-                    >
-                      <Settings2 size={15} />
-                    </button>
-                    <button
-                      disabled={saving}
-                      onClick={() => toggleEnabled(server.name)}
-                      className="w-[72px] rounded-lg bg-raised py-1.5 text-[12px] text-ink hover:bg-raised-hover disabled:opacity-50"
-                    >
-                      {server.enabled ? "Disable" : "Enable"}
-                    </button>
-                    <button
-                      disabled={saving}
-                      onClick={() => deleteServer(server.name)}
-                      className="rounded-md p-1.5 text-ink-secondary hover:bg-danger hover:text-white disabled:opacity-50"
-                      title="Delete"
-                    >
-                      <Trash2 size={15} />
-                    </button>
-                  </div>
-                ))
+        <div className="flex flex-col gap-3 px-6 pb-4 pt-5 sm:flex-row sm:items-center sm:justify-between sm:px-8">
+          <div className="flex w-fit rounded-xl bg-raised/70 p-1" role="tablist" aria-label="Plugin view">
+            <button
+              role="tab"
+              aria-selected={tab === "marketplace"}
+              onClick={() => setTab("marketplace")}
+              className={cn(
+                "rounded-lg px-4 py-2 text-[13.5px] transition-colors",
+                tab === "marketplace" ? "bg-card text-ink shadow-sm" : "text-ink-secondary hover:text-ink",
               )}
-            </div>
+            >
+              Marketplace
+            </button>
+            <button
+              role="tab"
+              aria-selected={tab === "connected"}
+              onClick={() => setTab("connected")}
+              className={cn(
+                "rounded-lg px-4 py-2 text-[13.5px] transition-colors",
+                tab === "connected" ? "bg-card text-ink shadow-sm" : "text-ink-secondary hover:text-ink",
+              )}
+            >
+              Connected{connectedCount > 0 ? ` ${connectedCount}` : ""}
+            </button>
+            <button
+              role="tab"
+              aria-selected={tab === "mcp"}
+              onClick={() => setTab("mcp")}
+              className={cn(
+                "rounded-lg px-4 py-2 text-[13.5px] transition-colors",
+                tab === "mcp" ? "bg-card text-ink shadow-sm" : "text-ink-secondary hover:text-ink",
+              )}
+            >
+              Custom MCP
+            </button>
+          </div>
+          {tab !== "mcp" && <label className="flex h-11 w-full items-center gap-2.5 rounded-xl bg-raised/70 px-3.5 sm:w-[320px]">
+            <Search size={17} className="shrink-0 text-ink-secondary" />
+            <input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search plugins"
+              aria-label="Search plugins"
+              className="min-w-0 flex-1 bg-transparent text-[14px] text-ink placeholder:text-ink-secondary focus:outline-none"
+            />
+          </label>
+        </div>
 
-            {composioConfigured && (
-              <div className="mt-4 rounded-lg border border-hairline/40 bg-card p-3">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <div className="text-[13px] font-medium text-ink">Composio Connect</div>
-                    <div className="text-[11px] text-ink-secondary">
-                      Connected apps (Slack, GitHub, Gmail, etc.) via Composio
+        {tab === "mcp" ? (
+          <CustomMcpTab />
+        ) : (
+          <>
+        {!configured && (
+          <div className="mx-6 mb-1 rounded-xl bg-warning/10 px-4 py-3 text-[13px] text-warning sm:mx-8">
+            Add your Composio project key to connect apps.{" "}
+            <button
+              className="font-medium underline underline-offset-2"
+              onClick={() => {
+                close();
+                dispatch({ type: "toggleAppSettings", open: true });
+              }}
+            >
+              Open settings
+            </button>
+          </div>
+        )}
+        {configured && source === "curated" && (
+          <div className="mx-6 mb-1 text-[12px] text-ink-secondary sm:mx-8">
+            Showing featured apps.{" "}
+            <button
+              className="underline underline-offset-2 hover:text-ink"
+              onClick={() => {
+                close();
+                dispatch({ type: "toggleAppSettings", open: true });
+              }}
+            >
+              Use your Composio key
+            </button>{" "}
+            for the full catalog.
+          </div>
+        )}
+        {error && <div role="alert" className="mx-6 mt-2 rounded-lg bg-danger/10 px-3 py-2 text-[12px] text-danger sm:mx-8">{error}</div>}
+
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-7 pt-5 sm:px-8">
+          {cards === null ? (
+            <div className="flex items-center justify-center gap-2 py-24 text-[13px] text-ink-secondary">
+              <Loader2 size={14} className="animate-spin" /> Loading catalog…
+            </div>
+          ) : (
+            <div>
+              <div className="mb-3 text-[12px] font-medium text-ink-secondary">
+                {tab === "connected" ? "Your connections" : search ? "Search results" : "Available apps"}
+              </div>
+              <div className="grid grid-cols-1 gap-x-10 md:grid-cols-2">
+              {visible.map((card) => {
+              const serviceStatus = status[card.slug];
+              const connected = serviceStatus?.connected;
+              const pending = serviceStatus?.pending;
+              const failed = serviceStatus?.status && /^(expired|failed)$/i.test(serviceStatus.status);
+              const busy = busySlug === card.slug;
+              return (
+                <div
+                  key={card.slug}
+                  className="flex min-h-[88px] items-center gap-3 border-b border-hairline/35 px-1 py-4"
+                >
+                  <ServiceIcon card={card} />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-[14px] font-medium text-ink">{card.label}</div>
+                    <div className="mt-0.5 truncate text-[12.5px] text-ink-secondary">
+                      {pending ? "Finish setup in your browser" : failed ? "Authorization expired — try again" : card.blurb}
                     </div>
                   </div>
-                  <a
-                    href="https://composio.dev"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center gap-1 rounded-lg bg-raised px-3 py-1.5 text-[12px] text-ink hover:bg-raised-hover"
+                  <button
+                    disabled={!configured || busy}
+                    onClick={() => {
+                      if (connected) disconnect(card.slug);
+                      else if (pending && pendingUrls[card.slug]) {
+                        setError(null);
+                        void openConnectUrl(pendingUrls[card.slug]).catch((e) => setError(e.message));
+                      } else void connect(card.slug);
+                    }}
+                    className={cn(
+                      "flex min-w-[88px] items-center justify-center gap-1.5 rounded-full px-3 py-2 text-[12.5px] transition-colors disabled:opacity-40",
+                      connected
+                        ? "bg-transparent text-success hover:bg-danger/10 hover:text-danger"
+                        : "bg-raised text-ink hover:bg-raised-hover",
+                    )}
+                    title={connected ? `Disconnect ${card.label}` : undefined}
                   >
-                    Manage
-                    <ExternalLink size={12} />
-                  </a>
+                    {busy ? (
+                      <Loader2 size={13} className="mx-auto animate-spin" />
+                    ) : connected ? (
+                      <><Check size={14} /> Connected</>
+                    ) : pending ? (
+                      "Continue"
+                    ) : failed ? (
+                      "Retry"
+                    ) : (
+                      "Connect"
+                    )}
+                  </button>
                 </div>
+              );
+              })}
               </div>
-            )}
-
-            <div className="mt-3 text-[11px] text-ink-secondary">
-              Need an MCP server? Check out{" "}
-              <a
-                href="https://github.com/modelcontextprotocol/servers"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="underline hover:text-ink"
-              >
-                MCP servers directory
-              </a>
-              .
             </div>
+          )}
+          {cards !== null && visible.length === 0 && (
+            <div className="flex min-h-56 flex-col items-center justify-center text-center">
+              <div className="text-[14px] font-medium text-ink">
+                {tab === "connected" ? "No connected plugins yet" : "No plugins found"}
+              </div>
+              <div className="mt-1 text-[12.5px] text-ink-secondary">
+                {tab === "connected" ? "Connect an app from Marketplace and it will appear here." : "Try a different search."}
+              </div>
+            </div>
+          )}
+        </div>
           </>
-        )}
-
-        {editing && (
-          <div className="mt-4 flex flex-col gap-3">
-            <div className="text-[14px] font-medium text-ink">
-              {servers.find((s) => s.name === editing.name) ? "Edit" : "Add"} MCP Server
-            </div>
-
-            <div>
-              <label className="block text-[12px] text-ink-secondary">
-                Name <span className="text-danger">*</span>
-              </label>
-              <input
-                type="text"
-                value={editing.name}
-                onChange={(e) => setEditing({ ...editing, name: e.target.value })}
-                placeholder="my-mcp-server"
-                disabled={servers.some((s) => s.name === editing.name)}
-                className="mt-1 w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none disabled:opacity-50"
-              />
-              <div className="mt-1 text-[11px] text-ink-secondary">
-                Lowercase letters, numbers, dash, and underscore only. Used as the MCP server identifier.
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-[12px] text-ink-secondary">
-                Transport <span className="text-danger">*</span>
-              </label>
-              <select
-                value={editing.transport}
-                onChange={(e) => setEditing({ ...editing, transport: e.target.value as "http" | "sse" })}
-                className="mt-1 w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none"
-              >
-                <option value="http">HTTP (streamable HTTP)</option>
-                <option value="sse">SSE (Server-Sent Events)</option>
-              </select>
-            </div>
-
-            <div>
-              <label className="block text-[12px] text-ink-secondary">
-                URL <span className="text-danger">*</span>
-              </label>
-              <input
-                type="url"
-                value={editing.url}
-                onChange={(e) => setEditing({ ...editing, url: e.target.value })}
-                placeholder="https://api.example.com/mcp"
-                className="mt-1 w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
-              />
-            </div>
-
-            <div>
-              <label className="block text-[12px] text-ink-secondary">Headers (optional)</label>
-              <div className="mt-1 space-y-2">
-                {editing.headers.map((header, i) => (
-                  <div key={i} className="flex gap-2">
-                    <input
-                      type="text"
-                      value={header.key}
-                      onChange={(e) => {
-                        const updated = [...editing.headers];
-                        updated[i] = { ...updated[i], key: e.target.value };
-                        setEditing({ ...editing, headers: updated });
-                      }}
-                      placeholder="Authorization"
-                      className="flex-1 rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[12px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
-                    />
-                    <input
-                      type="password"
-                      value={header.value}
-                      onChange={(e) => {
-                        const updated = [...editing.headers];
-                        updated[i] = { ...updated[i], value: e.target.value };
-                        setEditing({ ...editing, headers: updated });
-                      }}
-                      placeholder="Bearer token..."
-                      className="flex-1 rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[12px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
-                    />
-                    <button
-                      onClick={() => {
-                        const updated = editing.headers.filter((_, idx) => idx !== i);
-                        setEditing({ ...editing, headers: updated });
-                      }}
-                      className="rounded-md p-2 text-ink-secondary hover:bg-raised hover:text-danger"
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                ))}
-                <button
-                  onClick={() => setEditing({ ...editing, headers: [...editing.headers, { key: "", value: "" }] })}
-                  className="flex items-center gap-1 rounded-lg bg-raised px-3 py-1.5 text-[12px] text-ink hover:bg-raised-hover"
-                >
-                  <Plus size={12} />
-                  Add Header
-                </button>
-              </div>
-              <div className="mt-1 text-[11px] text-ink-secondary">
-                Headers are stored securely and never echoed back. Use for API keys, auth tokens, etc.
-              </div>
-            </div>
-
-            <div className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                id="enabled"
-                checked={editing.enabled}
-                onChange={(e) => setEditing({ ...editing, enabled: e.target.checked })}
-                className="size-4 rounded border-hairline/40"
-              />
-              <label htmlFor="enabled" className="text-[12px] text-ink">
-                Enabled
-              </label>
-            </div>
-
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={closeEditor}
-                disabled={saving}
-                className="rounded-lg bg-raised px-4 py-2 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={saveServer}
-                disabled={saving}
-                className="flex items-center gap-2 rounded-lg bg-blue-500 px-4 py-2 text-[13px] text-white hover:bg-blue-600 disabled:opacity-50"
-              >
-                {saving ? (
-                  <>
-                    <Loader2 size={14} className="animate-spin" />
-                    Saving...
-                  </>
-                ) : (
-                  "Save"
-                )}
-              </button>
-            </div>
-          </div>
         )}
       </div>
     </div>

@@ -10,12 +10,42 @@ export type InstanceId = string;
 export type ThreadId = string;
 export type TurnId = string;
 
+export type ProviderErrorCode =
+  | "missing_cli"
+  | "invalid_credentials"
+  | "inactive_subscription"
+  | "quota_or_region_restriction"
+  | "upstream_outage"
+  | "model_catalog_outage";
+
+export class ProviderError extends Error {
+  readonly code: ProviderErrorCode;
+
+  constructor(code: ProviderErrorCode, message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "ProviderError";
+    this.code = code;
+  }
+}
+
+/** Reasoning-effort levels, ascending. A union of everything any engine
+ * accepts; each driver declares the subset its CLI will take. */
+export const EFFORT_LEVELS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
+/** Narrow untrusted API/config input before it becomes a model selection. */
+export function isEffortLevel(value: unknown): value is EffortLevel {
+  return typeof value === "string" && (EFFORT_LEVELS as readonly string[]).includes(value);
+}
+
 // ── model selection ────────────────────────────────────────────────────
 // "Which model" is a data value carried on the request, never a service
 // binding (upstream ModelSelectionWire). instanceId is the routing key.
 export interface ModelSelection {
   instanceId: InstanceId;
   model: string;
+  /** Optional: no effort means no flag, and the CLI keeps its own default. */
+  effort?: EffortLevel;
 }
 
 // ── instance configuration envelope ────────────────────────────────────
@@ -74,7 +104,14 @@ export type RuntimeEvent = RuntimeEventBase &
         summary: string;
         choices?: string[];
       }
-    | { type: "request.resolved"; behavior: string; source: string }
+    | {
+        type: "request.resolved";
+        behavior: "allow" | "deny" | "answer";
+        /** who decided: a person, auto mode, the ask's own timeout, the
+         * harness (turn ended / settings changed), or nobody — the answerer
+         * was already gone and the action never ran */
+        source: "user" | "auto" | "timeout" | "system" | "unavailable" | "peer";
+      }
     | { type: "thread.token-usage.updated"; input: number; output: number }
     // `setup: true` marks a failure the user fixes by installing or
     // configuring something, not by retrying — the UI offers setup instead.
@@ -82,6 +119,12 @@ export type RuntimeEvent = RuntimeEventBase &
   );
 
 export type RuntimeEventListener = (event: RuntimeEvent) => void;
+
+/** What became of an answer to an ask. `allowed-once` grants only the
+ * asked-about action — broadening ("always allow") stays a separate,
+ * explicit step. `unavailable` is the fail-closed default: no answerer,
+ * no action. */
+export type RequestOutcome = "allowed-once" | "rejected" | "answered" | "unavailable";
 
 // ── adapter contract (upstream ProviderAdapterShape, promise-flavored) ──
 // The conversation runtime every provider is flattened into. streamEvents
@@ -92,6 +135,7 @@ export interface SendTurnInput {
   threadId: ThreadId;
   text: string;
   model?: string;
+  effort?: EffortLevel;
   resumeCursor?: unknown;
   /** Prior turns for transcript-replay providers (API-backed drivers). */
   transcript?: Array<{ role: "user" | "assistant"; text: string }>;
@@ -99,7 +143,7 @@ export interface SendTurnInput {
   system?: string;
   /** Per-bot integrations the driver may hand to the agent as tools. */
   integrations?: {
-    composio?: { url?: string; key: string };
+    composio?: { url: string; headers: Record<string, string> };
     /** Cloud computer, reached through OpenMausBot's REST-to-MCP adapter. */
     computer?: { kind?: "box"; boxId: string; token: string };
     /** Direct stdio connection to a Cua Driver MCP server (host or sandbox). */
@@ -116,6 +160,9 @@ export interface SendTurnInput {
       headers?: Record<string, string>;
       enabled?: boolean;
     }>;
+    /** dweb network daemon: an MCP proxy exposing dweb status, repo, and
+     * opencode model access as tools. url is the dweb HTTP base. */
+    dweb?: { url: string };
   };
   cwd?: string;
 }
@@ -137,14 +184,27 @@ export interface ProviderAdapter {
      * told it has a computer whose tools its driver cannot mount — it
      * burns turns hunting for tools that aren't there. */
     computerMcp?: boolean;
+    /** True when the driver mounts turn.integrations.composio (the user's
+     * connected apps). Same rule again: a key in the config says the user
+     * HAS those connections, not that this driver can reach them. */
+    composioMcp?: boolean;
+    /** Effort levels this driver can pass to its CLI, ascending. Absent =
+     * the driver cannot set effort, so the app never offers the control —
+     * same rule as computerMcp: never show a knob the driver cannot turn. */
+    effortLevels?: readonly EffortLevel[];
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;
+  /** Answer a pending ask. Resolves with what actually happened — never
+   * throws for an ask that is no longer there: `unavailable` means nobody
+   * could take the answer (the turn ended, the broker died, the driver
+   * has no asks), and the caller treats it as a deny. Callers branch on the
+   * outcome, not on prose. */
   respondToRequest(
     threadId: ThreadId,
     requestId: string,
     decision: { behavior: "allow" | "deny" | "answer"; message?: string },
-  ): Promise<void>;
+  ): Promise<RequestOutcome>;
   hasSession(threadId: ThreadId): boolean;
   stopAll(): Promise<void>;
   onEvent(listener: RuntimeEventListener): () => void;
@@ -186,7 +246,7 @@ export interface EngineInstall {
 // a rejection to an unavailable shadow snapshot.
 export interface ModelCatalog {
   default: string;
-  options: Array<{ id: string; label: string }>;
+  options: Array<{ id: string; label: string; custom?: boolean; loaded?: boolean }>;
 }
 
 export interface DriverCreateInput<Config> {
@@ -203,6 +263,8 @@ export interface ProviderInstance {
   readonly displayName: string | undefined;
   readonly enabled: boolean;
   readonly models: ModelCatalog;
+  /** Refresh a live catalog without recreating the provider instance. */
+  readonly refreshModels?: () => Promise<void>;
   readonly adapter: ProviderAdapter;
   snapshot(): Promise<ProviderSnapshot>;
   /** Cheap one-shot text call (upstream TextGeneration) — titles, summaries. */
@@ -210,9 +272,18 @@ export interface ProviderInstance {
   dispose(): Promise<void>;
 }
 
+/** How an engine is presented in the picker rail.
+ *  `subscription` — first-party cloud catalog; Custom is extra.
+ *  `custom` — no subscription catalog; Custom is the product. */
+export type EngineAccess = "subscription" | "custom";
+
 export interface ProviderDriver<Config = unknown> {
   readonly driverKind: DriverKind;
-  readonly metadata: { displayName: string; supportsMultipleInstances?: boolean };
+  readonly metadata: {
+    displayName: string;
+    supportsMultipleInstances?: boolean;
+    access?: EngineAccess;
+  };
   /** How to get this engine installed. Omit for engines that need no local
    * binary (API-key drivers), which is what makes it optional. */
   readonly install?: EngineInstall;

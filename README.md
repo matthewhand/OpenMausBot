@@ -47,11 +47,13 @@ memory of its thread, model, computer, and apps) and rebuilds it open, local-fir
 already have:
 
 - **Bring your own agents.** Bots run on the `claude`, `codex`, and `grok` CLIs installed on your own machine
-  — your existing logins and subscriptions, no new accounts, no proxy in the middle.
+  — your existing logins and subscriptions, no new accounts, no proxy in the middle. Point any engine at a
+  custom CLI binary (a versioned build or wrapper) in **Settings → Engines**.
 - **Local first.** One small harness server on `127.0.0.1` owns every agent process. Transcripts, keys, and
   events live in `~/.openmausbot`, not a cloud.
 - **Agents with hands.** Each bot can get a real computer — a cloud Linux desktop it drives while you watch
-  live, or your own Mac — plus custom tools through remote MCP servers (HTTP or SSE).
+  live, or your own Mac — plus 500+ apps through Composio, or your own
+  remote MCP servers (HTTP or SSE).
 
 ## Features
 
@@ -91,10 +93,11 @@ permission broker turns every risky action into a decision you make, for cloud a
 </td>
 <td width="50%" valign="top">
 
-### 🔌 Custom remote MCP servers
+### 🔌 Connected apps and custom MCP
 
-Add your own HTTP or SSE MCP servers in the Plugins panel. Point at any Model Context Protocol server —
-Notion, GitHub, custom APIs — and every Claude bot can use those tools. Composio is optional.
+A one-click marketplace over Composio Sessions: Gmail, Slack, GitHub, Notion, Linear and hundreds more.
+OAuth once, and every bot can use them as tools. You can also add your own HTTP or SSE MCP servers in
+the Plugins panel.
 
 <img src="docs/screenshots/marketplace.png" alt="Remote MCP servers panel" width="100%">
 
@@ -163,7 +166,8 @@ flowchart LR
     REG --> CL & CX & GR
     CL & CX & GR -- "permission requests" --> BROKER
     server -- "Box API" --> BOX[("Cloud computer<br/>box.ascii.dev")]
-    server -- "Custom MCP servers" --> APPS[("Your HTTP/SSE MCP tools")]
+    server -- "Composio Session" --> APPS[("Gmail · Slack · GitHub · …")]
+    server -- "Custom MCP servers" --> MCP[("Your HTTP/SSE MCP tools")]
 ```
 
 | Layer | Where | What it does |
@@ -229,9 +233,9 @@ in the sidebar footer) when you want to enable its integration:
 
 | Credential | What it enables | Where to get it |
 |---|---|---|
+| Composio project key (`ak_…`) | Connect Gmail, GitHub, Slack, Notion, and other apps to your bots | [OpenMausBot Composio setup](docs/composio.md) |
 | Box API key | Give bots an isolated remote Linux computer with a desktop and terminal | [Box API key guide](https://docs.ascii.dev/box/api-keys) |
 | TTS provider | Read replies aloud and call your bots — choose ElevenLabs or OpenAI-compatible (Kokoro, etc.) | [ElevenLabs keys](https://elevenlabs.io/app/settings/api-keys) or [local Kokoro setup](docs/voice-mode.md) |
-| Composio Connect key (`ck_…`) (optional) | Use Composio's connected apps marketplace instead of custom MCP servers | [Composio Connect setup guide](https://docs.composio.dev/docs/composio-connect) |
 **Custom MCP servers** are configured in the Plugins panel (puzzle icon in the chat header). No account
 or API key required — just point at your HTTP or SSE MCP server URL. See the [MCP servers
 directory](https://github.com/modelcontextprotocol/servers) for examples.
@@ -264,11 +268,26 @@ pnpm package:win   # Windows installer + zip → release/
 pnpm package:linux # Ubuntu x64 .deb + AppImage → release/
 ```
 
+### Routines and webhook triggers
+
+Routines can run once or on selected weekdays, using either a MAUS's configured model/computer or the
+Cloud VM runner. Webhook triggers are independent from schedules but reuse the same queued task executor
+and calendar receipts.
+
+OpenMausBot starts a webhook-only receiver on `127.0.0.1:8800` by default (or one port above `OMB_PORT`).
+Set `OMB_WEBHOOK_PORT` to choose another port. A webhook secret is shown once when the trigger is created
+or rotated. Bearer authentication is recommended so the secret stays out of request URLs and most access
+logs; a single capability URL remains available for senders that cannot configure headers. The receiver
+exposes only `/health` and secret `/hooks/...` endpoints; it never exposes the app's broader API.
+OpenMausBot must remain running to accept a delivery. For public internet delivery, proxy only this
+dedicated receiver through a hosted relay or a tool such as Tailscale Funnel.
+
 ## Status
 
 Early but real — the loop works end to end: message → agent → streamed reply → tools → approvals →
 computer use. macOS and Windows have released builds; Ubuntu 24.04 x64 packages are in beta with the
-capability limits above. Rough edges to expect: routines are a placeholder and sidebar sections aren't built yet.
+capability limits above. Rough edges to expect: hosted/mobile connectivity is still being built, and webhook
+triggers currently use the local receiver rather than an always-on hosted relay.
 Voice supports ElevenLabs and OpenAI-compatible providers (like local Kokoro), and calls are macOS-only for
 now (they ride the same on-device dictation as the composer mic) — see [`docs/voice-mode.md`](docs/voice-mode.md)
 for the design and the known gaps.

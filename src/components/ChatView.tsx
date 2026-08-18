@@ -1,4 +1,4 @@
-import { Component, memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Component, memo, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   ArrowDown,
@@ -9,11 +9,13 @@ import {
   ChevronRight,
   Copy,
   Crown,
+  Folder,
   Loader2,
   Monitor,
   Pencil,
   RefreshCw,
   Square,
+  Webhook,
   X,
 } from "lucide-react";
 import {
@@ -29,16 +31,21 @@ import {
 import { EngineSetup } from "./EngineSetup";
 import { MausAvatar } from "./Avatar";
 import { stateForBot } from "@/lib/mascot";
+import { showWorkingDots } from "@/lib/turn-tail";
 import { ChatMarkdown } from "./ChatMarkdown";
 import { OptionCard } from "./OptionCard";
 import { ApprovalCard } from "./ApprovalCard";
 import { Composer } from "./Composer";
 import { ModelPicker } from "./ModelPicker";
+import { RenameTitle } from "./RenameTitle";
 import { TaskPicker } from "./TaskPicker";
 import { ReactionBar, ReactionChips } from "./Reactions";
 import { SpeakButton } from "./SpeakButton";
 import { CallButton, CallOverlay } from "./CallView";
 import { cn } from "@/lib/cn";
+import { webhookMessageView } from "@/lib/webhook-message";
+import { BOTTOM_FOLLOW_THRESHOLD, shouldResumeBottomFollow } from "@/lib/bottom-follow";
+import { expandWindowStart, resolveTranscriptWindow, tailWindowStart } from "@/lib/transcript-window";
 
 /** Long user messages collapse behind a fade so pasted walls of text don't
  * bury the conversation; bots get full markdown. */
@@ -268,10 +275,12 @@ function Bubble({
   const user = message.role === "user";
   const [expanded, setExpanded] = useState(false);
   const text = message.text ?? "";
+  const webhookView = user ? webhookMessageView(text) : null;
+  const visibleText = webhookView?.task ?? text;
   const collapsible =
-    user && !expanded && (text.length > USER_COLLAPSE_CHARS || text.split("\n").length > USER_COLLAPSE_LINES);
+    user && !webhookView && !expanded && (visibleText.length > USER_COLLAPSE_CHARS || visibleText.split("\n").length > USER_COLLAPSE_LINES);
 
-  if (user && editing) {
+  if (user && editing && !webhookView) {
     return (
       <div className="flex w-full justify-end">
         <BubbleEditor initial={text} onCancel={onCancelEdit} onSubmit={onSubmitEdit} />
@@ -291,7 +300,7 @@ function Bubble({
       <div className={cn("flex w-full items-center gap-1.5", user ? "justify-end" : "justify-start")}>
         {/* editing rewinds the thread, so it waits for the turn to end —
             same rule as the version switcher below */}
-        {user && message.kind === "text" && !bot.busy && (
+        {user && message.kind === "text" && !webhookView && !bot.busy && (
           <button
             onClick={onStartEdit}
             aria-label="Edit message"
@@ -302,15 +311,33 @@ function Bubble({
           </button>
         )}
         {user && message.kind === "text" && <ReactionBar threadId={bot.threadId} message={message} />}
-        {user && <CopyButton text={text} />}
+        {user && <CopyButton text={visibleText} />}
         <div
           className={cn(
-            "max-w-[70%] rounded-2xl px-4 py-2.5 text-[15px] leading-relaxed",
-            user ? "whitespace-pre-wrap bg-bubble-user text-ink" : "bg-card text-ink",
+            "max-w-[70%] rounded-2xl text-[15px] leading-relaxed",
+            user && webhookView
+              ? "overflow-hidden border border-accent/25 bg-card text-ink shadow-[0_10px_30px_rgba(0,0,0,0.18)]"
+              : user
+                ? "bg-bubble-user px-4 py-2.5 whitespace-pre-wrap text-ink"
+                : "bg-card px-4 py-2.5 text-ink",
           )}
           title={new Date(message.at).toLocaleString()}
         >
-          {user ? (
+          {user && webhookView ? (
+            <div className="min-w-[300px] max-w-[520px]">
+              <div className="flex items-center gap-2 border-b border-accent/15 bg-accent/[0.055] px-4 py-2.5 text-[11.5px] font-medium text-accent">
+                <Webhook size={13} />
+                <span>Webhook task</span>
+              </div>
+              <div className="px-4 py-3 whitespace-pre-wrap">{webhookView.task}</div>
+              {webhookView.payload && (
+                <details className="border-t border-hairline/30 bg-inset/25 px-4 py-2.5 text-[11.5px] text-ink-secondary">
+                  <summary className="cursor-pointer select-none hover:text-ink">View event payload</summary>
+                  <pre className="mt-2 max-h-48 overflow-auto rounded-lg border border-hairline/25 bg-black/25 p-3 font-mono text-[10.5px] leading-relaxed whitespace-pre-wrap text-ink-secondary">{webhookView.payload}</pre>
+                </details>
+              )}
+            </div>
+          ) : user ? (
             <>
               <div
                 className={cn(collapsible && "max-h-40 overflow-hidden [mask-image:linear-gradient(to_bottom,black_60%,transparent)]")}
@@ -507,12 +534,18 @@ const MessagesList = memo(function MessagesList({
   onSubmitEdit: (id: string, text: string) => void;
   onRegenerate: () => void;
 }) {
+  const { dispatch } = useStore();
   return (
     <>
       {messages.length === 0 && !bot.busy && (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 py-24 text-center">
           <MausAvatar color={bot.color} state="idle" size={64} motion="none" motionKey={0} />
-          <div className="text-[17px] font-semibold text-ink">{bot.name}</div>
+          <RenameTitle
+            value={bot.name}
+            onCommit={(name) => dispatch({ type: "updateBot", botId: bot.id, patch: { name } })}
+            className="text-[17px] font-semibold text-ink"
+            inputClassName="rounded bg-inset px-1.5 py-0.5 text-center text-[17px] font-semibold"
+          />
           <div className="max-w-[360px] text-[14px] text-ink-secondary">
             {bot.description || "Send a message to start the conversation."}
           </div>
@@ -583,6 +616,26 @@ export function ChatView({ bot }: { bot: Bot }) {
 
   // only the active branch is rendered; forks stay reachable via ‹ › nav
   const messages = useMemo(() => visibleMessages(bot), [bot]);
+
+  // Windowed transcript: only a tail of the thread mounts (screenshots make
+  // full threads DOM-heavy). The boundary is anchored per bot+task; a
+  // render-phase reset re-tails it on switch so the old thread's boundary
+  // never flashes into the new one. Everything derived below (lastBotTextId,
+  // lastUserMessage, working dots) stays computed from the FULL list.
+  const transcriptKey = `${bot.id}:${bot.threadId}`;
+  const [transcriptWindow, setTranscriptWindow] = useState(() => ({
+    key: transcriptKey,
+    start: tailWindowStart(messages.length),
+  }));
+  if (transcriptWindow.key !== transcriptKey) {
+    setTranscriptWindow({ key: transcriptKey, start: tailWindowStart(messages.length) });
+  }
+  const {
+    visible: windowedMessages,
+    hiddenCount,
+    startIndex,
+  } = useMemo(() => resolveTranscriptWindow(messages, transcriptWindow.start), [messages, transcriptWindow.start]);
+
   const lastBotTextId = useMemo(
     () => [...messages].reverse().find((m) => m.role === "bot" && m.kind === "text")?.id,
     [messages],
@@ -619,29 +672,65 @@ export function ChatView({ bot }: { bot: Bot }) {
   // false for a frame, and breaking there kills follow permanently
   // (upstream-verified failure). Scrolling back to the end re-arms it.
   const [follow, setFollow] = useState(true);
+  const followRef = useRef(true);
+  const previousScrollTop = useRef(0);
   const touchY = useRef(0);
 
-  useEffect(() => setFollow(true), [bot.id]);
+  const setBottomFollow = useCallback((next: boolean) => {
+    followRef.current = next;
+    setFollow(next);
+  }, []);
+
+  useEffect(() => setBottomFollow(true), [bot.id, setBottomFollow]);
+  // deps track the FULL messages.length, so expanding the window (which only
+  // changes windowedMessages) can never re-trigger this bottom scrollTo
   useEffect(() => {
-    if (follow) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+    const el = scrollRef.current;
+    if (!el || !followRef.current) return;
+    el.scrollTo({ top: el.scrollHeight });
+    previousScrollTop.current = el.scrollTop;
   }, [bot.id, messages.length, streaming, reasoning, bot.busy, follow]);
+
+  // Expanding prepends rows: capture the height first, then after the commit
+  // shift scrollTop by the growth so the message under the cursor stays put
+  // (browser scroll anchoring is disabled on this container).
+  const preExpandHeight = useRef<number | null>(null);
+  const showEarlier = () => {
+    preExpandHeight.current = scrollRef.current?.scrollHeight ?? null;
+    // expanding means reading scrollback — never let a mid-expand stream
+    // event pin the viewport back to the bottom
+    setBottomFollow(false);
+    const start = expandWindowStart(startIndex);
+    setTranscriptWindow((w) => ({ key: w.key, start }));
+  };
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (preExpandHeight.current === null || !el) return;
+    el.scrollTop += el.scrollHeight - preExpandHeight.current;
+    preExpandHeight.current = null;
+    // keep the resume-follow heuristic from reading the restore as a
+    // downward user scroll
+    previousScrollTop.current = el.scrollTop;
+  }, [transcriptWindow.start]);
 
   // keyboard is a scroll gesture too (upstream lesson): PageUp/Home break
   // follow like an upward wheel; the at-end onScroll check re-arms it
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "PageUp" || (e.key === "Home" && !(e.target instanceof HTMLTextAreaElement))) setFollow(false);
+      if (e.key === "PageUp" || (e.key === "Home" && !(e.target instanceof HTMLTextAreaElement))) {
+        setBottomFollow(false);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [setBottomFollow]);
 
   const atEnd = () => {
     const el = scrollRef.current;
-    return !el || el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+    return !el || el.scrollHeight - el.scrollTop - el.clientHeight < BOTTOM_FOLLOW_THRESHOLD;
   };
   const jumpToLatest = () => {
-    setFollow(true);
+    setBottomFollow(true);
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   };
 
@@ -657,30 +746,41 @@ export function ChatView({ bot }: { bot: Bot }) {
       <CallOverlay bot={bot} />
       {/* Header */}
       <div
-        className={cn("flex items-center justify-between px-5 py-3", isWin && "pr-[148px]")}
+        className={cn(
+          "flex items-center justify-between px-5 py-3",
+          // Room for the drawer button, which overlays this corner below md.
+          "pl-11 md:pl-5",
+          isWin && "pr-[148px]",
+        )}
         style={drag}
       >
-        <button
-          onClick={() => dispatch({ type: "toggleSettings" })}
-          className="flex items-center gap-2.5 rounded-lg px-1.5 py-1 hover:bg-raised/50"
-          title="Bot settings"
-          style={noDrag}
-        >
-          <MausAvatar
-            color={bot.color}
-            state={stateForBot({ ...bot, messages })}
-            size={28}
-            motion={mascotMotion?.kind ?? "none"}
-            motionKey={mascotMotion?.nonce ?? 0}
+        <div className="flex min-w-0 items-center gap-2.5 rounded-lg px-1.5 py-1" style={noDrag}>
+          <button
+            onClick={() => dispatch({ type: "toggleSettings" })}
+            className="flex shrink-0 items-center rounded-lg p-0.5 hover:bg-raised/50"
+            title="Bot settings"
+          >
+            <MausAvatar
+              color={bot.color}
+              state={stateForBot({ ...bot, messages })}
+              size={28}
+              motion={mascotMotion?.kind ?? "none"}
+              motionKey={mascotMotion?.nonce ?? 0}
+            />
+          </button>
+          <RenameTitle
+            value={bot.name}
+            onCommit={(name) => dispatch({ type: "updateBot", botId: bot.id, patch: { name } })}
+            className="truncate text-[15px] font-semibold text-ink"
+            inputClassName="max-w-[220px] rounded bg-inset px-1.5 py-0.5 text-[15px] font-semibold"
           />
-          <span className="text-[15px] font-semibold text-ink">{bot.name}</span>
           {bot.chiefOfStaff && (
             <span className="flex items-center gap-1 rounded-full bg-accent/12 px-2 py-0.5 text-[11px] font-medium text-accent">
               <Crown size={11} /> Chief of Staff
             </span>
           )}
           {bot.busy && <Loader2 size={14} className="animate-spin text-ink-secondary" />}
-        </button>
+        </div>
         <div className="flex items-center gap-2" style={noDrag}>
           {bot.busy && (
             <button
@@ -693,6 +793,7 @@ export function ChatView({ bot }: { bot: Bot }) {
             </button>
           )}
           <TaskPicker bot={bot} />
+          <WorkingFolderChip bot={bot} />
           <ModelPicker bot={bot} />
           <CallButton bot={bot} />
           <button
@@ -722,17 +823,27 @@ export function ChatView({ bot }: { bot: Bot }) {
         ref={scrollRef}
         className="flex-1 overflow-y-auto px-5 [overflow-anchor:none]"
         onWheel={(e) => {
-          if (e.deltaY < 0) setFollow(false);
-          else if (atEnd()) setFollow(true);
+          if (e.deltaY < 0) setBottomFollow(false);
+          else if (atEnd()) setBottomFollow(true);
         }}
         onTouchStart={(e) => (touchY.current = e.touches[0]?.clientY ?? 0)}
         onTouchMove={(e) => {
           const y = e.touches[0]?.clientY ?? 0;
-          if (y > touchY.current + 4) setFollow(false);
-          else if (atEnd()) setFollow(true);
+          if (y > touchY.current + 4) setBottomFollow(false);
+          else if (atEnd()) setBottomFollow(true);
         }}
         onScroll={() => {
-          if (!follow && atEnd()) setFollow(true);
+          const el = scrollRef.current;
+          if (!el) return;
+          const scrollTop = el.scrollTop;
+          const resume = shouldResumeBottomFollow({
+            following: followRef.current,
+            previousScrollTop: previousScrollTop.current,
+            scrollTop,
+            distanceFromBottom: el.scrollHeight - scrollTop - el.clientHeight,
+          });
+          previousScrollTop.current = scrollTop;
+          if (resume) setBottomFollow(true);
         }}
       >
         <div
@@ -741,9 +852,19 @@ export function ChatView({ bot }: { bot: Bot }) {
           aria-live="polite"
           aria-label={`Conversation with ${bot.name}`}
         >
+          {hiddenCount > 0 && (
+            <div className="flex justify-center pt-2">
+              <button
+                onClick={showEarlier}
+                className="rounded-full border border-hairline/40 bg-panel px-3 py-1 text-[12.5px] text-ink-secondary hover:bg-raised hover:text-ink"
+              >
+                Show earlier messages ({hiddenCount} more)
+              </button>
+            </div>
+          )}
           <MessagesList
             bot={bot}
-            messages={messages}
+            messages={windowedMessages}
             editingId={editingId}
             lastBotTextId={lastBotTextId}
             canRetryLast={!bot.busy && Boolean(lastUserMessage)}
@@ -765,7 +886,7 @@ export function ChatView({ bot }: { bot: Bot }) {
           {streaming ? (
             <StreamingBubble text={streaming} />
           ) : (
-            bot.busy && (
+            showWorkingDots(bot.busy, streaming, messages.at(-1)) && (
               <div className="flex justify-start">
                 <div className="flex items-center gap-2.5 rounded-2xl bg-raised px-4 py-3">
                   <span className="flex items-center gap-1.5">
@@ -804,5 +925,26 @@ export function ChatView({ bot }: { bot: Bot }) {
       />
 
     </main>
+  );
+}
+
+/** The folder this task's tools run in — quiet unless it's somewhere other
+ * than home. Shows the pinned task folder when there is one, else the bot's
+ * folder a first turn would pin. Click opens bot settings to change it. */
+function WorkingFolderChip({ bot }: { bot: Bot }) {
+  const { dispatch } = useStore();
+  const task = bot.tasks?.find((t) => t.threadId === bot.threadId);
+  const folder = task?.cwd === undefined ? bot.cwd : (task.cwd ?? undefined);
+  if (!folder) return null;
+  const name = folder.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || folder;
+  return (
+    <button
+      onClick={() => dispatch({ type: "toggleSettings", open: true })}
+      className="flex max-w-[180px] items-center gap-1.5 rounded-full border border-hairline/40 bg-raised/60 px-2.5 py-1 text-[12.5px] text-ink-secondary hover:bg-raised hover:text-ink"
+      title={`Working folder: ${folder}`}
+    >
+      <Folder size={12} />
+      <span className="truncate font-mono">{name}</span>
+    </button>
   );
 }
