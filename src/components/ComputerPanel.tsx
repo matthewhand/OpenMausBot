@@ -475,14 +475,14 @@ export function ComputerPanel({
   const pageVisible = usePageVisible();
   const live = state.screens[bot.id];
   const sseFlowing = Boolean(bot.busy && live);
-  const inFlight = useRef(false);
   useEffect(() => {
     if (phase !== "ready" || sseFlowing || viewerOpen || !pageVisible) return;
     let alive = true;
+    let inFlight = false;
     let controller: AbortController | undefined;
     const shoot = async () => {
-      if (inFlight.current) return;
-      inFlight.current = true;
+      if (inFlight) return;
+      inFlight = true;
       controller = new AbortController();
       try {
         const { png, format } = await api(`/api/bots/${bot.id}/computer/screenshot`, {
@@ -494,13 +494,14 @@ export function ComputerPanel({
         if (e instanceof DOMException && e.name === "AbortError") return;
         /* box mid-command or asleep — next tick */
       } finally {
-        inFlight.current = false;
+        inFlight = false;
       }
     };
     void shoot();
     const timer = setInterval(shoot, bot.busy ? 4000 : 30_000);
     return () => {
       alive = false;
+      inFlight = false;
       controller?.abort();
       clearInterval(timer);
     };
@@ -508,14 +509,14 @@ export function ComputerPanel({
 
   // Local VM preview comes directly from Cua Driver through the harness. It
   // does not use the password-protected noVNC viewer or cloud endpoints.
-  const vmInFlight = useRef(false);
   useEffect(() => {
     if (phase !== "vm" || viewerOpen || !pageVisible) return;
     let alive = true;
+    let inFlight = false;
     let controller: AbortController | undefined;
     const shoot = async () => {
-      if (vmInFlight.current) return;
-      vmInFlight.current = true;
+      if (inFlight) return;
+      inFlight = true;
       controller = new AbortController();
       try {
         const { image } = await api(`/api/bots/${bot.id}/local-computer/screenshot`, { method: "POST" });
@@ -524,13 +525,14 @@ export function ComputerPanel({
         if (e instanceof DOMException && e.name === "AbortError") return;
         if (alive) setError(e instanceof Error ? e.message : String(e));
       } finally {
-        vmInFlight.current = false;
+        inFlight = false;
       }
     };
     void shoot();
     const timer = window.setInterval(() => void shoot(), bot.busy ? 3000 : 30_000);
     return () => {
       alive = false;
+      inFlight = false;
       controller?.abort();
       window.clearInterval(timer);
     };
