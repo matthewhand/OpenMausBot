@@ -1477,7 +1477,7 @@ function createWindow() {
   }
 
   const withToken = (base) => {
-    const token = process.env.OMB_AUTH_TOKEN;
+    const token = process.env.OMB_AUTH_TOKEN?.trim();
     if (!token || !base.startsWith("http")) return base;
     const join = base.includes("?") ? "&" : "?";
     return `${base}${join}access_token=${encodeURIComponent(token)}`;

@@ -2,16 +2,17 @@
 
 The sidecar a phone talks to.
 
-OpenMausBot's harness listens on `127.0.0.1` and nothing else, which is the
-right default and one it has recently gone out of its way to enforce: it now
-rejects any request whose `Host` is not loopback, defeating DNS rebinding.
+OpenMausBot's harness is loopback-only **by default** (`127.0.0.1`) and
+rejects a non-loopback `Host` unless LAN auth is on, defeating DNS rebinding.
 
 This is a separate process that sits in front of it. A paired device reaches
 *this*, over the LAN or a tailnet; this reaches the harness over loopback, as
-a request from the machine the harness already trusts. The harness keeps its
-loopback-only bind and gains only the paged/read/approval verbs the native
-client needs; pairing, device tokens, network exposure, and response scrubbing
-remain entirely in the sidecar.
+a request from the machine the harness already trusts. Pairing, device tokens,
+network exposure, and response scrubbing remain entirely in the sidecar.
+
+If `OMB_AUTH_TOKEN` is set, the sidecar must present that token on every
+upstream request. Loopback is not exempt. The phone bearer authenticates the
+sidecar only and is never forwarded.
 
 That is the entire point of the design. The alternative — teaching the harness
 to bind a second socket — means a patch to somebody else's request handler,
@@ -21,8 +22,11 @@ upstream hardened its loopback gate.
 ```text
   phone ──LAN/tailnet──▶ companion :8810 ──loopback──▶ harness :8799
                           ▲                             ▲
-                          │ token, allowlist,           │ unmodified,
-                          │ Origin refused              │ loopback-only
+                          │ phone token, allowlist,     │ loopback-only
+                          │ Origin refused              │ by default;
+                          │                             │ OMB_AUTH_TOKEN
+                          │                             │ if the harness
+                          │                             │ is LAN-gated
 ```
 
 ## What it is responsible for
@@ -100,6 +104,7 @@ it is switched on, so the opt-in is never implicit.
 | Environment | Default | |
 |---|---|---|
 | `OMB_PORT` | `8799` | where the harness is |
+| `OMB_AUTH_TOKEN` | (none) | if the harness is LAN-gated, the sidecar presents this token; loopback is not exempt |
 | `OMB_WEBHOOK_PORT` | `OMB_PORT` + 1 | the harness's webhook receiver — refused, not used |
 | `OMB_COMPANION_PORT` | `8810` | where devices connect |
 | `OMB_CONTROL_PORT` | `8811` | the pairing page, loopback only |

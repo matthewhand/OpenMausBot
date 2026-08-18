@@ -334,6 +334,20 @@ describe("onboarding quiz", () => {
   });
 });
 
+describe("LAN unauthorized hydration", () => {
+  it("records 401 as unauthorized, not a down server", () => {
+    const next = reducer(initialState, { type: "unauthorized" });
+    expect(next.unauthorized).toBe(true);
+    expect(next.connected).toBe(false);
+  });
+
+  it("clears unauthorized on a successful hydrate", () => {
+    const denied = reducer(initialState, { type: "unauthorized" });
+    const next = reducer(denied, { type: "hydrate", bots: [], groups: [], computerControl: {} });
+    expect(next.unauthorized).toBe(false);
+  });
+});
+
 describe("cross-client bot creation", () => {
   it("adds an announced bot before its greeting frames arrive", () => {
     const announced = {

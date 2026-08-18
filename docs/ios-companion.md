@@ -71,10 +71,13 @@ There are three deliberately separate trust surfaces:
 
 | Surface | Bind | Purpose |
 |---|---|---|
-| Harness | `127.0.0.1:8799` | Existing app API; remains loopback-only |
+| Harness | `127.0.0.1:8799` | Existing app API; loopback-only **by default** |
 | Companion | `0.0.0.0:8810` | Paired native devices; authenticated and allowlisted |
 | Companion control | `127.0.0.1:8811` | Start pairing, cancel pairing, list devices, revoke |
 | Hosted gateway | `127.0.0.1:8812` | Guardian-owned route to one exact sidecar generation |
+
+If `OMB_AUTH_TOKEN` is set, the sidecar must present that token to the harness.
+Loopback is not exempt. The phone bearer authenticates the sidecar only.
 
 The desktop app owns the sidecar lifecycle through
 `electron/companion.mjs`. The renderer only receives narrow IPC operations; it

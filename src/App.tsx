@@ -231,11 +231,15 @@ function Shell() {
         <ChatView bot={bot} />
       ) : (
         <main className="flex h-full min-w-0 flex-1 flex-col items-center justify-center gap-3 bg-app text-ink-secondary">
-          <Loader2 size={20} className="animate-spin" />
+          {!state.unauthorized && <Loader2 size={20} className="animate-spin" />}
           <div className="text-[14px]">
-            {state.connected ? "No bots yet" : "Connecting to the bot server…"}
+            {state.unauthorized
+              ? "unauthorized — set ?access_token= or App LAN token"
+              : state.connected
+                ? "No bots yet"
+                : "Connecting to the bot server…"}
           </div>
-          {!state.connected && (
+          {!state.connected && !state.unauthorized && (
             <div className="text-[12px]">
               Start it with <code className="rounded bg-raised px-1.5 py-0.5">pnpm dev:server</code>
             </div>

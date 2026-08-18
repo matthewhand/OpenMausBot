@@ -249,6 +249,8 @@ Requirements: **macOS, Windows, or Ubuntu 24.04 x64**, **Node 24+**, **pnpm**, a
 [`codex`](https://github.com/openai/codex), or [`grok`](https://x.ai/cli) — installed and logged in. They appear
 in the model picker automatically.
 
+**LAN access:** the harness binds `127.0.0.1` with no auth by default. To reach it from another machine, set `OMB_HOST` (a non-loopback bind **requires** `OMB_AUTH_TOKEN`) and follow [Headless LAN access](docs/headless-lan-access.md).
+
 Package the desktop application:
 
 ```sh
