@@ -14,6 +14,7 @@ import { Bug, ChevronDown, ChevronRight, RefreshCw, X } from "lucide-react";
 import { useStore, type Bot } from "@/state/store";
 import { cn } from "@/lib/cn";
 import { formatTime, toRows, type InspectorEntry, type InspectorPage, type InspectorRow } from "@/lib/inspector";
+import { eventsUrl, lanAuthHeaders } from "@/lib/lan-auth";
 import type { RuntimeEvent } from "../../server/contracts.ts";
 
 type Lens = "events" | "raw";
@@ -34,7 +35,10 @@ export function InspectorPanel({ bot }: { bot: Bot }) {
     const controller = new AbortController();
     loadAbort.current = controller;
     try {
-      const res = await fetch(`/api/threads/${threadId}/events?limit=400`, { signal: controller.signal });
+      const res = await fetch(`/api/threads/${threadId}/events?limit=400`, {
+        signal: controller.signal,
+        headers: lanAuthHeaders(),
+      });
       if (!res.ok) throw new Error(`${res.status}`);
       const next = (await res.json()) as InspectorPage;
       if (controller.signal.aborted) return;
@@ -62,7 +66,7 @@ export function InspectorPanel({ bot }: { bot: Bot }) {
   // up. Own EventSource on purpose: the store folds runtime events into
   // chat state and does not re-emit them.
   useEffect(() => {
-    const es = new EventSource("/api/events?screens=off");
+    const es = new EventSource(eventsUrl("/api/events?screens=off"));
     let settle: ReturnType<typeof setTimeout> | null = null;
     es.onmessage = (raw) => {
       let frame: { kind?: string; event?: RuntimeEvent };

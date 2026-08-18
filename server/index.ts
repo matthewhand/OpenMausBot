@@ -2279,10 +2279,14 @@ const server = createServer(async (req, res) => {
 
     // ── LAN access authentication ──────────────────────────────────────
     // When OMB_AUTH_TOKEN is set, all public /api/ endpoints (except /api/health)
-    // require the token. EventSource cannot send headers, so GET also accepts
-    // ?access_token= (same value). Compare is constant-time like /api/internal.
+    // require the token. EventSource cannot send headers, so GET /api/events
+    // also accepts ?access_token= (same value). Mutating routes and other GETs
+    // require Bearer — a query token on POST /api/bots is not enough.
+    // Compare is constant-time like /api/internal.
     if (AUTH_TOKEN && path.startsWith("/api/") && path !== "/api/health") {
-      if (!authorizedLan(req.headers.authorization, url.searchParams.get("access_token"))) {
+      const queryToken =
+        method === "GET" && path === "/api/events" ? url.searchParams.get("access_token") : null;
+      if (!authorizedLan(req.headers.authorization, queryToken)) {
         return json(res, 401, { error: "unauthorized: valid OMB_AUTH_TOKEN required" });
       }
     }

@@ -164,6 +164,17 @@ describe("LAN access authentication", () => {
     ac.abort();
   });
 
+  it("rejects ?access_token= on mutating and other GET routes", async () => {
+    const mutating = await fetch(`${BASE}/api/bots?access_token=${encodeURIComponent(AUTH_TOKEN)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    expect(mutating.status).toBe(401);
+    const otherGet = await fetch(`${BASE}/api/instances?access_token=${encodeURIComponent(AUTH_TOKEN)}`);
+    expect(otherGet.status).toBe(401);
+  });
+
   it("handles OPTIONS preflight requests", async () => {
     const res = await fetch(`${BASE}/api/instances`, {
       method: "OPTIONS",
