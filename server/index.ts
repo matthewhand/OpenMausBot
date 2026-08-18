@@ -2788,7 +2788,7 @@ const server = createServer(async (req, res) => {
         if (field === "name" && !value.trim()) return json(res, 400, { error: "name must not be empty" });
       }
       const patch: Record<string, unknown> = {};
-      for (const key of ["name", "title", "description", "notifications", "modelSelection", "unread", "computer", "color", "mascotExpression", "pinned", "hidden", "speakReplies", "voice"] as const) {
+      for (const key of ["name", "title", "description", "notifications", "modelSelection", "unread", "computer", "color", "mascotExpression", "pinned", "hidden", "speakReplies", "voice", "openaiVoice"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
       // per-bot gate on the workspace's connected apps (Composio)

@@ -20,6 +20,7 @@ import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib
 import { currentCall } from "@/lib/call";
 import { showNotification } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
+import { botVoiceId } from "@/lib/tts-provider";
 
 export type { MausColor } from "@/lib/mascot";
 
@@ -161,8 +162,10 @@ export interface Bot {
   alwaysAllow?: string[];
   /** speak this bot's replies aloud as they settle */
   speakReplies?: boolean;
-  /** this bot's own voice id (falls back to the app-wide one) */
+  /** this bot's ElevenLabs voice id (falls back to the app-wide one) */
   voice?: string;
+  /** per-bot OpenAI-compatible voice; unused when the app TTS is ElevenLabs */
+  openaiVoice?: string;
   pinned?: boolean;
   hidden?: boolean;
   /** The workspace's one primary coordinator. */
@@ -1304,7 +1307,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               void speaker.speak(frame.message.text, {
                 botId: owner.id,
                 messageId: frame.message.id,
-                voiceId: owner.voice,
+                voiceId: botVoiceId(stateRef.current.config?.tts?.provider, owner),
               });
             }
           }
