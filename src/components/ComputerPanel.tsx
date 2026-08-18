@@ -21,6 +21,7 @@ import { useStore, type Bot } from "@/state/store";
 import type { Routine } from "@/lib/routines";
 import { ApiKeyRow } from "./ApiKeys";
 import { cn } from "@/lib/cn";
+import { canOpenExternalUrl } from "@/lib/loopback-viewer";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { RoutineEditor } from "./RoutinesPage";
 
@@ -295,7 +296,22 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
     api(`/api/bots/${bot.id}/computer/${kind}`, { method: "POST" })
       .then((result) => {
         // the join URL's stream token rotates — always freshly minted, never cached
-        if (kind === "join" && result.joinUrl) window.open(result.joinUrl);
+        if (kind === "join") {
+          if (!result.joinUrl) {
+            setError("The desktop link could not be created.");
+            return;
+          }
+          if (!canOpenExternalUrl(result.joinUrl, window.location.hostname)) {
+            setError("That desktop URL is only reachable from this machine. Use Watch screen instead.");
+            return;
+          }
+          if (window.ogb?.openExternal) {
+            void window.ogb.openExternal(result.joinUrl);
+            return;
+          }
+          const opened = window.open(result.joinUrl, "_blank", "noopener,noreferrer");
+          if (!opened) setError("The browser blocked the desktop window. Allow pop-ups and try again.");
+        }
         if (kind === "sleep") setBoxState("archived");
       })
       .catch((e) => setError(e.message))
