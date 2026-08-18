@@ -14,6 +14,7 @@ import { Card } from "./SettingsPrimitives";
 import { UsageSection } from "./UsageSection";
 import { VoiceSettings } from "./VoiceSettings";
 import { cn } from "@/lib/cn";
+import { lanAuthHeaders } from "@/lib/lan-auth";
 
 const SECTIONS: Array<{ id: AppSettingsSection; label: string; icon: typeof User }> = [
   { id: "general", label: "General", icon: User },
@@ -38,7 +39,7 @@ function ProfileFields() {
   const save = () => {
     void fetch("/api/config", {
       method: "PUT",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...lanAuthHeaders() },
       body: JSON.stringify({ profile: { name: name.trim(), email: email.trim().toLowerCase() } }),
     })
       .then((r) => r.json())

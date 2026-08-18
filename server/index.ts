@@ -80,9 +80,28 @@ import { listenWebhookIngress, webhookCredential, type WebhookIngress } from "./
 import { memberTurnSelection } from "./member-turn.ts";
 import { WebhookManager } from "./webhooks.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
+import { isLoopbackBindHost, lanBindAllowed } from "./lan-bind.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
+const HOST = process.env.OMB_HOST || "127.0.0.1";
+// LAN access auth token. When set, all /api/ requests (except /api/health and
+// /api/internal/* which has COMMS_TOKEN) require the Authorization header.
+// Defaults to disabled for backward compatibility and local-only use.
+// Trim once: whitespace-only is unset (no auth, no lanMode CSRF relaxation).
+const AUTH_TOKEN = (process.env.OMB_AUTH_TOKEN ?? "").trim() || null;
+// CORS origin for LAN access. Set to "*" or a specific origin (e.g., "http://10.0.0.32:5199").
+// Defaults to null (no CORS headers) for localhost-only setups.
+const CORS_ORIGIN = process.env.OMB_CORS_ORIGIN || null;
 const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
+
+// Fail before webhook ingress or the public listen — an off-machine bind
+// without a token must not open any port.
+if (!lanBindAllowed(HOST, AUTH_TOKEN)) {
+  console.error(
+    `error: refusing to bind ${HOST}: OMB_AUTH_TOKEN is required for a non-loopback listen`,
+  );
+  process.exit(1);
+}
 const STATIC_DIR = process.env.OMB_STATIC_DIR || null;
 const MIME: Record<string, string> = {
   ".html": "text/html",
@@ -111,6 +130,19 @@ const COMMS_TOKEN = randomBytes(24).toString("hex");
 /** Constant-time bearer check for the internal comms endpoints. The token
  * is high-entropy and loopback-only, so a timing oracle is a long shot —
  * but the compare costs nothing to make safe. */
+function tokenEquals(got: string, expected: string): boolean {
+  const a = Buffer.from(got);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function authorizedLan(header: string | string[] | undefined, queryToken: string | null): boolean {
+  if (!AUTH_TOKEN) return true;
+  const raw = Array.isArray(header) ? header[0] : header;
+  const fromHeader = raw?.startsWith("Bearer ") ? raw.slice("Bearer ".length) : "";
+  return tokenEquals(fromHeader || queryToken || "", AUTH_TOKEN);
+}
+
 function authorizedComms(header: string | string[] | undefined): boolean {
   const expected = Buffer.from(`Bearer ${COMMS_TOKEN}`);
   const got = Buffer.from(Array.isArray(header) ? "" : (header ?? ""));
@@ -2025,14 +2057,41 @@ const server = createServer(async (req, res) => {
   const method = req.method ?? "GET";
   /** scratch for route matches, shared by every `path.match` below */
   let m: RegExpMatchArray | null = null;
+
+  // CORS headers for LAN access
+  if (CORS_ORIGIN) {
+    res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Last-Event-ID");
+    if (CORS_ORIGIN !== "*") {
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+      res.setHeader("Vary", "Origin");
+    }
+
+    // Handle preflight requests
+    if (method === "OPTIONS") {
+      res.writeHead(204);
+      return res.end();
+    }
+  }
+
   try {
-    // loopback-host + loopback-origin gate before any route (DNS rebinding / CSRF)
-    if (!isLoopbackHost(req.headers.host)) {
+    // loopback-host + loopback-origin gate before any route (DNS rebinding / CSRF).
+    // LAN mode (OMB_AUTH_TOKEN) is the explicit exception: the Host is a LAN
+    // address and the origin is whatever CORS_ORIGIN allows. Auth is checked
+    // after the internal-comms routes. Loopback is not exempt from the token.
+    const lanMode = Boolean(AUTH_TOKEN);
+    if (!lanMode && !isLoopbackHost(req.headers.host)) {
       return json(res, 403, { error: "forbidden: loopback host required" });
     }
     const origin = req.headers.origin;
     if (origin && !isAllowedOrigin(origin)) {
-      return json(res, 403, { error: "forbidden: cross-origin request" });
+      if (!lanMode) {
+        return json(res, 403, { error: "forbidden: cross-origin request" });
+      }
+      if (CORS_ORIGIN && CORS_ORIGIN !== "*" && origin !== CORS_ORIGIN) {
+        return json(res, 403, { error: "forbidden: cross-origin request" });
+      }
     }
     // ── internal peer-agent comms (localhost + shared token only) ──────
     // The agents-proxy (spawned inside a bot's agent process) calls these to
@@ -2227,6 +2286,20 @@ const server = createServer(async (req, res) => {
         return json(res, 200, { messageIds });
       }
       return json(res, 404, { error: "unknown internal endpoint" });
+    }
+
+    // ── LAN access authentication ──────────────────────────────────────
+    // When OMB_AUTH_TOKEN is set, all public /api/ endpoints (except /api/health)
+    // require the token. EventSource cannot send headers, so GET /api/events
+    // also accepts ?access_token= (same value). Mutating routes and other GETs
+    // require Bearer — a query token on POST /api/bots is not enough.
+    // Compare is constant-time like /api/internal.
+    if (AUTH_TOKEN && path.startsWith("/api/") && path !== "/api/health") {
+      const queryToken =
+        method === "GET" && path === "/api/events" ? url.searchParams.get("access_token") : null;
+      if (!authorizedLan(req.headers.authorization, queryToken)) {
+        return json(res, 401, { error: "unauthorized: valid OMB_AUTH_TOKEN required" });
+      }
     }
 
     // ── routines calendar ────────────────────────────────────────────────
@@ -3471,8 +3544,17 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`openmausbot server on http://127.0.0.1:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`openmausbot server on http://${HOST}:${PORT}`);
+  if (AUTH_TOKEN) {
+    console.log("⚠️  LAN authentication enabled (OMB_AUTH_TOKEN is set)");
+  }
+  if (CORS_ORIGIN) {
+    console.log(`✓ CORS enabled for origin: ${CORS_ORIGIN}`);
+  }
+  if (!isLoopbackBindHost(HOST)) {
+    console.log(`⚠️  Server bound to ${HOST} — accessible from the network`);
+  }
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {

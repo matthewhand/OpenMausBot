@@ -316,10 +316,16 @@ function createWindow() {
     });
   }
 
+  const withToken = (base) => {
+    const token = process.env.OMB_AUTH_TOKEN?.trim();
+    if (!token || !base.startsWith("http")) return base;
+    const join = base.includes("?") ? "&" : "?";
+    return `${base}${join}access_token=${encodeURIComponent(token)}`;
+  };
   if (app.isPackaged) {
-    win.loadURL(serverReady ? `http://127.0.0.1:${SERVER_PORT}` : ERROR_PAGE);
+    win.loadURL(serverReady ? withToken(`http://127.0.0.1:${SERVER_PORT}`) : ERROR_PAGE);
   } else {
-    win.loadURL(DEV_URL);
+    win.loadURL(withToken(DEV_URL));
   }
   return win;
 }
@@ -467,9 +473,11 @@ ipcMain.handle("credential:set", async (_event, name, value) => {
   // receive credentials from Electron at boot. Keep its established local
   // config path there; production always uses the encrypted external store.
   const secretStorage = app.isPackaged ? "?secretStorage=external" : "";
+  const token = process.env.OMB_AUTH_TOKEN?.trim();
+  const auth = token ? { Authorization: `Bearer ${token}` } : {};
   const response = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/config${secretStorage}`, {
     method: "PUT",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...auth },
     body: JSON.stringify({ composio: { apiKey: value.trim() } }),
   });
   const body = await response.json().catch(() => null);
