@@ -11,6 +11,11 @@ import type { InstanceConfigMap } from "./contracts.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 
 const optionalText = z.string().optional();
+
+/** Names the harness already mounts (agents proxy, computer, Composio, dweb,
+ *  permission broker). A user server with one of these would overwrite the
+ *  built-in and break comms or computer-use. */
+export const RESERVED_MCP_NAMES = new Set(["agents", "computer", "composio", "dweb", "ogb"]);
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
   displayName: optionalText,
@@ -32,10 +37,55 @@ const appConfigSchema = z.object({
   tts: z.object({ key: optionalText, voice: optionalText }).optional(),
   /** Non-secret profile details shown in the sidebar. */
   profile: z.object({ name: optionalText, email: optionalText }).optional(),
+  /** Custom remote MCP servers. Headers are write-only like other secrets. */
+  mcpServers: z
+    .array(
+      z.object({
+        name: z.string().regex(/^[\w-]+$/, "letters, numbers, dash, and underscore only"),
+        transport: z.enum(["http", "sse"]),
+        url: z
+          .string()
+          .url()
+          .refine((u) => /^https?:\/\//i.test(u), "must be an http(s) URL"),
+        headers: z.record(z.string(), z.string()).optional(),
+        enabled: z.boolean().optional(),
+      }),
+    )
+    .superRefine((servers, ctx) => {
+      const seen = new Set<string>();
+      for (const [i, server] of servers.entries()) {
+        if (RESERVED_MCP_NAMES.has(server.name)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [i, "name"],
+            message: `"${server.name}" is reserved`,
+          });
+        }
+        if (seen.has(server.name)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [i, "name"],
+            message: "duplicate server name",
+          });
+        }
+        seen.add(server.name);
+      }
+    })
+    .optional(),
   instances: instanceConfigMapSchema.optional(),
 });
 const appConfigPatchSchema = appConfigSchema.omit({ instances: true });
 const jsonObjectSchema = z.record(z.string(), z.json());
+
+export interface McpServer {
+  name: string;
+  transport: "http" | "sse";
+  url: string;
+  /** Optional headers (e.g. Authorization, API keys) — stored on the harness,
+   * never echoed back in GET /api/config (same write-only rule as other secrets). */
+  headers?: Record<string, string>;
+  enabled?: boolean;
+}
 
 export interface AppConfig {
   xai?: { key?: string; url?: string };
@@ -43,10 +93,38 @@ export interface AppConfig {
   box?: { token?: string };
   opencodeGo?: { apiKey?: string };
   tts?: { key?: string; voice?: string };
+  /** The person using the app (collected in onboarding, shown in the
+   * sidebar). Not a secret — echoed back by GET /api/config. */
   profile?: { name?: string; email?: string };
+  /** Custom remote MCP servers: user-configured HTTP or SSE servers. Persisted
+   * in ~/.openmausbot/config.json; headers are write-only like other secrets. */
+  mcpServers?: McpServer[];
   instances?: InstanceConfigMap;
 }
 export type ConfigPatch = z.output<typeof appConfigPatchSchema>;
+
+/** Keep stored MCP headers when a PUT omits them. GET never echoes headers,
+ * so a "save this list" from the UI would otherwise blank every secret. An
+ * explicit empty headers object still clears. */
+export function mergeMcpServers(previous: unknown, next: McpServer[]): McpServer[] {
+  const prevByName = new Map<string, McpServer>();
+  if (Array.isArray(previous)) {
+    for (const item of previous) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      if (typeof rec.name !== "string" || !rec.name) continue;
+      prevByName.set(rec.name, item as McpServer);
+    }
+  }
+  return next.map((server) => {
+    if (server.headers !== undefined) return server;
+    const prior = prevByName.get(server.name);
+    if (prior?.headers && Object.keys(prior.headers).length) {
+      return { ...server, headers: prior.headers };
+    }
+    return server;
+  });
+}
 
 export function parseStoredConfig(value: JsonValue): AppConfig {
   const parsed = appConfigSchema.safeParse(value);
@@ -127,6 +205,11 @@ export function saveConfig(patch: Partial<AppConfig>): void {
       diskInstances[instanceId] = merged;
     }
     disk.instances = diskInstances;
+  }
+  // mcpServers is an array. A client that does not have headers (GET never
+  // echoes them) must not wipe stored secrets when it PUTs the rest.
+  if (Array.isArray(patch.mcpServers)) {
+    disk.mcpServers = JSON.parse(JSON.stringify(mergeMcpServers(disk.mcpServers, patch.mcpServers)));
   }
   mkdirSync(DATA_DIR, { recursive: true });
   writeFileAtomic(p, JSON.stringify(disk, null, 2), { mode: 0o600 });

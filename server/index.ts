@@ -1190,6 +1190,10 @@ async function startTurn(
         const connection = await connectedAppsIntegration(bot.id, threadId);
         if (connection) integrations.composio = connection;
       }
+      // Custom remote MCP servers (enabled servers only)
+      if (cfg.mcpServers?.length) {
+        integrations.mcpServers = cfg.mcpServers.filter((s) => s.enabled !== false);
+      }
       // CLI engines work inside the bot's own workspace directory rather
       // than the user's home: a bot with file tools and acceptEdits gets a
       // desk, not the whole house — and the workspace is where its
@@ -1551,6 +1555,9 @@ async function runGroupMemberTurn(
       const connection = await connectedAppsIntegration(bot.id, group.threadId);
       if (connection) integrations.composio = connection;
     }
+    if (cfg.mcpServers?.length) {
+      integrations.mcpServers = cfg.mcpServers.filter((s) => s.enabled !== false);
+    }
   } catch (error) {
     store.appendMessage(group.threadId, {
       role: "bot",
@@ -1894,6 +1901,15 @@ function configStatus() {
     tts: tts.describeVoice(cfg),
     // not a secret — the sidebar shows it
     profile: { name: cfg.profile?.name ?? "", email: cfg.profile?.email ?? "" },
+    // custom MCP servers: names, urls, and enabled state are echoed back;
+    // headers are write-only like other secrets
+    mcpServers: (cfg.mcpServers ?? []).map((s) => ({
+      name: s.name,
+      transport: s.transport,
+      url: s.url,
+      enabled: s.enabled ?? true,
+      hasHeaders: Boolean(s.headers && Object.keys(s.headers).length),
+    })),
   };
 }
 

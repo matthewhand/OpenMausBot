@@ -217,6 +217,14 @@ export interface ConfigStatus {
   tts?: { configured: boolean; ready: boolean; voice: string };
   /** who's using the app — collected in onboarding, shown in the sidebar */
   profile?: { name: string; email: string };
+  /** Custom remote MCP servers: names, urls, and enabled state. Headers are write-only. */
+  mcpServers?: Array<{
+    name: string;
+    transport: "http" | "sse";
+    url: string;
+    enabled: boolean;
+    hasHeaders: boolean;
+  }>;
 }
 
 /** How an engine gets installed — declared by its driver, mirrors

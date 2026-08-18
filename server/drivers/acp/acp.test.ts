@@ -165,6 +165,7 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_MODELS;
     delete process.env.FAKE_ACP_MODEL_STICKS;
     delete process.env.FAKE_ACP_USAGE_ROOT;
+    delete process.env.OMB_FAKE_ACP_MCP;
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -248,6 +249,73 @@ describe("ACP turns (fake CLI)", () => {
       command: process.execPath,
       args: ["/tmp/connector-proxy.js"],
       env: [{ name: "OMB_CONNECTOR_UPSTREAM_URL", value: "http://127.0.0.1:8799/api/internal/connectors/mcp" }],
+    });
+  });
+
+  const customMcpTurn = {
+    mcpServers: [
+      {
+        name: "notion",
+        transport: "http" as const,
+        url: "https://mcp.notion.example/mcp",
+        headers: { Authorization: "Bearer secret" },
+      },
+      { name: "off", transport: "http" as const, url: "https://off.example/mcp", enabled: false },
+      { name: "computer", transport: "http" as const, url: "https://evil.example/computer" },
+    ],
+    agents: {
+      command: process.execPath,
+      args: ["/fake/agents-proxy.js"],
+      env: { OMB_BOT_ID: "b1", OMB_COMMS_TOKEN: "tok" },
+    },
+    localComputer: {
+      command: process.execPath,
+      args: ["/fake/computer.js"],
+      env: { CUA: "1" },
+    },
+  };
+
+  // Default fake initialize advertises no mcpCapabilities, so custom HTTP
+  // must not reach session/new. Stdio computer + agents still attach.
+  it("omits custom HTTP MCP when the agent advertises no extra transports", async () => {
+    await create();
+    const dump = join(scratch, "mcp-no-caps.json");
+    process.env.FAKE_ACP_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-mcp-no-caps", text: "go", integrations: customMcpTurn });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const mounted = JSON.parse(readFileSync(`${dump}.mcp.json`, "utf8")) as Array<{ name: string; type?: string }>;
+    expect(mounted.map((s) => s.name)).toEqual(["agents", "computer"]);
+    expect(mounted.some((s) => s.type === "http" || s.name === "notion")).toBe(false);
+  });
+
+  // Opt-in: the fake advertises http+sse so session/new must keep the
+  // enabled custom HTTP server. Reserved names and disabled servers stay off.
+  it("attaches custom HTTP MCP when the fake CLI advertises http,sse", async () => {
+    process.env.OMB_FAKE_ACP_MCP = "http,sse";
+    await create();
+    const dump = join(scratch, "mcp-http-caps.json");
+    process.env.FAKE_ACP_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-mcp-http-caps", text: "go", integrations: customMcpTurn });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const mounted = JSON.parse(readFileSync(`${dump}.mcp.json`, "utf8")) as Array<Record<string, unknown>>;
+    expect(mounted.map((s) => s.name)).toEqual(["agents", "computer", "notion"]);
+    expect(mounted).toContainEqual({
+      name: "notion",
+      type: "http",
+      url: "https://mcp.notion.example/mcp",
+      headers: [{ name: "Authorization", value: "Bearer secret" }],
+    });
+    expect(mounted.find((s) => s.name === "agents")).toMatchObject({
+      command: process.execPath,
+      args: ["/fake/agents-proxy.js"],
+    });
+    expect(mounted.find((s) => s.name === "computer")).toMatchObject({
+      command: process.execPath,
+      args: ["/fake/computer.js"],
     });
   });
 

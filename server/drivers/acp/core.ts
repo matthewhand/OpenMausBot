@@ -16,6 +16,7 @@
 import { homedir } from "node:os";
 
 import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../../procs.ts";
+import { filterAcpMcpServers, mapCustomAcpMcpServers } from "./mcp-servers.ts";
 
 import type {
   DriverCreateInput,
@@ -212,7 +213,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       // an injected stdio proxy — e.g. the peer-agent comms tool — attaches
       // fine here. env is the ACP {name,value}[] shape.
       const acpMcpServers = (turn: SendTurnInput) => {
-        const servers: Array<{ name: string; command: string; args: string[]; env: Array<{ name: string; value: string }> }> = [];
+        const servers: Array<Record<string, unknown>> = [];
         const acpEnv = (env: Record<string, string>) =>
           Object.entries(env).map(([name, value]) => ({ name, value: String(value) }));
         const agents = turn.integrations?.agents;
@@ -248,6 +249,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             env: acpEnv(local.env ?? {}),
           });
         }
+        // User-configured HTTP/SSE MCP servers (Plugins → Custom MCP). ACP
+        // agents that advertise mcpCapabilities.http/.sse accept these
+        // alongside the stdio proxies above.
+        servers.push(...mapCustomAcpMcpServers(turn.integrations?.mcpServers ?? []));
         return servers;
       };
 
@@ -526,12 +531,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
 
             const cursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
+            const mcpCaps = init?.agentCapabilities?.mcpCapabilities ?? {};
+            const allowedMcpServers = filterAcpMcpServers(mcpServers, mcpCaps);
             let sessionResult: any = null;
             if (cursor) {
               try {
                 sessionResult = await request(
                   "session/load",
-                  { sessionId: cursor, cwd, mcpServers },
+                  { sessionId: cursor, cwd, mcpServers: allowedMcpServers },
                   LOAD_SESSION_TIMEOUT,
                 );
                 sessionId = cursor;
@@ -540,7 +547,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               }
             }
             if (!sessionId) {
-              sessionResult = await request("session/new", { cwd, mcpServers }, NEW_SESSION_TIMEOUT);
+              sessionResult = await request("session/new", { cwd, mcpServers: allowedMcpServers }, NEW_SESSION_TIMEOUT);
               sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
               if (!sessionId) throw new Error("session/new returned no sessionId");
             }

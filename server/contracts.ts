@@ -160,6 +160,14 @@ export interface SendTurnInput {
      * through the harness so this bot can message other bots. The harness
      * owns turns, permissions, and recursion limits; the proxy only forwards. */
     agents?: { command: string; args: string[]; env: Record<string, string> };
+    /** Custom remote MCP servers: user-configured HTTP or SSE servers. */
+    mcpServers?: Array<{
+      name: string;
+      transport: "http" | "sse";
+      url: string;
+      headers?: Record<string, string>;
+      enabled?: boolean;
+    }>;
     /** dweb network daemon: an MCP proxy exposing dweb status, repo, and
      * opencode model access as tools. url is the dweb HTTP base. */
     dweb?: { url: string };
