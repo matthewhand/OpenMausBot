@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { PROVIDER_CREDENTIAL_ENV, WORKSPACE_CREDENTIAL_ENV } from "../../config.ts";
 import { decodeInjectId } from "../local-inject.ts";
 import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../../procs.ts";
+import { filterAcpMcpServers, mapCustomAcpMcpServers } from "./mcp-servers.ts";
 
 /**
  * A `host::model` pick talks to a loopback server with its own key.
@@ -286,16 +287,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // User-configured HTTP/SSE MCP servers (Plugins → Custom MCP). ACP
         // agents that advertise mcpCapabilities.http/.sse accept these
         // alongside the stdio proxies above.
-        for (const server of turn.integrations?.mcpServers ?? []) {
-          if (server.enabled === false) continue;
-          if (RESERVED_MCP_NAMES.has(server.name)) continue;
-          servers.push({
-            name: server.name,
-            type: server.transport,
-            url: server.url,
-            headers: Object.entries(server.headers ?? {}).map(([name, value]) => ({ name, value })),
-          });
-        }
+        servers.push(...mapCustomAcpMcpServers(turn.integrations?.mcpServers ?? []));
         return servers;
       };
 
@@ -602,12 +594,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
 
             const cursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
             const mcpCaps = init?.agentCapabilities?.mcpCapabilities ?? {};
-            const allowedMcpServers = mcpServers.filter((server) => {
-              if (typeof server.command === "string") return true;
-              if (server.type === "http") return mcpCaps.http === true;
-              if (server.type === "sse") return mcpCaps.sse === true;
-              return false;
-            });
+            const allowedMcpServers = filterAcpMcpServers(mcpServers, mcpCaps);
             let sessionResult: any = null;
             if (cursor) {
               try {
