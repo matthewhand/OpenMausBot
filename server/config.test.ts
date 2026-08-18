@@ -524,10 +524,33 @@ describe("TTS provider configuration", () => {
     });
   });
 
-  it("accepts a provider-only patch so a switch cannot wipe credentials", () => {
-    expect(parseConfigPatch({ tts: { provider: "openai-compatible" } })).toEqual({
-      tts: { provider: "openai-compatible" },
+  it("accepts openaiVoice next to the ElevenLabs voice id", () => {
+    expect(
+      parseStoredConfig({
+        tts: {
+          provider: "openai-compatible",
+          baseUrl: "http://127.0.0.1:9093/v1",
+          voice: "v-1",
+          openaiVoice: "af_heart",
+        },
+      }),
+    ).toEqual({
+      tts: {
+        provider: "openai-compatible",
+        baseUrl: "http://127.0.0.1:9093/v1",
+        voice: "v-1",
+        openaiVoice: "af_heart",
+      },
     });
+  });
+
+  it("accepts a provider-only patch so a switch cannot wipe credentials or voices", () => {
+    const patch = parseConfigPatch({ tts: { provider: "openai-compatible" } });
+    expect(patch).toEqual({ tts: { provider: "openai-compatible" } });
+    expect(patch.tts).not.toHaveProperty("voice");
+    expect(patch.tts).not.toHaveProperty("openaiVoice");
+    expect(patch.tts).not.toHaveProperty("key");
+    expect(patch.tts).not.toHaveProperty("openaiKey");
   });
 });
 

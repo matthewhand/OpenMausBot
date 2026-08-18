@@ -51,14 +51,21 @@ export function providerConfigured(cfg: AppConfig): boolean {
   return Boolean(cfg.tts?.key);
 }
 
+/** Voice id for the selected provider. `voice` is ElevenLabs / system;
+ * `openaiVoice` is OpenAI-compatible — a leftover id from the other
+ * provider is not valid. */
+function configuredVoice(cfg: AppConfig): string | undefined {
+  return voiceProvider(cfg) === "openai-compatible" ? cfg.tts?.openaiVoice : cfg.tts?.voice;
+}
+
 export function voiceConfigured(cfg: AppConfig): boolean {
   const provider = voiceProvider(cfg);
   if (provider === "system") {
     return systemVoices.systemVoicesAvailable() && Boolean(cfg.tts?.voice);
   }
   if (provider === "openai-compatible") {
-    // OpenAI-compatible needs baseUrl and voice; key is optional
-    return Boolean(cfg.tts?.baseUrl && cfg.tts?.voice);
+    // OpenAI-compatible needs baseUrl and openaiVoice; key is optional
+    return Boolean(cfg.tts?.baseUrl && cfg.tts?.openaiVoice);
   }
   return Boolean(cfg.tts?.key && cfg.tts?.voice);
 }
@@ -71,19 +78,19 @@ export function voiceReady(cfg: AppConfig, voiceId?: string): boolean {
     return systemVoices.systemVoicesAvailable() && Boolean(voiceId || cfg.tts?.voice);
   }
   if (provider === "openai-compatible") {
-    return Boolean(cfg.tts?.baseUrl && (voiceId || cfg.tts?.voice));
+    return Boolean(cfg.tts?.baseUrl && (voiceId || cfg.tts?.openaiVoice));
   }
   return Boolean(cfg.tts?.key && (voiceId || cfg.tts?.voice));
 }
 
 /** What the settings panel needs. Never includes the key — same write-only
- * rule as every other credential. */
+ * rule as every other credential. `voice` is the active provider's id. */
 export function describeVoice(cfg: AppConfig) {
   const provider = voiceProvider(cfg);
   return {
     configured: providerConfigured(cfg),
     ready: voiceConfigured(cfg),
-    voice: cfg.tts?.voice ?? "",
+    voice: configuredVoice(cfg) ?? "",
     provider,
     baseUrl: cfg.tts?.baseUrl ?? "",
   };
@@ -134,7 +141,7 @@ export function speak(cfg: AppConfig, text: string, voiceId?: string, run?: syst
   if (provider === "openai-compatible") {
     const baseUrl = cfg.tts?.baseUrl;
     if (!baseUrl) throw new NoVoiceConfigured("baseUrl", provider);
-    const voice = voiceId || cfg.tts?.voice;
+    const voice = voiceId || cfg.tts?.openaiVoice;
     if (!voice) throw new NoVoiceConfigured("voice", provider);
     return openaiCompatible.synthesize(text, voice, baseUrl, openaiAuthKey(cfg));
   }

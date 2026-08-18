@@ -9,7 +9,12 @@ import { Check, Loader2, Volume2 } from "lucide-react";
 import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { useDesktopCapabilities } from "@/components/DesktopCapabilities";
 import { speaker } from "@/lib/tts";
-import { ttsElevenLabsKeyPatch, ttsOpenaiCredentialsPatch, ttsProviderPatch } from "@/lib/tts-provider";
+import {
+  ttsElevenLabsKeyPatch,
+  ttsOpenaiCredentialsPatch,
+  ttsProviderPatch,
+  ttsVoicePatch,
+} from "@/lib/tts-provider";
 import { cn } from "@/lib/cn";
 
 const SAMPLE = "Morning. Overnight the tests went green, and I left two notes for you in the thread.";
@@ -33,6 +38,7 @@ export function VoiceSettings({
   const [error, setError] = useState<string | null>(null);
   const [voices, setVoices] = useState<Array<{ id: string; label: string; description?: string }>>([]);
   const [loadingVoices, setLoadingVoices] = useState(false);
+  const [customVoice, setCustomVoice] = useState(tts?.voice ?? "");
 
   const { capabilities } = useDesktopCapabilities();
   // Built-in voices are offered where the desktop contract says they exist —
@@ -43,7 +49,8 @@ export function VoiceSettings({
 
   useEffect(() => {
     if (tts?.baseUrl !== undefined) setBaseUrl(tts.baseUrl);
-  }, [tts?.baseUrl]);
+    if (tts?.voice !== undefined) setCustomVoice(tts.voice);
+  }, [tts?.provider, tts?.baseUrl, tts?.voice]);
 
   useEffect(() => {
     if (!configured) {
@@ -71,10 +78,19 @@ export function VoiceSettings({
     setError(null);
     // the provider is a setting, not a secret — it rides the ordinary
     // config write, and the key row reappears or disappears with it
-    api("/api/config", { method: "PUT", body: JSON.stringify({ tts: { provider: next } }) })
+    api("/api/config", { method: "PUT", body: JSON.stringify({ tts: ttsProviderPatch(next) }) })
       .then((status: ConfigStatus) => dispatch({ type: "configStatus", config: status }))
       .catch((e: Error) => setError(e.message))
       .finally(() => setSwitching(false));
+  };
+
+  const save = (ttsPatch: Record<string, unknown>) => {
+    setSaving(true);
+    setError(null);
+    return api("/api/config", { method: "PUT", body: JSON.stringify({ tts: ttsPatch }) })
+      .then((status: ConfigStatus) => dispatch({ type: "configStatus", config: status }))
+      .catch((e: Error) => setError(e.message))
+      .finally(() => setSaving(false));
   };
 
   const saveKey = () => {
@@ -84,7 +100,7 @@ export function VoiceSettings({
     setError(null);
     const request = window.ogb?.setCredential
       ? window.ogb.setCredential("ttsKey", nextKey)
-      : api("/api/config", { method: "PUT", body: JSON.stringify({ tts: { key: nextKey } }) });
+      : api("/api/config", { method: "PUT", body: JSON.stringify({ tts: ttsElevenLabsKeyPatch(nextKey) }) });
     return request
       .then((status: ConfigStatus) => {
         dispatch({ type: "configStatus", config: status });
@@ -99,12 +115,10 @@ export function VoiceSettings({
     if (!nextUrl) return Promise.resolve();
     setSaving(true);
     setError(null);
-    const body: { provider: "openai-compatible"; baseUrl: string; key?: string } = {
-      provider: "openai-compatible",
-      baseUrl: nextUrl,
-    };
-    if (key.trim()) body.key = key.trim();
-    return api("/api/config", { method: "PUT", body: JSON.stringify({ tts: body }) })
+    return api("/api/config", {
+      method: "PUT",
+      body: JSON.stringify({ tts: ttsOpenaiCredentialsPatch(nextUrl, key) }),
+    })
       .then((status: ConfigStatus) => {
         dispatch({ type: "configStatus", config: status });
         setKey("");
@@ -282,6 +296,9 @@ export function VoiceSettings({
                   {v.description ? ` — ${v.description}` : ""}
                 </option>
               ))}
+              {tts.voice && !voices.some((v) => v.id === tts.voice) && (
+                <option value={tts.voice}>Custom — {tts.voice}</option>
+              )}
             </select>
             <button
               onClick={() => void speaker.speak(SAMPLE, { voiceId: bot.voice, botId: bot.id })}
@@ -291,6 +308,25 @@ export function VoiceSettings({
               className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-control py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Volume2 size={14} /> Try
+            </button>
+          </div>
+          <div className="mt-2 flex gap-2">
+            <input
+              type="text"
+              value={customVoice}
+              onChange={(e) => setCustomVoice(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && customVoice.trim() && void save(ttsVoicePatch(provider, customVoice))}
+              placeholder="Or type a custom voice id"
+              aria-label="Custom voice id"
+              autoComplete="off"
+              className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+            />
+            <button
+              onClick={() => void save(ttsVoicePatch(provider, customVoice))}
+              disabled={saving || !customVoice.trim()}
+              className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
             </button>
           </div>
         </div>
