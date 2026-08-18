@@ -131,7 +131,7 @@ Press the speaker on any reply, or switch a bot to read its answers out as they 
 to what ran overnight while you make breakfast. Hit **call** and it's a conversation: it hears you, tells
 you what it's doing while it works, and asks for approvals out loud.
 
-Bring your own ElevenLabs key — paste it once in App Settings, pick a voice, and every bot can talk.
+Bring your own voice — ElevenLabs or an OpenAI-compatible server (local Kokoro, LiteLLM). Paste credentials in App Settings, pick a voice, and every bot can talk.
 Give a bot its own voice and a room stops sounding like one person.
 
 **Also in the box:** streaming replies with tool-run activity chips · native macOS dictation from the
@@ -171,7 +171,7 @@ flowchart LR
 | Drivers | `server/drivers/` | One per provider: Claude, Codex, and Grok Build over their local CLIs (stream-JSON / JSON-RPC / ACP), plus a cloud-computer agent. Unknown drivers degrade to "unavailable", never crash the fleet. |
 | Harness | `server/harness/` | Registry (configs → live instances) and the fan-in event bus every client folds. |
 | API | `server/index.ts` | Bots, turns, approvals, model catalog, computer lifecycle, connectors, config — HTTP + SSE. |
-| Voice | `server/tts/` | ElevenLabs, bring your own key. Runs on the harness so the key never reaches the UI; markdown is rewritten into something worth hearing before it is spoken. |
+| Voice | `server/tts/` | ElevenLabs or OpenAI-compatible `/v1/audio/speech`. Credentials stay on the harness; markdown is rewritten before it is spoken. |
 | App | `src/` | The chat shell. Server-backed store, one reducer, zero client-side transports. |
 | Desktop | `electron/` | macOS, Windows, and Ubuntu shells with an embedded harness and explicit platform capabilities; Apple speech, local screen capture, and the current CUA bridge remain macOS-only. |
 
@@ -231,7 +231,7 @@ in the sidebar footer) when you want to enable its integration:
 |---|---|---|
 | Composio project key (`ak_…`) | Connect Gmail, GitHub, Slack, Notion, and other apps to your bots | [OpenMausBot Composio setup](docs/composio.md) |
 | Box API key | Give bots an isolated remote Linux computer with a desktop and terminal | [Box API key guide](https://docs.ascii.dev/box/api-keys) |
-| ElevenLabs key | Read replies aloud, and call your bots | [ElevenLabs API keys](https://elevenlabs.io/app/settings/api-keys) |
+| ElevenLabs key or OpenAI-compatible base URL | Read replies aloud, and call your bots | [ElevenLabs API keys](https://elevenlabs.io/app/settings/api-keys) · or a local Kokoro/LiteLLM `/v1` URL |
 
 Composio and Box are third-party services with their own accounts and terms. Box is a paid service after
 its trial, and using a cloud computer may incur charges.
@@ -265,7 +265,7 @@ Early but real — the loop works end to end: message → agent → streamed rep
 computer use. macOS and Windows have released builds; Ubuntu 24.04 x64 packages are in beta with the
 capability limits above. Rough edges to expect: hosted/mobile connectivity is still being built, and webhook
 triggers currently use the local receiver rather than an always-on hosted relay.
-Voice needs an ElevenLabs key, and calls are macOS-only for now (they ride the same on-device dictation as
+Voice needs an ElevenLabs key or an OpenAI-compatible base URL, and calls are macOS-only for now (they ride the same on-device dictation as
 the composer mic) — see [`docs/voice-mode.md`](docs/voice-mode.md) for the design and the known gaps.
 
 Contributions welcome — the driver SPI in [`server/contracts.ts`](server/contracts.ts) is deliberately
