@@ -23,6 +23,7 @@ import { Loader2, Phone, PhoneOff, X } from "lucide-react";
 import { useStore, visibleMessages, type Bot } from "@/state/store";
 import { currentCall, deferCallCleanup, endCall, startCall, useOnCall } from "@/lib/call";
 import { speaker } from "@/lib/tts";
+import { botVoiceId } from "@/lib/tts-provider";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
 import { MausAvatar } from "./Avatar";
@@ -41,11 +42,12 @@ type Phase = "listening" | "sending" | "working" | "speaking";
 const CALL_ENDPOINT_MS = 850;
 
 export function CallButton({ bot }: { bot: Bot }) {
+  const { state } = useStore();
   return (
     <CallTargetButton
       targetId={bot.id}
       targetName={bot.name}
-      voices={[bot.voice]}
+      voices={[botVoiceId(state.config?.tts?.provider, bot)]}
       setupBotId={bot.id}
       requireExplicitVoices={false}
       onStart={() => track("call_started", { driver: bot.modelSelection?.instanceId })}
@@ -198,7 +200,7 @@ export function CallOverlay({ bot }: { bot: Bot }) {
 }
 
 function Call({ bot }: { bot: Bot }) {
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
   const speech = useSpeech();
   const initialPhase: Phase = bot.busy ? "working" : "listening";
   const [phase, setPhase] = useState<Phase>(initialPhase);
@@ -270,10 +272,10 @@ function Call({ bot }: { bot: Bot }) {
       // never observe an old "listening" phase and reopen the mic.
       move("speaking");
       hush();
-      await speaker.speak(text, { botId: bot.id, voiceId: bot.voice });
+      await speaker.speak(text, { botId: bot.id, voiceId: botVoiceId(state.config?.tts?.provider, bot) });
       return alive.current && currentCall() === bot.id && sayGeneration.current === mine;
     },
-    [bot.id, bot.voice, hush, move],
+    [bot, hush, move, state.config?.tts?.provider],
   );
 
   const sayThenListen = useCallback(

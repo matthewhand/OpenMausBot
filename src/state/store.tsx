@@ -23,6 +23,7 @@ import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib
 import { currentCall } from "@/lib/call";
 import { showNotification, type NotificationTarget } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
+import { botVoiceId } from "@/lib/tts-provider";
 import { createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
 import { openLiveEvents } from "@/lib/live-events";
@@ -229,8 +230,10 @@ export interface Bot {
   alwaysAllow?: string[];
   /** speak this bot's replies aloud as they settle */
   speakReplies?: boolean;
-  /** this bot's own voice id (falls back to the app-wide one) */
+  /** this bot's ElevenLabs voice id (falls back to the app-wide one) */
   voice?: string;
+  /** per-bot OpenAI-compatible voice; unused when the app TTS is ElevenLabs */
+  openaiVoice?: string;
   pinned?: boolean;
   hidden?: boolean;
   /** Sidebar section this bot renders under; absent = unsectioned. */
@@ -1969,7 +1972,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               void speaker.speak(frame.message.text, {
                 botId: owner.id,
                 messageId: frame.message.id,
-                voiceId: owner.voice,
+                voiceId: botVoiceId(stateRef.current.config?.tts?.provider, owner),
               });
             }
           }

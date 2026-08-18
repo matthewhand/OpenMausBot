@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  botVoiceId,
+  botVoicePatch,
   ttsActiveVoice,
   ttsElevenLabsKeyPatch,
   ttsOpenaiCredentialsPatch,
@@ -70,5 +72,24 @@ describe("ttsActiveVoice", () => {
     expect(ttsActiveVoice("openai-compatible", both)).toBe("af_heart");
     expect(ttsActiveVoice("openai-compatible", { voice: "v-1" })).toBe("");
     expect(ttsActiveVoice("elevenlabs", { openaiVoice: "af_heart" })).toBe("");
+  });
+});
+
+describe("botVoiceId", () => {
+  it("does not send a leftover ElevenLabs bot voice to OpenAI-compatible", () => {
+    const bot = { voice: "el-rachel", openaiVoice: "af_heart" };
+    expect(botVoiceId("elevenlabs", bot)).toBe("el-rachel");
+    expect(botVoiceId("openai-compatible", bot)).toBe("af_heart");
+    expect(botVoiceId("openai-compatible", { voice: "el-rachel" })).toBeUndefined();
+    expect(botVoiceId("elevenlabs", { openaiVoice: "af_heart" })).toBeUndefined();
+    expect(botVoiceId("openai-compatible", { openaiVoice: "  " })).toBeUndefined();
+  });
+});
+
+describe("botVoicePatch", () => {
+  it("writes the active provider field only", () => {
+    expect(botVoicePatch("elevenlabs", "v-1")).toEqual({ voice: "v-1" });
+    expect(botVoicePatch("openai-compatible", "")).toEqual({ openaiVoice: "" });
+    expect(botVoicePatch("openai-compatible", "af_heart")).not.toHaveProperty("voice");
   });
 });

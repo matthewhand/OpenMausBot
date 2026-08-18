@@ -58,6 +58,7 @@ import { RenameTitle } from "./RenameTitle";
 import { TaskPicker } from "./TaskPicker";
 import { ReactionBar, ReactionChips } from "./Reactions";
 import { SpeakButton } from "./SpeakButton";
+import { botVoiceId } from "@/lib/tts-provider";
 import { CallButton, CallOverlay } from "./CallView";
 import { cn } from "@/lib/cn";
 import { COMPACT_BUBBLE, COMPACT_SQUARE } from "@/lib/compact-chip";
@@ -309,7 +310,7 @@ function Bubble({
   replyTarget?: Message;
   onReply: () => void;
 }) {
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
   const user = message.role === "user";
   const [expanded, setExpanded] = useState(false);
   const text = message.text ?? "";
@@ -456,7 +457,7 @@ function Bubble({
             <div className="flex flex-col gap-0.5 self-end pb-0.5">
               <CopyButton text={text} />
               {message.kind === "text" && (
-                <SpeakButton text={text} botId={bot.id} messageId={message.id} voiceId={bot.voice} />
+                <SpeakButton text={text} botId={bot.id} messageId={message.id} voiceId={botVoiceId(state.config?.tts?.provider, bot)} />
               )}
               {isLastBotText && !bot.busy && onRegenerate && (
                 <button

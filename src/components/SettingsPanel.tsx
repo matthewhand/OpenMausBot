@@ -14,6 +14,7 @@ import { instanceSupportsLocalComputer, localComputerDisabledReason, localComput
 import { BotProfileAvatarCard } from "./BotProfileAvatarCard";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import { VoiceSettings } from "./VoiceSettings";
+import { botVoiceId, type TtsProvider } from "@/lib/tts-provider";
 import { BOT_PROFILE_LIMITS } from "../../shared/bot-profile";
 
 function Field({
@@ -341,6 +342,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "autoReview"
         | "speakReplies"
         | "voice"
+        | "openaiVoice"
         | "chiefOfStaff"
         | "approvePeerComms"
         | "composio"
@@ -349,6 +351,8 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
       >
     > & { acknowledgeLocalAuto?: boolean },
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
+  const ttsProvider = (state.config?.tts?.provider as TtsProvider) ?? "elevenlabs";
+  const selectedBotVoice = botVoiceId(ttsProvider, bot) ?? "";
   const activeState = stateForBot(bot);
   const mascotMotion = state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
   const engine = state.instances.find((instance) => instance.instanceId === bot.modelSelection.instanceId);

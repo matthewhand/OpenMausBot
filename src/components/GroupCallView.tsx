@@ -11,6 +11,7 @@ import { routeSpokenGroupMessage } from "@/lib/group-call";
 import { track } from "@/lib/analytics";
 import { normalizeState } from "@/lib/mascot";
 import { speaker } from "@/lib/tts";
+import { botVoiceId } from "@/lib/tts-provider";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
 import { useStore, type Bot, type Group, type Message } from "@/state/store";
@@ -26,13 +27,14 @@ const CALL_ENDPOINT_MS = 850;
 type Phase = "listening" | "sending" | "working" | "speaking";
 
 export function GroupCallButton({ group, members }: { group: Group; members: Bot[] }) {
+  const { state } = useStore();
   if (group.dm) return null;
   return (
     <CallTargetButton
       targetId={group.id}
       targetName={group.name}
-      voices={members.map((member) => member.voice)}
-      setupBotId={members.find((member) => !member.voice)?.id ?? members[0]?.id}
+      voices={members.map((member) => botVoiceId(state.config?.tts?.provider, member))}
+      setupBotId={members.find((member) => !botVoiceId(state.config?.tts?.provider, member))?.id ?? members[0]?.id}
       requireExplicitVoices
       onStart={() => track("group_call_started", { memberCount: members.length })}
     />
@@ -57,7 +59,7 @@ function questionIn(messages: Message[]): Message | undefined {
 }
 
 function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
   const speech = useSpeech();
   const initialPhase: Phase = group.busyBotId ? "working" : "listening";
   const [phase, setPhase] = useState<Phase>(initialPhase);
@@ -144,10 +146,13 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
       move("speaking");
       setSpeakingMemberId(member?.id ?? null);
       hush();
-      await speaker.speak(text, { botId: member?.id, voiceId: member?.voice });
+      await speaker.speak(text, {
+        botId: member?.id,
+        voiceId: botVoiceId(state.config?.tts?.provider, member),
+      });
       return alive.current && currentCall() === group.id && sayGeneration.current === mine;
     },
-    [group.id, hush, move],
+    [group.id, hush, move, state.config?.tts?.provider],
   );
 
   const enqueueSpeech = useCallback(
