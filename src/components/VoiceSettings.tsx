@@ -7,7 +7,12 @@ import { Check, Loader2, Volume2 } from "lucide-react";
 
 import { api, useStore, type ConfigStatus } from "@/state/store";
 import { speaker } from "@/lib/tts";
-import { ttsElevenLabsKeyPatch, ttsOpenaiCredentialsPatch, ttsProviderPatch } from "@/lib/tts-provider";
+import {
+  ttsElevenLabsKeyPatch,
+  ttsOpenaiCredentialsPatch,
+  ttsProviderPatch,
+  ttsVoicePatch,
+} from "@/lib/tts-provider";
 import { cn } from "@/lib/cn";
 
 const SAMPLE = "Morning. Overnight the tests went green, and I left two notes for you in the thread.";
@@ -25,6 +30,7 @@ export function VoiceSettings() {
   const [error, setError] = useState<string | null>(null);
   const [voices, setVoices] = useState<Array<{ id: string; label: string; description?: string }>>([]);
   const [loadingVoices, setLoadingVoices] = useState(false);
+  const [customVoice, setCustomVoice] = useState(tts?.voice ?? "");
 
   const configured = Boolean(tts?.configured);
 
@@ -34,7 +40,8 @@ export function VoiceSettings() {
       setProvider(tts.provider as "elevenlabs" | "openai-compatible");
     }
     if (tts?.baseUrl !== undefined) setBaseUrl(tts.baseUrl);
-  }, [tts?.provider, tts?.baseUrl]);
+    if (tts?.voice !== undefined) setCustomVoice(tts.voice);
+  }, [tts?.provider, tts?.baseUrl, tts?.voice]);
 
   useEffect(() => {
     if (!configured) {
@@ -54,7 +61,7 @@ export function VoiceSettings() {
     return () => {
       alive = false;
     };
-  }, [configured]);
+  }, [configured, tts?.provider]);
 
   const save = (patch: Record<string, unknown>) => {
     setSaving(true);
@@ -214,7 +221,7 @@ export function VoiceSettings() {
           <div className="flex gap-2">
             <select
               value={tts.voice}
-              onChange={(e) => void save({ voice: e.target.value })}
+              onChange={(e) => void save(ttsVoicePatch(provider, e.target.value))}
               aria-label="Voice"
               className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none"
             >
@@ -225,6 +232,9 @@ export function VoiceSettings() {
                   {v.description ? ` — ${v.description}` : ""}
                 </option>
               ))}
+              {tts.voice && !voices.some((v) => v.id === tts.voice) && (
+                <option value={tts.voice}>Custom — {tts.voice}</option>
+              )}
             </select>
             <button
               onClick={() => void speaker.speak(SAMPLE)}
@@ -234,6 +244,25 @@ export function VoiceSettings() {
               className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Volume2 size={14} /> Try
+            </button>
+          </div>
+          <div className="mt-2 flex gap-2">
+            <input
+              type="text"
+              value={customVoice}
+              onChange={(e) => setCustomVoice(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && customVoice.trim() && void save(ttsVoicePatch(provider, customVoice))}
+              placeholder="Or type a custom voice id"
+              aria-label="Custom voice id"
+              autoComplete="off"
+              className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+            />
+            <button
+              onClick={() => void save(ttsVoicePatch(provider, customVoice))}
+              disabled={saving || !customVoice.trim()}
+              className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
             </button>
           </div>
         </div>

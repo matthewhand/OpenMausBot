@@ -40,6 +40,13 @@ optional for local unauthenticated servers like Kokoro); `ready` means base URL
 separately. Switching the provider dropdown must not wipe or send the other
 provider's secret.
 
+Voice ids are per provider too: `tts.voice` is ElevenLabs and `tts.openaiVoice`
+is OpenAI-compatible. Switching the dropdown keeps both ids and uses only the
+active one — an ElevenLabs id is not valid on Kokoro and vice versa. App
+Settings binds the voice select to the active id, and a text field next to it
+saves a custom id. If that id is not in the listed voices, it stays visible as
+a custom option with the field filled.
+
 ## The spoken register
 
 The half that decides whether this is pleasant. Agents write for a screen:
@@ -108,7 +115,9 @@ ports.
 
 Voice lists come from the server's `/voices` endpoint when available. If the
 server doesn't expose that endpoint, a fallback list of common Kokoro voices
-is shown, and users can also type a custom voice ID.
+is shown. Users can type a custom voice id in the field under the voice
+select; Save writes `openaiVoice` (or `voice` on ElevenLabs). A saved id that
+is not in the list remains selected as a custom option.
 
 ## Rejected alternatives
 

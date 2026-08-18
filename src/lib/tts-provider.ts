@@ -10,6 +10,24 @@ export function ttsElevenLabsKeyPatch(key: string): { key: string } {
   return { key: key.trim() };
 }
 
+/** Voice ids are per provider. Switching to Kokoro must not send an
+ * ElevenLabs id, and the reverse must not send `openaiVoice` as `voice`. */
+export function ttsVoicePatch(
+  provider: TtsProvider,
+  voiceId: string,
+): { voice: string } | { openaiVoice: string } {
+  const id = voiceId.trim();
+  return provider === "openai-compatible" ? { openaiVoice: id } : { voice: id };
+}
+
+export function ttsActiveVoice(
+  provider: TtsProvider,
+  tts?: { voice?: string; openaiVoice?: string } | null,
+): string {
+  if (provider === "openai-compatible") return tts?.openaiVoice ?? "";
+  return tts?.voice ?? "";
+}
+
 /** OpenAI-compatible saves its own optional key. An empty field is omitted so
  *  a leftover ElevenLabs `key` (and a previously saved `openaiKey`) stay put. */
 export function ttsOpenaiCredentialsPatch(

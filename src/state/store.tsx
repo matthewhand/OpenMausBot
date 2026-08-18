@@ -214,6 +214,7 @@ export interface ConfigStatus {
   /** Voice. Supports ElevenLabs and OpenAI-compatible providers.
    * `provider` = which provider is selected; `configured` = credentials are
    * saved; `ready` = credentials AND a voice. Secrets are never echoed back.
+   * `voice` is the active provider's id (the settings select binds to it).
    * `baseUrl` is echoed for OpenAI-compatible (not a secret). */
   tts?: { provider: "elevenlabs" | "openai-compatible"; configured: boolean; ready: boolean; voice: string; baseUrl: string };
   /** who's using the app — collected in onboarding, shown in the sidebar */

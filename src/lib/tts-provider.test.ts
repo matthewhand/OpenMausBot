@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { ttsElevenLabsKeyPatch, ttsOpenaiCredentialsPatch, ttsProviderPatch } from "./tts-provider";
+import {
+  ttsActiveVoice,
+  ttsElevenLabsKeyPatch,
+  ttsOpenaiCredentialsPatch,
+  ttsProviderPatch,
+  ttsVoicePatch,
+} from "./tts-provider";
 
 describe("ttsProviderPatch", () => {
   it("sends only the provider — never a blank key that would wipe ElevenLabs", () => {
@@ -27,5 +33,27 @@ describe("ttsOpenaiCredentialsPatch", () => {
 describe("ttsElevenLabsKeyPatch", () => {
   it("trims the ElevenLabs key only", () => {
     expect(ttsElevenLabsKeyPatch("  el-key  ")).toEqual({ key: "el-key" });
+  });
+});
+
+describe("ttsVoicePatch", () => {
+  it("saves ElevenLabs as voice only — never openaiVoice", () => {
+    expect(ttsVoicePatch("elevenlabs", " v-1 ")).toEqual({ voice: "v-1" });
+    expect(ttsVoicePatch("elevenlabs", "v-1")).not.toHaveProperty("openaiVoice");
+  });
+
+  it("saves OpenAI-compatible as openaiVoice only — never the ElevenLabs field", () => {
+    expect(ttsVoicePatch("openai-compatible", " af_heart ")).toEqual({ openaiVoice: "af_heart" });
+    expect(ttsVoicePatch("openai-compatible", "af_heart")).not.toHaveProperty("voice");
+  });
+});
+
+describe("ttsActiveVoice", () => {
+  it("reads the field for the selected provider and ignores the other", () => {
+    const both = { voice: "v-1", openaiVoice: "af_heart" };
+    expect(ttsActiveVoice("elevenlabs", both)).toBe("v-1");
+    expect(ttsActiveVoice("openai-compatible", both)).toBe("af_heart");
+    expect(ttsActiveVoice("openai-compatible", { voice: "v-1" })).toBe("");
+    expect(ttsActiveVoice("elevenlabs", { openaiVoice: "af_heart" })).toBe("");
   });
 });

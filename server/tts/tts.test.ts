@@ -84,15 +84,19 @@ describe("configuration", () => {
     expect(voiceReady({}, "v-per-bot")).toBe(false);
   });
 
-  it("needs baseUrl and voice for OpenAI-compatible (key optional)", async () => {
+  it("needs baseUrl and openaiVoice for OpenAI-compatible (key optional)", async () => {
     const { voiceConfigured, voiceReady } = await voice();
     const openaiCfg = (tts: AppConfig["tts"]): AppConfig => ({ tts: { provider: "openai-compatible", ...tts } });
     expect(voiceConfigured(openaiCfg({}))).toBe(false);
     expect(voiceConfigured(openaiCfg({ baseUrl: "http://localhost" }))).toBe(false);
-    expect(voiceConfigured(openaiCfg({ voice: "v-1" }))).toBe(false);
-    expect(voiceConfigured(openaiCfg({ baseUrl: "http://localhost", voice: "v-1" }))).toBe(true);
+    expect(voiceConfigured(openaiCfg({ openaiVoice: "af_heart" }))).toBe(false);
+    expect(voiceConfigured(openaiCfg({ baseUrl: "http://localhost", openaiVoice: "af_heart" }))).toBe(true);
+    // leftover ElevenLabs voice is not a Kokoro voice
+    expect(voiceConfigured(openaiCfg({ baseUrl: "http://localhost", voice: "v-1" }))).toBe(false);
     // key is optional for local servers
     expect(voiceReady(openaiCfg({ baseUrl: "http://localhost" }), "v-per-bot")).toBe(true);
+    expect(voiceReady(openaiCfg({ baseUrl: "http://localhost", openaiVoice: "af_heart" }))).toBe(true);
+    expect(voiceReady(openaiCfg({ baseUrl: "http://localhost", voice: "v-1" }))).toBe(false);
   });
 
   it("defaults to elevenlabs when provider is not set", async () => {
@@ -112,10 +116,20 @@ describe("configuration", () => {
 
   it("reports baseUrl for OpenAI-compatible (not a secret)", async () => {
     const { describeVoice } = await voice();
-    const described = describeVoice(cfg({ provider: "openai-compatible", baseUrl: "http://localhost", voice: "v-1" }));
+    const described = describeVoice(
+      cfg({ provider: "openai-compatible", baseUrl: "http://localhost", openaiVoice: "af_heart" }),
+    );
     expect(described.baseUrl).toBe("http://localhost");
     expect(described.configured).toBe(true);
+    expect(described.voice).toBe("af_heart");
     expect(JSON.stringify(described)).not.toContain("sk-");
+  });
+
+  it("describeVoice.voice is the active provider's voice, not the other one", async () => {
+    const { describeVoice } = await voice();
+    const both = { key: "el-key", voice: "v-1", openaiVoice: "af_heart", baseUrl: "http://localhost" };
+    expect(describeVoice(cfg(both)).voice).toBe("v-1");
+    expect(describeVoice(cfg({ ...both, provider: "openai-compatible" })).voice).toBe("af_heart");
   });
 
   it("distinguishes 'no key' from 'no voice picked' for ElevenLabs", async () => {
@@ -203,6 +217,14 @@ describe("ElevenLabs", () => {
     expect(seen.at(-1)!.url).toContain("/v1/text-to-speech/v-other");
   });
 
+  it("does not use leftover openaiVoice when speaking with ElevenLabs", async () => {
+    seen.length = 0;
+    const { speak } = await voice();
+    await speak(cfg({ key: "el-key", voice: "v-1", openaiVoice: "af_heart" }), "hello");
+    expect(seen.at(-1)!.url).toContain("/v1/text-to-speech/v-1");
+    expect(seen.at(-1)!.url).not.toContain("af_heart");
+  });
+
   it("surfaces the service's own refusal rather than a bare status", async () => {
     refuse = { status: 429, body: { detail: "You have exceeded your quota." } };
     const { speak } = await voice();
@@ -245,7 +267,7 @@ describe("OpenAI-compatible", () => {
 
   it("lists voices from the server", async () => {
     const { listVoices } = await voice();
-    const voices = await listVoices(openaiCfg({ voice: "af_heart" }));
+    const voices = await listVoices(openaiCfg({ openaiVoice: "af_heart" }));
     expect(voices).toContainEqual({ id: "af_heart", label: "Heart", description: "Warm female voice" });
     expect(voices).toContainEqual({ id: "am_adam", label: "Adam", description: "Clear male voice" });
   });
@@ -253,7 +275,7 @@ describe("OpenAI-compatible", () => {
   it("synthesizes speech with the OpenAI endpoint", async () => {
     seen.length = 0;
     const { speak } = await voice();
-    const audio = await speak(openaiCfg({ voice: "af_heart" }), "hello there");
+    const audio = await speak(openaiCfg({ openaiVoice: "af_heart" }), "hello there");
     expect(audio.mime).toBe("audio/mpeg");
     expect(Buffer.from(audio.bytes)).toEqual(MP3);
 
@@ -266,7 +288,7 @@ describe("OpenAI-compatible", () => {
   it("sends Authorization header when openaiKey is provided", async () => {
     seen.length = 0;
     const { speak } = await voice();
-    await speak(openaiCfg({ openaiKey: "sk-test", voice: "af_heart" }), "hello");
+    await speak(openaiCfg({ openaiKey: "sk-test", openaiVoice: "af_heart" }), "hello");
     const call = seen.at(-1)!;
     expect(call.headers.authorization).toBe("Bearer sk-test");
   });
@@ -274,7 +296,7 @@ describe("OpenAI-compatible", () => {
   it("omits Authorization header when openaiKey is absent", async () => {
     seen.length = 0;
     const { speak } = await voice();
-    await speak(openaiCfg({ voice: "af_heart" }), "hello");
+    await speak(openaiCfg({ openaiVoice: "af_heart" }), "hello");
     const call = seen.at(-1)!;
     expect(call.headers.authorization).toBeUndefined();
   });
@@ -282,9 +304,21 @@ describe("OpenAI-compatible", () => {
   it("does not send a leftover ElevenLabs key as Bearer to the OpenAI-compatible server", async () => {
     seen.length = 0;
     const { speak } = await voice();
-    await speak(openaiCfg({ key: "el-secret", voice: "af_heart" }), "hello");
+    await speak(openaiCfg({ key: "el-secret", openaiVoice: "af_heart" }), "hello");
     const call = seen.at(-1)!;
     expect(call.headers.authorization).toBeUndefined();
     expect(JSON.stringify(call.headers)).not.toContain("el-secret");
+  });
+
+  it("does not speak with a leftover ElevenLabs voice id", async () => {
+    const { speak } = await voice();
+    expect(() => speak(openaiCfg({ voice: "el-voice-id" }), "hello")).toThrow(/voice/i);
+  });
+
+  it("synthesizes with openaiVoice, ignoring leftover ElevenLabs voice", async () => {
+    seen.length = 0;
+    const { speak } = await voice();
+    await speak(openaiCfg({ voice: "el-voice-id", openaiVoice: "af_heart" }), "hello");
+    expect(JSON.parse(seen.at(-1)!.body)).toMatchObject({ voice: "af_heart" });
   });
 });
