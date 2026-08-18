@@ -58,6 +58,12 @@ export function CustomMcpTab() {
       setError("Name must contain only letters, numbers, dash, and underscore");
       return;
     }
+    // Same reserved set as server/config.ts RESERVED_MCP_NAMES — reject here
+    // so the operator sees why before a 400 from parse.
+    if (["agents", "computer", "composio", "dweb", "ogb"].includes(editing.name.trim())) {
+      setError(`"${editing.name.trim()}" is reserved for a built-in mount`);
+      return;
+    }
 
     setSaving(true);
     setError(null);
