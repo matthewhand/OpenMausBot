@@ -1,6 +1,8 @@
 /** LAN bearer token for the harness. EventSource cannot send headers, so
  *  GET /api/events also accepts ?access_token=. A first visit can bootstrap
- *  via that query (or ?access_token= on any page) into localStorage. */
+ *  via that query (or ?access_token= on any page) into localStorage.
+ *  Other /api/* routes require Authorization: Bearer — do not put the token
+ *  on mutating URLs. */
 
 const STORAGE_KEY = "ombAuthToken";
 

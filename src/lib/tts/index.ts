@@ -13,6 +13,7 @@
 // that produced it — it is the piece most likely to be tuned against real
 // transcripts, and keeping it in one place is the same reasoning as the
 // server-computed approval key.
+import { lanAuthHeaders } from "@/lib/lan-auth";
 
 export type SpeechStatus = "idle" | "preparing" | "speaking";
 
@@ -161,7 +162,7 @@ export class Speaker {
   private async prepare(text: string, voiceId: string | undefined, signal: AbortSignal): Promise<string[]> {
     const res = await fetch("/api/tts/prepare", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...lanAuthHeaders() },
       body: JSON.stringify({ text, voiceId }),
       signal,
     });
@@ -176,7 +177,7 @@ export class Speaker {
   private async render(text: string, voiceId: string | undefined, signal: AbortSignal): Promise<Blob> {
     const res = await fetch("/api/tts/speak", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...lanAuthHeaders() },
       body: JSON.stringify({ text, voiceId }),
       signal,
     });

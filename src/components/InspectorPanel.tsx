@@ -14,6 +14,7 @@ import { Bug, ChevronDown, ChevronRight, RefreshCw, X } from "lucide-react";
 import { useStore, type Bot } from "@/state/store";
 import { cn } from "@/lib/cn";
 import { formatTime, toRows, type InspectorEntry, type InspectorPage, type InspectorRow } from "@/lib/inspector";
+import { lanAuthHeaders } from "@/lib/lan-auth";
 import { openLiveEvents } from "@/lib/live-events";
 import type { RuntimeEvent } from "../../server/contracts.ts";
 
@@ -36,7 +37,10 @@ export function InspectorPanel({ bot }: { bot: Bot }) {
     const controller = new AbortController();
     loadAbort.current = controller;
     try {
-      const res = await fetch(`/api/threads/${threadId}/events?limit=400`, { signal: controller.signal });
+      const res = await fetch(`/api/threads/${threadId}/events?limit=400`, {
+        signal: controller.signal,
+        headers: lanAuthHeaders(),
+      });
       if (!res.ok) throw new Error(`${res.status}`);
       // SAFETY: this same-version renderer calls the harness's typed
       // inspector endpoint; malformed transport data is handled by catch.

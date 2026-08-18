@@ -7,6 +7,7 @@ import { EngineSetup } from "./EngineSetup";
 import { ProviderMark } from "./ProviderIcons";
 import { PhoneSetupFlow } from "./PhoneSetupFlow";
 import type { InstanceInfo } from "@/state/store";
+import { lanAuthHeaders } from "@/lib/lan-auth";
 
 // First-run onboarding: who you are (email), what's installed (live engine
 // checks from the harness), what the app may use (TCC), then an optional
@@ -122,7 +123,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
     // footer reads it back through /api/config
     void fetch("/api/config", {
       method: "PUT",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...lanAuthHeaders() },
       body: JSON.stringify({ profile: { name: name.trim(), email: email.trim().toLowerCase() } }),
     }).catch(() => {});
     setStep(1);
@@ -138,7 +139,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
     let latestRequest = 0;
     const refresh = () => {
       const request = ++latestRequest;
-      fetch("/api/instances")
+      fetch("/api/instances", { headers: lanAuthHeaders() })
         .then((r) => r.json())
         .then((d) => active && request === latestRequest && setInstances(d.instances ?? []))
         .catch(() => active && request === latestRequest && setInstances([]));

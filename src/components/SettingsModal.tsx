@@ -22,6 +22,7 @@ import {
   browserProfileDeletionBlockReason,
   browserProfilesForPatch,
 } from "@/lib/browser-profiles";
+import { lanAuthHeaders } from "@/lib/lan-auth";
 
 const SECTIONS: Array<{
   id: AppSettingsSection;
@@ -56,7 +57,7 @@ function ProfileFields() {
   const save = () => {
     void fetch("/api/config", {
       method: "PUT",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...lanAuthHeaders() },
       body: JSON.stringify({ profile: { name: name.trim(), email: email.trim().toLowerCase() } }),
     })
       .then((r) => r.json())

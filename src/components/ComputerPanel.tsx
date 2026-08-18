@@ -48,7 +48,10 @@ import {
 import { vpsComputerNeedsReplacement, type VpsComputerStatus } from "@/lib/vps-computer";
 
 async function api(path: string, init?: RequestInit): Promise<any> {
-  const res = await fetch(path, { headers: { "content-type": "application/json" }, ...init });
+  const res = await fetch(path, {
+    ...init,
+    headers: { "content-type": "application/json", ...lanAuthHeaders(), ...(init?.headers ?? {}) },
+  });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error ?? `${res.status} ${res.statusText}`);
   return body;
