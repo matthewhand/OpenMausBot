@@ -7,6 +7,13 @@ import { Check, Loader2, Volume2 } from "lucide-react";
 
 import { api, useStore, type ConfigStatus } from "@/state/store";
 import { speaker } from "@/lib/tts";
+import {
+  ttsElevenLabsKeyPatch,
+  ttsOpenaiCredentialsPatch,
+  ttsOpenaiModelPatch,
+  ttsProviderPatch,
+  ttsVoicePatch,
+} from "@/lib/tts-provider";
 import { cn } from "@/lib/cn";
 
 const SAMPLE = "Morning. Overnight the tests went green, and I left two notes for you in the thread.";
@@ -15,13 +22,29 @@ export function VoiceSettings() {
   const { state, dispatch } = useStore();
   const tts = state.config?.tts;
 
+  const [provider, setProvider] = useState<"elevenlabs" | "openai-compatible">(
+    (tts?.provider as "elevenlabs" | "openai-compatible") ?? "elevenlabs",
+  );
   const [key, setKey] = useState("");
+  const [baseUrl, setBaseUrl] = useState(tts?.baseUrl ?? "");
+  const [model, setModel] = useState(tts?.openaiModel ?? "");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [voices, setVoices] = useState<Array<{ id: string; label: string; description?: string }>>([]);
   const [loadingVoices, setLoadingVoices] = useState(false);
+  const [customVoice, setCustomVoice] = useState(tts?.voice ?? "");
 
   const configured = Boolean(tts?.configured);
+
+  // Update local provider state when config changes
+  useEffect(() => {
+    if (tts?.provider) {
+      setProvider(tts.provider as "elevenlabs" | "openai-compatible");
+    }
+    if (tts?.baseUrl !== undefined) setBaseUrl(tts.baseUrl);
+    if (tts?.voice !== undefined) setCustomVoice(tts.voice);
+    if (tts?.openaiModel !== undefined) setModel(tts.openaiModel);
+  }, [tts?.provider, tts?.baseUrl, tts?.voice, tts?.openaiModel]);
 
   useEffect(() => {
     if (!configured) {
@@ -41,7 +64,7 @@ export function VoiceSettings() {
     return () => {
       alive = false;
     };
-  }, [configured]);
+  }, [configured, tts?.provider]);
 
   const save = (patch: Record<string, unknown>) => {
     setSaving(true);
@@ -57,50 +80,182 @@ export function VoiceSettings() {
 
   if (!tts) return null;
 
+  const saveProvider = (newProvider: "elevenlabs" | "openai-compatible") => {
+    setProvider(newProvider);
+    setError(null);
+    // Provider only — do not send key: "" (that wipes the other provider's secret).
+    void save(ttsProviderPatch(newProvider));
+  };
+
+  const saveCredentials = () => {
+    if (provider === "openai-compatible") {
+      if (!baseUrl.trim()) {
+        setError("Base URL is required for OpenAI-compatible servers.");
+        return;
+      }
+      void save(ttsOpenaiCredentialsPatch(baseUrl || tts.baseUrl || "", key));
+    } else {
+      if (!key.trim()) {
+        setError("ElevenLabs key is required.");
+        return;
+      }
+      void save(ttsElevenLabsKeyPatch(key));
+    }
+  };
+
   return (
     <div className="rounded-xl bg-card p-4">
       <div className="text-[15px] font-medium text-ink">Voice</div>
       <div className="mt-0.5 text-[13px] text-ink-secondary">
-        Read replies aloud and talk to your bots, using your own ElevenLabs account. Billed per character by
-        ElevenLabs.
+        Read replies aloud and talk to your bots. Choose your TTS provider below.
       </div>
 
       <div className="mt-4">
-        <div className="mb-1.5 flex items-center gap-2 text-[13px] text-ink-secondary">
-          <span className={cn("size-1.5 rounded-full", configured ? "bg-success" : "bg-raised-hover")} />
-          <span>ElevenLabs key</span>
-          {configured && <span className="text-[11px] text-success">Connected</span>}
-        </div>
-        <div className="flex gap-2">
-          <input
-            type="password"
-            value={key}
-            onChange={(e) => setKey(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && key.trim() && void save({ key: key.trim() })}
-            placeholder={configured ? "••••••••  (paste to replace)" : "Paste your ElevenLabs API key"}
-            aria-label="ElevenLabs key"
-            autoComplete="off"
-            className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
-          />
-          <button
-            onClick={() => key.trim() && void save({ key: key.trim() })}
-            disabled={saving || !key.trim()}
-            className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
-          </button>
-        </div>
-        {!configured && (
-          <a
-            href="https://elevenlabs.io/app/settings/api-keys"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="mt-1.5 inline-block text-[12px] font-medium text-accent hover:underline"
-          >
-            Get a key from ElevenLabs
-          </a>
-        )}
+        <div className="mb-1.5 text-[13px] text-ink-secondary">Provider</div>
+        <select
+          value={provider}
+          onChange={(e) => saveProvider(e.target.value as "elevenlabs" | "openai-compatible")}
+          aria-label="TTS Provider"
+          className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none"
+        >
+          <option value="elevenlabs">ElevenLabs</option>
+          <option value="openai-compatible">OpenAI-compatible</option>
+        </select>
       </div>
+
+      {provider === "elevenlabs" && (
+        <div className="mt-4">
+          <div className="mb-1.5 flex items-center gap-2 text-[13px] text-ink-secondary">
+            <span className={cn("size-1.5 rounded-full", configured ? "bg-success" : "bg-raised-hover")} />
+            <span>ElevenLabs key</span>
+            {configured && <span className="text-[11px] text-success">Connected</span>}
+          </div>
+          <div className="flex gap-2">
+            <input
+              type="password"
+              value={key}
+              onChange={(e) => setKey(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && key.trim() && saveCredentials()}
+              placeholder={configured ? "••••••••  (paste to replace)" : "Paste your ElevenLabs API key"}
+              aria-label="ElevenLabs key"
+              autoComplete="off"
+              className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+            />
+            <button
+              onClick={saveCredentials}
+              disabled={saving || !key.trim()}
+              className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
+            </button>
+          </div>
+          {!configured && (
+            <a
+              href="https://elevenlabs.io/app/settings/api-keys"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mt-1.5 inline-block text-[12px] font-medium text-accent hover:underline"
+            >
+              Get a key from ElevenLabs
+            </a>
+          )}
+        </div>
+      )}
+
+      {provider === "openai-compatible" && (
+        <>
+          <div className="mt-4">
+            <div className="mb-1.5 flex items-center gap-2 text-[13px] text-ink-secondary">
+              <span className={cn("size-1.5 rounded-full", configured ? "bg-success" : "bg-raised-hover")} />
+              <span>Base URL</span>
+              {configured && <span className="text-[11px] text-success">Connected</span>}
+            </div>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={baseUrl || tts.baseUrl || ""}
+                onChange={(e) => setBaseUrl(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && baseUrl.trim() && saveCredentials()}
+                placeholder="http://127.0.0.1:8880/v1"
+                aria-label="Base URL"
+                autoComplete="off"
+                className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+              />
+              <button
+                onClick={saveCredentials}
+                disabled={saving || !baseUrl.trim()}
+                className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
+              </button>
+            </div>
+            <div className="mt-1.5 text-[12px] text-ink-secondary">
+              For local Kokoro or any OpenAI-compatible TTS server. Example: http://127.0.0.1:8880/v1 for
+              Kokoro-FastAPI.
+            </div>
+          </div>
+          <div className="mt-4">
+            <div className="mb-1.5 text-[13px] text-ink-secondary">Model</div>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && void save(ttsOpenaiModelPatch(model))}
+                placeholder="tts-1 or kokoro"
+                aria-label="Model"
+                autoComplete="off"
+                className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+              />
+              <button
+                onClick={() => void save(ttsOpenaiModelPatch(model))}
+                disabled={saving}
+                className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
+              </button>
+            </div>
+          </div>
+          <div className="mt-4">
+            <div className="mb-1.5 flex items-center gap-2 text-[13px] text-ink-secondary">
+              <span className={cn("size-1.5 rounded-full", tts.openaiKeyConfigured ? "bg-success" : "bg-raised-hover")} />
+              <span>API Key (optional)</span>
+              {tts.openaiKeyConfigured && <span className="text-[11px] text-success">Connected</span>}
+            </div>
+            <div className="flex gap-2">
+              <input
+                type="password"
+                value={key}
+                onChange={(e) => setKey(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && saveCredentials()}
+                placeholder={tts.openaiKeyConfigured ? "••••••••  (paste to replace)" : "Optional for local servers"}
+                aria-label="API Key"
+                autoComplete="off"
+                className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+              />
+              <button
+                onClick={saveCredentials}
+                disabled={saving}
+                className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
+              </button>
+              {tts.openaiKeyConfigured && (
+                <button
+                  onClick={() =>
+                    void save(ttsOpenaiCredentialsPatch(baseUrl || tts.baseUrl || "", "", { clearKey: true }))
+                  }
+                  disabled={saving}
+                  aria-label="Clear API key"
+                  className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+          </div>
+        </>
+      )}
 
       {configured && (
         <div className="mt-4">
@@ -108,7 +263,7 @@ export function VoiceSettings() {
           <div className="flex gap-2">
             <select
               value={tts.voice}
-              onChange={(e) => void save({ voice: e.target.value })}
+              onChange={(e) => void save(ttsVoicePatch(provider, e.target.value))}
               aria-label="Voice"
               className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none"
             >
@@ -119,6 +274,9 @@ export function VoiceSettings() {
                   {v.description ? ` — ${v.description}` : ""}
                 </option>
               ))}
+              {tts.voice && !voices.some((v) => v.id === tts.voice) && (
+                <option value={tts.voice}>Custom — {tts.voice}</option>
+              )}
             </select>
             <button
               onClick={() => void speaker.speak(SAMPLE)}
@@ -128,6 +286,25 @@ export function VoiceSettings() {
               className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Volume2 size={14} /> Try
+            </button>
+          </div>
+          <div className="mt-2 flex gap-2">
+            <input
+              type="text"
+              value={customVoice}
+              onChange={(e) => setCustomVoice(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && customVoice.trim() && void save(ttsVoicePatch(provider, customVoice))}
+              placeholder="Or type a custom voice id"
+              aria-label="Custom voice id"
+              autoComplete="off"
+              className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+            />
+            <button
+              onClick={() => void save(ttsVoicePatch(provider, customVoice))}
+              disabled={saving || !customVoice.trim()}
+              className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
             </button>
           </div>
         </div>

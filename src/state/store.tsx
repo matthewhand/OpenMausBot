@@ -20,6 +20,7 @@ import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib
 import { currentCall } from "@/lib/call";
 import { showNotification } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
+import { botVoiceId } from "@/lib/tts-provider";
 
 export type { MausColor } from "@/lib/mascot";
 
@@ -161,8 +162,10 @@ export interface Bot {
   alwaysAllow?: string[];
   /** speak this bot's replies aloud as they settle */
   speakReplies?: boolean;
-  /** this bot's own voice id (falls back to the app-wide one) */
+  /** this bot's ElevenLabs voice id (falls back to the app-wide one) */
   voice?: string;
+  /** per-bot OpenAI-compatible voice; unused when the app TTS is ElevenLabs */
+  openaiVoice?: string;
   pinned?: boolean;
   hidden?: boolean;
   /** The workspace's one primary coordinator. */
@@ -211,10 +214,20 @@ export interface ConfigStatus {
   composio: { configured: boolean; mode?: "managed" | "self-hosted" | "unavailable" };
   box: { configured: boolean };
   opencodeGo?: { configured: boolean };
-  /** Voice (ElevenLabs). `configured` = a key is saved; `ready` = a key AND
-   * a voice, which is what it takes to actually speak. The key itself is
-   * never echoed back. */
-  tts?: { configured: boolean; ready: boolean; voice: string };
+  /** Voice. Supports ElevenLabs and OpenAI-compatible providers.
+   * `provider` = which provider is selected; `configured` = credentials are
+   * saved; `ready` = credentials AND a voice. Secrets are never echoed back.
+   * `voice` is the active provider's id (the settings select binds to it).
+   * `baseUrl` is echoed for OpenAI-compatible (not a secret). */
+  tts?: {
+    provider: "elevenlabs" | "openai-compatible";
+    configured: boolean;
+    ready: boolean;
+    voice: string;
+    baseUrl: string;
+    openaiKeyConfigured: boolean;
+    openaiModel: string;
+  };
   /** who's using the app — collected in onboarding, shown in the sidebar */
   profile?: { name: string; email: string };
 }
@@ -1294,7 +1307,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               void speaker.speak(frame.message.text, {
                 botId: owner.id,
                 messageId: frame.message.id,
-                voiceId: owner.voice,
+                voiceId: botVoiceId(stateRef.current.config?.tts?.provider, owner),
               });
             }
           }

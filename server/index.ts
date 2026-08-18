@@ -2788,7 +2788,7 @@ const server = createServer(async (req, res) => {
         if (field === "name" && !value.trim()) return json(res, 400, { error: "name must not be empty" });
       }
       const patch: Record<string, unknown> = {};
-      for (const key of ["name", "title", "description", "notifications", "modelSelection", "unread", "computer", "color", "mascotExpression", "pinned", "hidden", "speakReplies", "voice"] as const) {
+      for (const key of ["name", "title", "description", "notifications", "modelSelection", "unread", "computer", "color", "mascotExpression", "pinned", "hidden", "speakReplies", "voice", "openaiVoice"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
       // per-bot gate on the workspace's connected apps (Composio)
@@ -3279,9 +3279,26 @@ const server = createServer(async (req, res) => {
       // patch SELECTS, not the one already saved, or pasting a Cartesia key
       // while switching from ElevenLabs validates against the wrong service
       const newTts = patch.tts;
-      if (newTts?.key?.trim()) {
-        const check = await tts.verifyKey(newTts.key.trim());
-        if (!check.ok) return json(res, 400, { error: check.message });
+      if (newTts) {
+        const provider = newTts.provider ?? cfg.tts?.provider ?? "elevenlabs";
+        // For OpenAI-compatible, verify if baseUrl is provided (key is optional)
+        if (provider === "openai-compatible" && newTts.baseUrl?.trim()) {
+          const check = await tts.verifyKey(
+            (newTts.openaiKey ?? cfg.tts?.openaiKey)?.trim() ?? "",
+            provider,
+            newTts.baseUrl.trim(),
+            {
+              model: newTts.openaiModel ?? cfg.tts?.openaiModel,
+              voice: newTts.openaiVoice ?? cfg.tts?.openaiVoice,
+            },
+          );
+          if (!check.ok) return json(res, 400, { error: check.message });
+        }
+        // For ElevenLabs, verify if key is provided
+        else if (provider === "elevenlabs" && newTts.key?.trim()) {
+          const check = await tts.verifyKey(newTts.key.trim(), provider);
+          if (!check.ok) return json(res, 400, { error: check.message });
+        }
       }
       const externalSecretStorage = url.searchParams.get("secretStorage") === "external";
       if (externalSecretStorage && patch.composio) {
@@ -3319,6 +3336,7 @@ const server = createServer(async (req, res) => {
       return json(res, 200, {
         ready: tts.voiceReady(cfg, typeof body.voiceId === "string" ? body.voiceId : undefined),
         utterances: toUtterances(String(body.text ?? "")),
+        provider: cfg.tts?.provider ?? "elevenlabs",
       });
     }
     if (method === "GET" && path === "/api/tts/voices") {

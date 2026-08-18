@@ -14,6 +14,7 @@ import { cn } from "@/lib/cn";
 import { requestNotificationPermission } from "@/lib/notify";
 import { botUsage, costCaption, formatTokens, formatUsd } from "@/lib/usage";
 import { shortPath } from "@/lib/short-path";
+import { botVoiceId, botVoicePatch, type TtsProvider } from "@/lib/tts-provider";
 
 function Field({
   label,
@@ -332,6 +333,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "autoApprove"
         | "speakReplies"
         | "voice"
+        | "openaiVoice"
         | "chiefOfStaff"
         | "approvePeerComms"
         | "composio"
@@ -339,6 +341,8 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
       >
     >,
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
+  const ttsProvider = (state.config?.tts?.provider as TtsProvider) ?? "elevenlabs";
+  const selectedBotVoice = botVoiceId(ttsProvider, bot) ?? "";
   const activeState = stateForBot(bot);
   const mascotMotion = state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
   const engine = state.instances.find((instance) => instance.instanceId === bot.modelSelection.instanceId);
@@ -362,7 +366,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
     return () => {
       alive = false;
     };
-  }, [state.config?.tts?.configured]);
+  }, [state.config?.tts?.configured, state.config?.tts?.provider, state.config?.tts?.baseUrl]);
 
   return (
     <aside className="animate-panel-in flex h-full w-[400px] shrink-0 flex-col border-l border-hairline/40 bg-panel">
@@ -704,15 +708,15 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                 Use a distinct voice for calls and spoken replies, or inherit the app default
               </div>
               <select
-                value={bot.voice ?? ""}
-                onChange={(e) => patch({ voice: e.target.value })}
+                value={selectedBotVoice}
+                onChange={(e) => patch(botVoicePatch(ttsProvider, e.target.value))}
                 aria-label={`${bot.name}'s voice`}
                 className="mt-3 w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none"
               >
                 <option value="">App default</option>
-                {bot.voice && !voices.some((voice) => voice.id === bot.voice) && (
-                  <option value={bot.voice}>Current bot voice</option>
-                )}
+                {selectedBotVoice && !voices.some((voice) => voice.id === selectedBotVoice) && (
+                    <option value={selectedBotVoice}>Current bot voice</option>
+                  )}
                 {voices.map((voice) => (
                   <option key={voice.id} value={voice.id}>
                     {voice.label}{voice.description ? ` — ${voice.description}` : ""}

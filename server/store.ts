@@ -260,9 +260,12 @@ export interface BotRecord {
    * Off by default: a hosted voice costs money per character, so speaking
    * is something you turn on, never something that happens to you. */
   speakReplies?: boolean;
-  /** This bot's own voice id, so a room of bots doesn't sound like one
-   * person. Falls back to the app-wide voice in config. */
+  /** This bot's own ElevenLabs voice id, so a room of bots doesn't sound
+   * like one person. Falls back to the app-wide voice in config. */
   voice?: string;
+  /** Per-bot OpenAI-compatible voice. Separate from `voice` so switching
+   * the app TTS provider does not send an ElevenLabs id to Kokoro. */
+  openaiVoice?: string;
   /** true after an edit/branch-switch rewound the visible conversation:
    * provider sessions still hold the abandoned branch, so the next turn
    * must start fresh (drop cursors) and replay the surviving path. */

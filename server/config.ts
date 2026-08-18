@@ -28,8 +28,25 @@ const appConfigSchema = z.object({
   box: z.object({ token: optionalText }).optional(),
   /** OpenCode Go key; persisted write-only and passed only to its child. */
   opencodeGo: z.object({ apiKey: optionalText }).optional(),
-  /** Voice credentials and the selected voice id. */
-  tts: z.object({ key: optionalText, voice: optionalText }).optional(),
+  /** Voice. Supports ElevenLabs and OpenAI-compatible servers (Kokoro, etc.).
+   * `provider` defaults to "elevenlabs" for backward compatibility.
+   * `key` is the ElevenLabs credential and is never echoed back; `openaiKey`
+   * is the optional OpenAI-compatible credential. `voice` is the ElevenLabs
+   * voice id; `openaiVoice` is the OpenAI-compatible voice id — switching
+   * provider must not reuse the other id. OpenAI-compatible servers need
+   * `baseUrl` and optionally `openaiKey`. `openaiModel` is the speech model
+   * (defaults to tts-1 at speak/verify time when unset). */
+  tts: z
+    .object({
+      provider: z.enum(["elevenlabs", "openai-compatible"]).optional(),
+      key: optionalText,
+      openaiKey: optionalText,
+      voice: optionalText,
+      openaiVoice: optionalText,
+      openaiModel: optionalText,
+      baseUrl: optionalText,
+    })
+    .optional(),
   /** Non-secret profile details shown in the sidebar. */
   profile: z.object({ name: optionalText, email: optionalText }).optional(),
   instances: instanceConfigMapSchema.optional(),
@@ -42,7 +59,23 @@ export interface AppConfig {
   composio?: { apiKey?: string; userId?: string; sessionId?: string };
   box?: { token?: string };
   opencodeGo?: { apiKey?: string };
-  tts?: { key?: string; voice?: string };
+  /** Voice. Supports ElevenLabs and OpenAI-compatible servers (Kokoro, etc.).
+   * `provider` defaults to "elevenlabs" for backward compatibility.
+   * `key` is the ElevenLabs credential and is never echoed back; `openaiKey`
+   * is the optional OpenAI-compatible credential. `voice` is the ElevenLabs
+   * voice id; `openaiVoice` is the OpenAI-compatible voice id — switching
+   * provider must not reuse the other id. OpenAI-compatible servers need
+   * `baseUrl` and optionally `openaiKey`. `openaiModel` is the speech model
+   * (defaults to tts-1 at speak/verify time when unset). */
+  tts?: {
+    provider?: "elevenlabs" | "openai-compatible";
+    key?: string;
+    openaiKey?: string;
+    voice?: string;
+    openaiVoice?: string;
+    openaiModel?: string;
+    baseUrl?: string;
+  };
   profile?: { name?: string; email?: string };
   instances?: InstanceConfigMap;
 }
@@ -93,7 +126,13 @@ export function loadConfig(): AppConfig {
   if (process.env.COMPOSIO_API_KEY !== undefined) cfg.composio.apiKey = process.env.COMPOSIO_API_KEY;
   cfg.box = { token: process.env.BOX_TOKEN, ...cfg.box };
   cfg.opencodeGo = { apiKey: process.env.OPENCODE_API_KEY, ...cfg.opencodeGo };
-  cfg.tts = { key: process.env.OMB_TTS_KEY, ...cfg.tts };
+  cfg.tts = {
+    provider: process.env.OMB_TTS_PROVIDER as "elevenlabs" | "openai-compatible" | undefined,
+    key: process.env.OMB_TTS_KEY,
+    baseUrl: process.env.OMB_TTS_BASE_URL,
+    openaiModel: process.env.OMB_TTS_OPENAI_MODEL,
+    ...cfg.tts,
+  };
   return cfg;
 }
 

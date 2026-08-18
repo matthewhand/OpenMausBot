@@ -101,6 +101,96 @@ describe("Instance CLI override", () => {
   });
 });
 
+describe("TTS provider configuration", () => {
+  it("accepts an OpenAI-compatible provider and baseUrl", () => {
+    expect(
+      parseStoredConfig({
+        tts: { provider: "openai-compatible", baseUrl: "http://127.0.0.1:9093/v1", voice: "af_heart" },
+      }),
+    ).toEqual({
+      tts: { provider: "openai-compatible", baseUrl: "http://127.0.0.1:9093/v1", voice: "af_heart" },
+    });
+  });
+
+  it("keeps a legacy ElevenLabs config without a provider field", () => {
+    expect(parseStoredConfig({ tts: { key: "el-key", voice: "v-1" } })).toEqual({
+      tts: { key: "el-key", voice: "v-1" },
+    });
+  });
+
+  it("rejects an unknown TTS provider", () => {
+    expect(() => parseConfigPatch({ tts: { provider: "cartesia" } })).toThrow(/provider/);
+  });
+
+  it("keeps the ElevenLabs key next to a separate optional openaiKey", () => {
+    expect(
+      parseStoredConfig({
+        tts: {
+          provider: "openai-compatible",
+          key: "el-key",
+          openaiKey: "sk-local",
+          baseUrl: "http://127.0.0.1:9093/v1",
+        },
+      }),
+    ).toEqual({
+      tts: {
+        provider: "openai-compatible",
+        key: "el-key",
+        openaiKey: "sk-local",
+        baseUrl: "http://127.0.0.1:9093/v1",
+      },
+    });
+  });
+
+  it("accepts openaiVoice next to the ElevenLabs voice id", () => {
+    expect(
+      parseStoredConfig({
+        tts: {
+          provider: "openai-compatible",
+          baseUrl: "http://127.0.0.1:9093/v1",
+          voice: "v-1",
+          openaiVoice: "af_heart",
+        },
+      }),
+    ).toEqual({
+      tts: {
+        provider: "openai-compatible",
+        baseUrl: "http://127.0.0.1:9093/v1",
+        voice: "v-1",
+        openaiVoice: "af_heart",
+      },
+    });
+  });
+
+  it("accepts openaiModel", () => {
+    expect(
+      parseStoredConfig({
+        tts: {
+          provider: "openai-compatible",
+          baseUrl: "http://127.0.0.1:8880/v1",
+          openaiModel: "kokoro",
+        },
+      }),
+    ).toEqual({
+      tts: {
+        provider: "openai-compatible",
+        baseUrl: "http://127.0.0.1:8880/v1",
+        openaiModel: "kokoro",
+      },
+    });
+    expect(parseConfigPatch({ tts: { openaiModel: "tts-1" } })).toEqual({ tts: { openaiModel: "tts-1" } });
+  });
+
+  it("accepts a provider-only patch so a switch cannot wipe credentials or voices", () => {
+    const patch = parseConfigPatch({ tts: { provider: "openai-compatible" } });
+    expect(patch).toEqual({ tts: { provider: "openai-compatible" } });
+    expect(patch.tts).not.toHaveProperty("voice");
+    expect(patch.tts).not.toHaveProperty("openaiVoice");
+    expect(patch.tts).not.toHaveProperty("key");
+    expect(patch.tts).not.toHaveProperty("openaiKey");
+  });
+});
+
 describe("OpenCode Go configuration", () => {
   it("injects the key only into OpenCode Go instances", () => {
     const cfg: AppConfig = {

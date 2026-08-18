@@ -7,28 +7,47 @@ one.
 
 ```
 Renderer (src/)                        Harness (server/)
-├── lib/tts/index.ts   the speaker     ├── tts/speech-text.ts  markdown → speakable
-│     queue · prefetch · interrupt     └── tts/elevenlabs.ts   verify · voices · synthesize
-└── components/CallView.tsx
+├── lib/tts/index.ts   the speaker     ├── tts/speech-text.ts         markdown → speakable
+│     queue · prefetch · interrupt     ├── tts/elevenlabs.ts          verify · voices · synthesize
+└── components/CallView.tsx            └── tts/openai-compatible.ts   OpenAI /audio/speech
       Apple STT endpointing            POST /api/tts/prepare → utterances
                                        POST /api/tts/speak   → mp3 bytes
 ```
 
-One voice provider: **ElevenLabs, bring your own key**. No local model, no
-second provider, no fallback ladder — if there is no key, voice is off and the
-buttons say so.
+Two voice providers: **ElevenLabs** (cloud, high quality) and
+**OpenAI-compatible** (local servers like Kokoro, or any service using the
+OpenAI `/v1/audio/speech` API). Choose in App Settings. No fallback ladder — if
+credentials aren't configured, voice is off and the buttons say so.
 
-## Why the key stays on the harness
+## Why credentials stay on the harness
 
-The renderer never talks to ElevenLabs. `GET /api/config` reports
+The renderer never talks to TTS providers directly. `GET /api/config` reports
 configured-or-not booleans and nothing else, which is the same rule every other
 credential follows, and it is worth more than a saved round trip. So the app
-asks the harness for audio and the harness holds the key.
+asks the harness for audio and the harness holds the secrets.
 
 Two states worth distinguishing, because they need different instructions:
-`configured` (a key is saved) and `ready` (a key *and* a chosen voice). Speaking
-without either throws `NoVoiceConfigured`, which the route turns into a 409 —
-"you haven't set this up" is not a provider failure and should not look like one.
+`configured` (credentials are saved) and `ready` (credentials *and* a chosen
+voice). Speaking without either throws `NoVoiceConfigured`, which the route
+turns into a 409 — "you haven't set this up" is not a provider failure and
+should not look like one.
+
+For **ElevenLabs**: `configured` means a key is saved; `ready` means key + voice.
+
+For **OpenAI-compatible**: `configured` means a base URL is saved (`openaiKey` is
+optional for local unauthenticated servers like Kokoro); `ready` means base URL
++ voice. The ElevenLabs `key` and the OpenAI-compatible `openaiKey` are stored
+separately. Switching the provider dropdown must not wipe or send the other
+provider's secret.
+
+Voice ids are per provider too: `tts.voice` is ElevenLabs and `tts.openaiVoice`
+is OpenAI-compatible. Switching the dropdown keeps both ids and uses only the
+active one — an ElevenLabs id is not valid on Kokoro and vice versa. App
+Settings binds the voice select to the active id, and a text field next to it
+saves a custom id. If that id is not in the listed voices, it stays visible as
+a custom option with the field filled. OpenAI-compatible also has
+`tts.openaiModel` (placeholder `tts-1` or `kokoro`; speak/verify default to
+`tts-1` when unset).
 
 ## The spoken register
 
@@ -80,14 +99,44 @@ voice choice is a quality decision, not a latency one. The way to make a call
 feel conversational is to put the bot you call on a fast model and let it
 delegate real work to specialists over `ask_bot` — no new machinery required.
 
-## Rejected
+## OpenAI-compatible provider
+
+The **OpenAI-compatible** provider talks to any server that implements the
+OpenAI `/v1/audio/speech` endpoint. Common use cases:
+
+- **Local Kokoro** (Kokoro-FastAPI running in Docker on the same machine)
+- **LiteLLM** (proxy to multiple TTS backends)
+- **Real OpenAI** (for users who already have OpenAI credits)
+
+The key is **optional** — local unauthenticated servers like Kokoro need none.
+When a key is provided, it's sent as `Authorization: Bearer <key>`. The
+settings panel reports `openaiKeyConfigured` (never the secret) and can
+explicitly clear a saved key.
+
+There is no silent default base URL. The UI example is
+`http://127.0.0.1:8880/v1` for Kokoro-FastAPI; point it at LiteLLM, a local
+proxy, or `https://api.openai.com/v1` as needed.
+
+The speech model is `tts.openaiModel` (e.g. `tts-1`, `kokoro`). Speak and
+verify POST `{ model, input, voice, response_format: "mp3" }` using the saved
+model and the per-provider voice; unset model defaults to `tts-1` so real
+OpenAI still works.
+
+Voice lists try `{baseUrl}/audio/voices` then `{baseUrl}/voices`. If both
+miss, `api.openai.com` gets the OpenAI built-ins (alloy, echo, fable, onyx,
+nova, shimmer, ash, coral, sage); anything else gets the Kokoro-style
+fallback. Users can type a custom voice id in the field under the voice
+select; Save writes `openaiVoice` (or `voice` on ElevenLabs). A saved id that
+is not in the list remains selected as a custom option.
+
+## Rejected alternatives
 
 | Option | Why not |
 | --- | --- |
 | OS voices (macOS/Windows) | Audibly synthetic; would cheapen the feature |
 | Piper | Same complaint, one tier up |
-| Kokoro-82M in the renderer | Genuinely good and free, but it is a second provider, a 2.2MB chunk, an ONNX runtime and a first-run model download. Simplicity won. |
-| Cartesia | Cheaper and faster to first byte, but a second provider earns its keep only once one is not enough |
+| Kokoro-82M in the renderer | Genuinely good and free, but embedding it means a 2.2MB chunk, an ONNX runtime, and a first-run model download. The OpenAI-compatible provider gives the same result with less complexity: users run Kokoro-FastAPI in Docker and this app talks to it over HTTP. |
+| Cartesia as a third provider | Was cheaper and faster to first byte in 2025, but a third provider earns its keep only when two isn't enough |
 | ElevenLabs Agents | Its custom-LLM `cascade_timeout_seconds` maxes at 15s and agent turns exceed that; it also wants to own turn-taking and tool calls, which is what the harness owns |
 | OpenAI Realtime / Gemini Live (speech-to-speech) | They replace the brain, and the brain being Claude Code on your own machine *is* the product |
 
