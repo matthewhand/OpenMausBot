@@ -29,9 +29,12 @@ export function SpeakButton({
   const ready = Boolean(state.config?.tts?.ready);
   const mine = speech.messageId === messageId && speech.status !== "idle";
   const preparing = mine && speech.status === "preparing";
+  const openai = state.config?.tts?.provider === "openai-compatible";
 
   const label = !ready
-    ? "Add an ElevenLabs key in App Settings to read messages aloud"
+    ? openai
+      ? "Add a base URL and pick a voice in App Settings"
+      : "Add an ElevenLabs key in App Settings to read messages aloud"
     : mine
       ? "Stop speaking"
       : "Read this aloud";

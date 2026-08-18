@@ -67,6 +67,7 @@ export function CallTargetButton({
   const active = useOnCall() === targetId;
   const supported = capabilities.dictation.available && Boolean(window.ogb?.speechStart);
   const configured = Boolean(state.config?.tts?.configured);
+  const openai = state.config?.tts?.provider === "openai-compatible";
   const voiceReady =
     configured && Boolean(state.config?.tts?.ready || (voices.length > 0 && voices.every((voice) => Boolean(voice))));
   const unavailable = !active && (!capabilitiesReady || !supported || !voiceReady);
@@ -82,7 +83,9 @@ export function CallTargetButton({
       : !supported
         ? "Calls currently need the macOS desktop app"
         : !configured
-          ? "Add an ElevenLabs key in App Settings to make calls"
+          ? openai
+            ? "Add a base URL and pick a voice in App Settings"
+            : "Add an ElevenLabs key in App Settings to make calls"
           : !voiceReady
             ? "Pick a voice in App Settings to make calls"
             : `Call ${targetName}`;
@@ -94,11 +97,17 @@ export function CallTargetButton({
       : !window.ogb?.speechStart
         ? "The speech service is unavailable in this app build. Restart or update OpenMausBot."
         : !configured
-          ? "Add an ElevenLabs API key so the bot can speak during calls."
+          ? openai
+            ? "Add a base URL and pick a voice in App Settings"
+            : "Add an ElevenLabs API key so the bot can speak during calls."
           : !voiceReady
             ? voices.length > 1
-              ? "Choose an app voice, or give every room member their own ElevenLabs voice."
-              : "Choose an ElevenLabs voice before starting a call."
+              ? openai
+                ? "Choose an app voice, or give every room member their own voice."
+                : "Choose an app voice, or give every room member their own ElevenLabs voice."
+              : openai
+                ? "Choose a voice before starting a call."
+                : "Choose an ElevenLabs voice before starting a call."
             : "";
 
   useEffect(() => {

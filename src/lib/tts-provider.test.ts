@@ -4,6 +4,7 @@ import {
   ttsActiveVoice,
   ttsElevenLabsKeyPatch,
   ttsOpenaiCredentialsPatch,
+  ttsOpenaiModelPatch,
   ttsProviderPatch,
   ttsVoicePatch,
 } from "./tts-provider";
@@ -27,6 +28,20 @@ describe("ttsOpenaiCredentialsPatch", () => {
       baseUrl: "http://127.0.0.1:9093/v1",
     });
     expect(ttsOpenaiCredentialsPatch("http://127.0.0.1:9093/v1", "")).not.toHaveProperty("key");
+    expect(ttsOpenaiCredentialsPatch("http://127.0.0.1:9093/v1", "")).not.toHaveProperty("openaiKey");
+  });
+
+  it("sends openaiKey: \"\" when clearKey is set", () => {
+    expect(ttsOpenaiCredentialsPatch("http://127.0.0.1:8880/v1", "", { clearKey: true })).toEqual({
+      baseUrl: "http://127.0.0.1:8880/v1",
+      openaiKey: "",
+    });
+  });
+});
+
+describe("ttsOpenaiModelPatch", () => {
+  it("trims the model id", () => {
+    expect(ttsOpenaiModelPatch(" kokoro ")).toEqual({ openaiModel: "kokoro" });
   });
 });
 

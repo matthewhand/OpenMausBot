@@ -34,7 +34,8 @@ const appConfigSchema = z.object({
    * is the optional OpenAI-compatible credential. `voice` is the ElevenLabs
    * voice id; `openaiVoice` is the OpenAI-compatible voice id — switching
    * provider must not reuse the other id. OpenAI-compatible servers need
-   * `baseUrl` and optionally `openaiKey`. */
+   * `baseUrl` and optionally `openaiKey`. `openaiModel` is the speech model
+   * (defaults to tts-1 at speak/verify time when unset). */
   tts: z
     .object({
       provider: z.enum(["elevenlabs", "openai-compatible"]).optional(),
@@ -42,6 +43,7 @@ const appConfigSchema = z.object({
       openaiKey: optionalText,
       voice: optionalText,
       openaiVoice: optionalText,
+      openaiModel: optionalText,
       baseUrl: optionalText,
     })
     .optional(),
@@ -63,13 +65,15 @@ export interface AppConfig {
    * is the optional OpenAI-compatible credential. `voice` is the ElevenLabs
    * voice id; `openaiVoice` is the OpenAI-compatible voice id — switching
    * provider must not reuse the other id. OpenAI-compatible servers need
-   * `baseUrl` and optionally `openaiKey`. */
+   * `baseUrl` and optionally `openaiKey`. `openaiModel` is the speech model
+   * (defaults to tts-1 at speak/verify time when unset). */
   tts?: {
     provider?: "elevenlabs" | "openai-compatible";
     key?: string;
     openaiKey?: string;
     voice?: string;
     openaiVoice?: string;
+    openaiModel?: string;
     baseUrl?: string;
   };
   profile?: { name?: string; email?: string };
@@ -126,6 +130,7 @@ export function loadConfig(): AppConfig {
     provider: process.env.OMB_TTS_PROVIDER as "elevenlabs" | "openai-compatible" | undefined,
     key: process.env.OMB_TTS_KEY,
     baseUrl: process.env.OMB_TTS_BASE_URL,
+    openaiModel: process.env.OMB_TTS_OPENAI_MODEL,
     ...cfg.tts,
   };
   return cfg;

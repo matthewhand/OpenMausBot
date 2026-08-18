@@ -3283,7 +3283,15 @@ const server = createServer(async (req, res) => {
         const provider = newTts.provider ?? cfg.tts?.provider ?? "elevenlabs";
         // For OpenAI-compatible, verify if baseUrl is provided (key is optional)
         if (provider === "openai-compatible" && newTts.baseUrl?.trim()) {
-          const check = await tts.verifyKey(newTts.openaiKey?.trim() ?? "", provider, newTts.baseUrl.trim());
+          const check = await tts.verifyKey(
+            (newTts.openaiKey ?? cfg.tts?.openaiKey)?.trim() ?? "",
+            provider,
+            newTts.baseUrl.trim(),
+            {
+              model: newTts.openaiModel ?? cfg.tts?.openaiModel,
+              voice: newTts.openaiVoice ?? cfg.tts?.openaiVoice,
+            },
+          );
           if (!check.ok) return json(res, 400, { error: check.message });
         }
         // For ElevenLabs, verify if key is provided
@@ -3328,6 +3336,7 @@ const server = createServer(async (req, res) => {
       return json(res, 200, {
         ready: tts.voiceReady(cfg, typeof body.voiceId === "string" ? body.voiceId : undefined),
         utterances: toUtterances(String(body.text ?? "")),
+        provider: cfg.tts?.provider ?? "elevenlabs",
       });
     }
     if (method === "GET" && path === "/api/tts/voices") {

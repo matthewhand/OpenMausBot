@@ -69,15 +69,22 @@ export function describeVoice(cfg: AppConfig) {
     ready: voiceConfigured(cfg),
     voice: configuredVoice(cfg) ?? "",
     baseUrl: cfg.tts?.baseUrl ?? "",
+    openaiKeyConfigured: Boolean(cfg.tts?.openaiKey?.trim()),
+    openaiModel: cfg.tts?.openaiModel ?? "",
   };
 }
 
-export function verifyKey(key: string, provider: "elevenlabs" | "openai-compatible", baseUrl?: string) {
+export function verifyKey(
+  key: string,
+  provider: "elevenlabs" | "openai-compatible",
+  baseUrl?: string,
+  opts?: { model?: string; voice?: string },
+) {
   if (provider === "openai-compatible") {
     if (!baseUrl) {
       return Promise.resolve({ ok: false, message: "Base URL is required for OpenAI-compatible servers." } as const);
     }
-    return openaiCompatible.verifyKey(baseUrl, key || undefined);
+    return openaiCompatible.verifyKey(baseUrl, key || undefined, opts);
   }
   return elevenlabs.verifyKey(key);
 }
@@ -107,9 +114,11 @@ export function speak(cfg: AppConfig, text: string, voiceId?: string) {
   if (provider === "openai-compatible") {
     const baseUrl = cfg.tts?.baseUrl;
     if (!baseUrl) throw new NoVoiceConfigured("baseUrl", provider);
+    // Per-bot voiceId wins when provided; leftover ElevenLabs `voice` is
+    // never read — only openaiVoice is the app-wide fallback.
     const voice = voiceId || cfg.tts?.openaiVoice;
     if (!voice) throw new NoVoiceConfigured("voice", provider);
-    return openaiCompatible.synthesize(text, voice, baseUrl, openaiAuthKey(cfg));
+    return openaiCompatible.synthesize(text, voice, baseUrl, openaiAuthKey(cfg), cfg.tts?.openaiModel);
   }
 
   // ElevenLabs: check key first, then voice (matches the original behavior)

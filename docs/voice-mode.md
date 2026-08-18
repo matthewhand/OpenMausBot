@@ -7,9 +7,9 @@ one.
 
 ```
 Renderer (src/)                        Harness (server/)
-├── lib/tts/index.ts   the speaker     ├── tts/speech-text.ts  markdown → speakable
-│     queue · prefetch · interrupt     └── tts/elevenlabs.ts   verify · voices · synthesize
-└── components/CallView.tsx
+├── lib/tts/index.ts   the speaker     ├── tts/speech-text.ts         markdown → speakable
+│     queue · prefetch · interrupt     ├── tts/elevenlabs.ts          verify · voices · synthesize
+└── components/CallView.tsx            └── tts/openai-compatible.ts   OpenAI /audio/speech
       Apple STT endpointing            POST /api/tts/prepare → utterances
                                        POST /api/tts/speak   → mp3 bytes
 ```
@@ -45,7 +45,9 @@ is OpenAI-compatible. Switching the dropdown keeps both ids and uses only the
 active one — an ElevenLabs id is not valid on Kokoro and vice versa. App
 Settings binds the voice select to the active id, and a text field next to it
 saves a custom id. If that id is not in the listed voices, it stays visible as
-a custom option with the field filled.
+a custom option with the field filled. OpenAI-compatible also has
+`tts.openaiModel` (placeholder `tts-1` or `kokoro`; speak/verify default to
+`tts-1` when unset).
 
 ## The spoken register
 
@@ -107,15 +109,23 @@ OpenAI `/v1/audio/speech` endpoint. Common use cases:
 - **Real OpenAI** (for users who already have OpenAI credits)
 
 The key is **optional** — local unauthenticated servers like Kokoro need none.
-When a key is provided, it's sent as `Authorization: Bearer <key>`.
+When a key is provided, it's sent as `Authorization: Bearer <key>`. The
+settings panel reports `openaiKeyConfigured` (never the secret) and can
+explicitly clear a saved key.
 
-The base URL defaults to `http://127.0.0.1:9093/v1` in the UI (common local
-Kokoro setup on Windows/Mac). Users can override it for cloud or different
-ports.
+There is no silent default base URL. The UI example is
+`http://127.0.0.1:8880/v1` for Kokoro-FastAPI; point it at LiteLLM, a local
+proxy, or `https://api.openai.com/v1` as needed.
 
-Voice lists come from the server's `/voices` endpoint when available. If the
-server doesn't expose that endpoint, a fallback list of common Kokoro voices
-is shown. Users can type a custom voice id in the field under the voice
+The speech model is `tts.openaiModel` (e.g. `tts-1`, `kokoro`). Speak and
+verify POST `{ model, input, voice, response_format: "mp3" }` using the saved
+model and the per-provider voice; unset model defaults to `tts-1` so real
+OpenAI still works.
+
+Voice lists try `{baseUrl}/audio/voices` then `{baseUrl}/voices`. If both
+miss, `api.openai.com` gets the OpenAI built-ins (alloy, echo, fable, onyx,
+nova, shimmer, ash, coral, sage); anything else gets the Kokoro-style
+fallback. Users can type a custom voice id in the field under the voice
 select; Save writes `openaiVoice` (or `voice` on ElevenLabs). A saved id that
 is not in the list remains selected as a custom option.
 

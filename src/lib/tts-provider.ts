@@ -29,12 +29,19 @@ export function ttsActiveVoice(
 }
 
 /** OpenAI-compatible saves its own optional key. An empty field is omitted so
- *  a leftover ElevenLabs `key` (and a previously saved `openaiKey`) stay put. */
+ *  a leftover ElevenLabs `key` (and a previously saved `openaiKey`) stay put.
+ *  Pass `clearKey` to persist `openaiKey: ""` and drop the saved key. */
 export function ttsOpenaiCredentialsPatch(
   baseUrl: string,
   key: string,
+  opts?: { clearKey?: boolean },
 ): { baseUrl: string; openaiKey?: string } {
   const patch: { baseUrl: string; openaiKey?: string } = { baseUrl: baseUrl.trim() };
-  if (key.trim()) patch.openaiKey = key.trim();
+  if (opts?.clearKey) patch.openaiKey = "";
+  else if (key.trim()) patch.openaiKey = key.trim();
   return patch;
+}
+
+export function ttsOpenaiModelPatch(model: string): { openaiModel: string } {
+  return { openaiModel: model.trim() };
 }

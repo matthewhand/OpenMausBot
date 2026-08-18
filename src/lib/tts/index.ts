@@ -32,7 +32,7 @@ interface SpeakOptions {
   messageId?: string;
 }
 
-type TtsPrepareBody = { ready?: boolean; utterances?: string[]; error?: string };
+type TtsPrepareBody = { ready?: boolean; utterances?: string[]; error?: string; provider?: string };
 type TtsErrorBody = { error?: string };
 
 const IDLE: SpeechSnapshot = { status: "idle" };
@@ -167,7 +167,13 @@ export class Speaker {
     });
     const body: TtsPrepareBody = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error ?? `the voice service returned ${res.status}`);
-    if (!body.ready) throw new Error("Add an ElevenLabs key and pick a voice in App Settings to turn on voice.");
+    if (!body.ready) {
+      throw new Error(
+        body.provider === "openai-compatible"
+          ? "Add a base URL and pick a voice in App Settings"
+          : "Add an ElevenLabs key and pick a voice in App Settings to turn on voice.",
+      );
+    }
     return body.utterances ?? [];
   }
 
