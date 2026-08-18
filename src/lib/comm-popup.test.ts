@@ -28,4 +28,19 @@ describe("commPopupMessages", () => {
       "textlooks good",
     ]);
   });
+
+  it("drops permission cards, connector rows, and nameless activity", () => {
+    const kept = commPopupMessages([
+      msg({ kind: "options", card: { requestId: "r1", tool: "Write" } as Message["card"] }),
+      msg({ kind: "connector", connector: { provider: "github" } as Message["connector"] }),
+      msg({ kind: "activity" }),
+      msg({ kind: "activity", tool: { name: "", ok: true } }),
+      msg({ kind: "activity", tool: { name: "failed turn", ok: false } }),
+    ]);
+    expect(kept.map((m) => m.tool?.name)).toEqual(["failed turn"]);
+  });
+
+  it("returns an empty list for an empty thread", () => {
+    expect(commPopupMessages([])).toEqual([]);
+  });
 });
