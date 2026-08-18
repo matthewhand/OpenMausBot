@@ -479,13 +479,19 @@ export function ComputerPanel({
   useEffect(() => {
     if (phase !== "ready" || sseFlowing || viewerOpen || !pageVisible) return;
     let alive = true;
+    let controller: AbortController | undefined;
     const shoot = async () => {
       if (inFlight.current) return;
       inFlight.current = true;
+      controller = new AbortController();
       try {
-        const { png, format } = await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" });
+        const { png, format } = await api(`/api/bots/${bot.id}/computer/screenshot`, {
+          method: "POST",
+          signal: controller.signal,
+        });
         if (alive) setPolledFrame({ png, mime: format === "jpeg" ? "image/jpeg" : "image/png" });
-      } catch {
+      } catch (e) {
+        if (e instanceof DOMException && e.name === "AbortError") return;
         /* box mid-command or asleep — next tick */
       } finally {
         inFlight.current = false;
@@ -495,6 +501,7 @@ export function ComputerPanel({
     const timer = setInterval(shoot, bot.busy ? 4000 : 30_000);
     return () => {
       alive = false;
+      controller?.abort();
       clearInterval(timer);
     };
   }, [phase, sseFlowing, bot.id, viewerOpen, pageVisible, bot.busy]);
@@ -505,13 +512,16 @@ export function ComputerPanel({
   useEffect(() => {
     if (phase !== "vm" || viewerOpen || !pageVisible) return;
     let alive = true;
+    let controller: AbortController | undefined;
     const shoot = async () => {
       if (vmInFlight.current) return;
       vmInFlight.current = true;
+      controller = new AbortController();
       try {
         const { image } = await api(`/api/bots/${bot.id}/local-computer/screenshot`, { method: "POST" });
         if (alive && typeof image === "string") setVmFrame(image);
       } catch (e) {
+        if (e instanceof DOMException && e.name === "AbortError") return;
         if (alive) setError(e instanceof Error ? e.message : String(e));
       } finally {
         vmInFlight.current = false;
@@ -521,6 +531,7 @@ export function ComputerPanel({
     const timer = window.setInterval(() => void shoot(), bot.busy ? 3000 : 30_000);
     return () => {
       alive = false;
+      controller?.abort();
       window.clearInterval(timer);
     };
   }, [phase, bot.id, viewerOpen, pageVisible, bot.busy]);
@@ -558,7 +569,7 @@ export function ComputerPanel({
     live ??
     polledFrame ??
     (lastScreenMessage ? { png: lastScreenMessage.png!, mime: lastScreenMessage.mime ?? "image/png" } : null);
-  const frameSrc =
+  const previewSrc =
     phase === "vm"
       ? vmFrame
       : phase === "local" && !isLinux
