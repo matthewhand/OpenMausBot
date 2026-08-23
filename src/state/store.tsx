@@ -718,6 +718,7 @@ export function reducer(state: AppState, action: Action): AppState {
           groups: action.groups,
           computerControl: action.computerControl,
           selectedId,
+          unauthorized: false,
         },
         [...action.bots, ...action.groups],
       );

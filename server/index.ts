@@ -156,6 +156,7 @@ import {
 } from "./skills.ts";
 import { fetchSkillFromSource } from "./skill-fetch.ts";
 import { readCuaConnection } from "./local-computer.ts";
+import { isLoopbackBindHost, lanBindAllowed } from "./lan-bind.ts";
 import { LocalVmIdleTimer } from "./local-vm-idle.ts";
 import { LocalVmLease, LocalVmLeasePool } from "./local-vm-lease.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
