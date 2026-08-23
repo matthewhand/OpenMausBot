@@ -243,10 +243,14 @@ const appConfigSchema = z.object({
   vps: vpsConfigSchema.optional(),
   /** Optional OpenCode key; persisted write-only and passed only to its child. */
   opencodeGo: z.object({ apiKey: optionalText }).optional(),
-  /** Voice credentials and the selected voice id. `provider` picks the
-   * engine: "elevenlabs" (default; needs a key), "system" (the Mac's
-   * built-in voices, no key), or "openai-compatible" (Kokoro-style
-   * servers; needs a base URL, key optional). */
+  /** Voice. ElevenLabs (default; needs a key), system (Mac built-in voices),
+   * or OpenAI-compatible servers (Kokoro, etc.). `key` is the ElevenLabs
+   * credential and is never echoed back; `openaiKey` is the optional
+   * OpenAI-compatible credential. `voice` is the ElevenLabs / system voice
+   * id; `openaiVoice` is the OpenAI-compatible voice id — switching
+   * provider must not reuse the other id. OpenAI-compatible servers need
+   * `baseUrl` and optionally `openaiKey`. `openaiModel` is the speech model
+   * (defaults to tts-1 at speak/verify time when unset). */
   tts: z
     .object({
       key: optionalText,
@@ -485,7 +489,12 @@ export function loadConfig(): AppConfig {
   cfg.opencodeGo = { ...cfg.opencodeGo };
   if (process.env.OPENCODE_API_KEY !== undefined) cfg.opencodeGo.apiKey = process.env.OPENCODE_API_KEY;
   cfg.tts = { ...cfg.tts };
+  if (process.env.OMB_TTS_PROVIDER !== undefined)
+    cfg.tts.provider = process.env.OMB_TTS_PROVIDER as "elevenlabs" | "system" | "openai-compatible";
   if (process.env.OMB_TTS_KEY !== undefined) cfg.tts.key = process.env.OMB_TTS_KEY;
+  if (process.env.OMB_TTS_BASE_URL !== undefined) cfg.tts.baseUrl = process.env.OMB_TTS_BASE_URL;
+  if (process.env.OMB_TTS_OPENAI_MODEL !== undefined)
+    cfg.tts.openaiModel = process.env.OMB_TTS_OPENAI_MODEL;
   cfg.imageGen = { ...cfg.imageGen };
   if (process.env.OMB_OPENAI_IMAGE_KEY !== undefined) cfg.imageGen.key = process.env.OMB_OPENAI_IMAGE_KEY;
   return cfg;
