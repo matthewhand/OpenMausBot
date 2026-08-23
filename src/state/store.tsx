@@ -299,6 +299,14 @@ export interface ConfigStatus {
   imageGen?: { configured: boolean };
   /** who's using the app — collected in onboarding, shown in the sidebar */
   profile?: { name: string; email: string };
+  /** Custom remote MCP servers: names, urls, and enabled state. Headers are write-only. */
+  mcpServers?: Array<{
+    name: string;
+    transport: "http" | "sse";
+    url: string;
+    enabled: boolean;
+    hasHeaders: boolean;
+  }>;
   /** Opt-in flags. Absent means off. */
   features?: { skillRecorder: boolean; showToolCalls?: boolean; browser?: boolean };
   /** Named browser sessions any bot can be pointed at. */

@@ -11,6 +11,7 @@ import {
   loadConfig,
   localVmMaxInstances,
   localVmMode,
+  mergeMcpServers,
   parseConfigPatch,
   parseStoredConfig,
   roomTurnTimeoutMinutes,
