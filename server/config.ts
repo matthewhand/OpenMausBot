@@ -13,6 +13,11 @@ import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schem
 const optionalText = z.string().optional();
 const SSH_ALIAS = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
+/** Names the harness already mounts (agents proxy, computer, Composio, dweb,
+ *  permission broker). A user server with one of these would overwrite the
+ *  built-in and break comms or computer-use. */
+export const RESERVED_MCP_NAMES = new Set(["agents", "computer", "composio", "dweb", "ogb"]);
+
 export const DEFAULT_ROOM_TURN_TIMEOUT_MINUTES = 5;
 export const MIN_ROOM_TURN_TIMEOUT_MINUTES = 1;
 export const MAX_ROOM_TURN_TIMEOUT_MINUTES = 1_440;
@@ -89,6 +94,41 @@ const appConfigSchema = z.object({
   imageGen: z.object({ key: optionalText }).optional(),
   /** Non-secret profile details shown in the sidebar. */
   profile: z.object({ name: optionalText, email: optionalText }).optional(),
+  /** Custom remote MCP servers. Headers are write-only like other secrets. */
+  mcpServers: z
+    .array(
+      z.object({
+        name: z.string().regex(/^[\w-]+$/, "letters, numbers, dash, and underscore only"),
+        transport: z.enum(["http", "sse"]),
+        url: z
+          .string()
+          .url()
+          .refine((u) => /^https?:\/\//i.test(u), "must be an http(s) URL"),
+        headers: z.record(z.string(), z.string()).optional(),
+        enabled: z.boolean().optional(),
+      }),
+    )
+    .superRefine((servers, ctx) => {
+      const seen = new Set<string>();
+      for (const [i, server] of servers.entries()) {
+        if (RESERVED_MCP_NAMES.has(server.name)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [i, "name"],
+            message: `"${server.name}" is reserved`,
+          });
+        }
+        if (seen.has(server.name)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [i, "name"],
+            message: "duplicate server name",
+          });
+        }
+        seen.add(server.name);
+      }
+    })
+    .optional(),
   rooms: roomConfigSchema.optional(),
   localVm: localVmConfigSchema.optional(),
   features: featureConfigSchema.optional(),
@@ -124,6 +164,9 @@ export interface AppConfig {
   localVm?: { mode?: "shared" | "per-bot"; maxInstances?: number };
   /** Opt-in product experiments. Every flag defaults to disabled. */
   features?: { skillRecorder?: boolean };
+  /** Custom remote MCP servers: user-configured HTTP or SSE servers. Persisted
+   * in ~/.openmausbot/config.json; headers are write-only like other secrets. */
+  mcpServers?: McpServer[];
   instances?: InstanceConfigMap;
 }
 export type ConfigPatch = z.output<typeof appConfigPatchSchema>;

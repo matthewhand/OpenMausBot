@@ -7,6 +7,7 @@ import {
   DATA_DIR,
   instanceConfigs,
   isValidSshAlias,
+  mergeMcpServers,
   loadConfig,
   localVmMaxInstances,
   localVmMode,

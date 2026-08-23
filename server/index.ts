@@ -2346,6 +2346,15 @@ function configStatus() {
     imageGen: { configured: Boolean(cfg.imageGen?.key) },
     // not a secret — the sidebar shows it
     profile: { name: cfg.profile?.name ?? "", email: cfg.profile?.email ?? "" },
+    // custom MCP servers: names, urls, and enabled state are echoed back;
+    // headers are write-only like other secrets
+    mcpServers: (cfg.mcpServers ?? []).map((s) => ({
+      name: s.name,
+      transport: s.transport,
+      url: s.url,
+      enabled: s.enabled ?? true,
+      hasHeaders: Boolean(s.headers && Object.keys(s.headers).length),
+    })),
     rooms: { turnTimeoutMinutes: roomTurnTimeoutMinutes(cfg) },
     localVm: {
       mode: localVmMode(cfg),
