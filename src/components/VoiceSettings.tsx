@@ -1,15 +1,25 @@
-// Voice, in App Settings. One key, one voice list, one Try button.
+// Per-agent voice profile. The key is shared; the voice and autoplay choice
+// belong to the selected bot.
+//
+// TTS itself is ElevenLabs or any OpenAI-compatible speech server — pick the
+// provider below; base URL and model are app-wide settings next to the key.
 //
 // The voice list comes from the harness, which holds the key — the
 // renderer never talks to ElevenLabs itself.
 import { useEffect, useState } from "react";
 import { Check, Loader2, Volume2 } from "lucide-react";
 
-import { api, useStore, type ConfigStatus } from "@/state/store";
+import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { speaker, SAMPLE } from "@/lib/tts";
 import { cn } from "@/lib/cn";
 
-export function VoiceSettings() {
+export function VoiceSettings({
+  bot,
+  onPatch,
+}: {
+  bot: Bot;
+  onPatch: (patch: Partial<Pick<Bot, "voice" | "speakReplies">>) => void;
+}) {
   const { state, dispatch } = useStore();
   const tts = state.config?.tts;
 
@@ -45,7 +55,7 @@ export function VoiceSettings() {
     setAuditioningVoiceId(target);
     setError(null);
     try {
-      await speaker.speak(SAMPLE, target);
+      await speaker.speak(SAMPLE, { voiceId: target, botId: bot.id });
       if (speaker.state.error) {
         setError(speaker.state.error);
       }
@@ -108,6 +118,29 @@ export function VoiceSettings() {
     void save(newProvider === "openai-compatible" ? { provider: newProvider, key: "" } : { provider: newProvider });
   };
 
+  // Desktop builds keep credentials in OS storage; the config API is the
+  // fallback everywhere else.
+  const saveElevenLabsKey = () => {
+    const nextKey = key.trim();
+    if (!nextKey) return Promise.resolve();
+    if (window.ogb?.setCredential) {
+      setSaving(true);
+      setError(null);
+      setSaved(false);
+      return window.ogb
+        .setCredential("ttsKey", nextKey)
+        .then((status: ConfigStatus) => {
+          dispatch({ type: "configStatus", config: status });
+          setKey("");
+          setSaved(true);
+          window.setTimeout(() => setSaved(false), 2500);
+        })
+        .catch((e: Error) => setError(e.message))
+        .finally(() => setSaving(false));
+    }
+    return save({ key: nextKey });
+  };
+
   const saveCredentials = () => {
     if (provider === "openai-compatible") {
       const trimmedUrl = (baseUrl || tts.baseUrl || "").trim();
@@ -123,14 +156,13 @@ export function VoiceSettings() {
         patch.key = key.trim();
       }
       void save(patch);
-    } else {
-      if (!key.trim()) {
-        setError("ElevenLabs key is required.");
-        return;
-      }
-      void save({ key: key.trim() });
+      return;
     }
+    void saveElevenLabsKey();
   };
+
+  const selectedVoice = bot.voice ?? "";
+  const ready = configured && Boolean(selectedVoice || tts.voice);
 
   return (
     <div className="rounded-xl bg-card p-4">
@@ -262,12 +294,21 @@ export function VoiceSettings() {
           <div className="mb-1.5 text-[13px] text-ink-secondary">Voice</div>
           <div className="flex gap-2">
             <select
-              value={tts.voice}
-              onChange={(e) => void save({ voice: e.target.value })}
-              aria-label="Voice"
+              value={selectedVoice}
+              onChange={(e) => onPatch({ voice: e.target.value })}
+              aria-label={`${bot.name}'s voice`}
               className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none"
             >
-              <option value="">{loadingVoices ? "Loading voices…" : "Pick a voice"}</option>
+              <option value="">
+                {loadingVoices
+                  ? "Loading voices…"
+                  : tts.voice
+                    ? "Workspace default"
+                    : "Pick a voice"}
+              </option>
+              {selectedVoice && !voices.some((voice) => voice.id === selectedVoice) && (
+                <option value={selectedVoice}>Current agent voice</option>
+              )}
               {voices.map((v) => (
                 <option key={v.id} value={v.id}>
                   {v.label}
@@ -276,11 +317,11 @@ export function VoiceSettings() {
               ))}
             </select>
             <button
-              onClick={() => void handleAudition()}
-              disabled={!tts.ready || auditioningVoiceId !== null}
-              title={tts.ready ? "Hear this voice" : "Pick a voice first"}
+              onClick={() => void handleAudition(selectedVoice || undefined)}
+              disabled={!ready || auditioningVoiceId !== null}
+              title={ready ? "Hear this voice" : "Pick a voice first"}
               aria-label="Hear this voice"
-              className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+              className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-control py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
             >
               {auditioningVoiceId ? <Loader2 size={14} className="animate-spin" /> : <Volume2 size={14} />} Try
             </button>
@@ -288,7 +329,33 @@ export function VoiceSettings() {
         </div>
       )}
 
-      {error && <div className="mt-2 text-[12px] text-danger">{error}</div>}
+      <div className="mt-4 flex items-center justify-between gap-4 border-t border-hairline/40 pt-4">
+        <div>
+          <div className="text-[13px] font-medium text-ink">Read replies aloud</div>
+          <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-secondary">
+            Speak this agent's answers as they arrive, even from another chat.
+          </div>
+        </div>
+        <button
+          role="switch"
+          aria-checked={Boolean(bot.speakReplies)}
+          aria-label="Read this bot's replies aloud"
+          onClick={() => onPatch({ speakReplies: !bot.speakReplies })}
+          className={cn(
+            "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors",
+            bot.speakReplies ? "bg-accent" : "bg-control",
+          )}
+        >
+          <span
+            className={cn(
+              "absolute top-[3px] size-5 rounded-full bg-white transition-all",
+              bot.speakReplies ? "left-[21px]" : "left-[3px]",
+            )}
+          />
+        </button>
+      </div>
+
+      {error && <div role="alert" className="mt-2 text-[12px] text-danger">{error}</div>}
     </div>
   );
 }

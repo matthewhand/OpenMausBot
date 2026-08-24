@@ -9,6 +9,7 @@ import { GroupView } from "@/components/GroupView";
 import { SettingsPanel } from "@/components/SettingsPanel";
 import { PluginsPanel } from "@/components/PluginsPanel";
 import { ComputerPanel } from "@/components/ComputerPanel";
+import { InspectorPanel } from "@/components/InspectorPanel";
 import { SettingsModal } from "@/components/SettingsModal";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { DesktopCapabilitiesProvider } from "@/components/DesktopCapabilities";
@@ -16,6 +17,7 @@ import { RoutinesPage } from "@/components/RoutinesPage";
 import { NoEngines } from "@/components/NoEngines";
 import { CommandPalette } from "@/components/CommandPalette";
 import { LanAuthModal } from "@/components/LanAuthModal";
+import { SkillRecorderPage } from "@/components/SkillRecorderPage";
 
 function Shell() {
   const { state, dispatch } = useStore();
@@ -108,6 +110,8 @@ function Shell() {
       />
       {state.activeView === "routines" ? (
         <RoutinesPage />
+      ) : state.activeView === "skill-recorder" ? (
+        <SkillRecorderPage />
       ) : noEngines ? (
         <NoEngines />
       ) : group ? (
@@ -129,6 +133,7 @@ function Shell() {
       )}
       {state.settingsOpen && bot && <SettingsPanel bot={bot} />}
       {state.computerOpen && bot && <ComputerPanel bot={bot} />}
+      {state.inspectorOpen && bot && <InspectorPanel bot={bot} />}
       {state.appSettingsOpen && <SettingsModal />}
       {state.pluginsOpen && <PluginsPanel />}
       {state.authRequired && <LanAuthModal />}

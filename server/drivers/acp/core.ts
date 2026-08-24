@@ -13,13 +13,19 @@
 // is never a security contract). session/load REPLAYS history as ordinary
 // session/update notifications, so updates are double-gated: nothing emits
 // before the prompt is sent, and `_meta.isReplay` updates are dropped.
-import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 
-import { RESERVED_MCP_NAMES } from "../../config.ts";
+import { PROVIDER_CREDENTIAL_ENV, RESERVED_MCP_NAMES, WORKSPACE_CREDENTIAL_ENV } from "../../config.ts";
+import { decodeInjectId } from "../local-inject.ts";
 import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../../procs.ts";
+
+/**
+ * A `host::model` pick talks to a loopback server with its own key.
+ * Subscription ACP login (grok.com cached_token) must not fail that turn.
+ */
+export function skipSubscriptionAuthForLocalInject(model: string | undefined): boolean {
+  return Boolean(decodeInjectId(model));
+}
 
 import type {
   DriverCreateInput,
@@ -38,13 +44,12 @@ import { newEventId, newId } from "../../contracts.ts";
 import { computerProxyEnv } from "../../container-computer.ts";
 import { augmentedPath } from "../../env-path.ts";
 
-// the computer proxy entry: .ts in dev (node type stripping), .js in the
-// compiled dist-server the packaged app ships
-const COMPUTER_PROXY_PATH = (() => {
-  const ts = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "computer-proxy.ts");
-  return existsSync(ts) ? ts : ts.replace(/\.ts$/, ".js");
-})();
+// Resolved from the server root, never relative to this file: bundling inlines
+// this module two directories up, so the `".."` pair here would climb past the
+// packaged server dir entirely. See server/proxy-paths.ts.
+const COMPUTER_PROXY_PATH = SPAWNED_PROXIES.computer;
 import { appendNative } from "../native.ts";
+import { SPAWNED_PROXIES } from "../../proxy-paths.ts";
 
 export interface AcpConfig {
   cli: string;
@@ -68,10 +73,18 @@ export interface AcpSupport {
   effortLevels?: readonly EffortLevel[];
   /** Default CLI binary name if the instance config doesn't override it. */
   defaultCli: string;
-  /** Optional live model catalog. A failed lookup keeps the last usable catalog. */
-  resolveModels?(environment: Record<string, string | undefined>): ModelCatalog | Promise<ModelCatalog>;
+  /** Optional live model catalog. A failed lookup keeps the last usable catalog.
+   *  `config` is the instance decode so a support can ask the same binary it
+   *  will spawn (custom `cli` paths), not whatever happens to be named on PATH. */
+  resolveModels?(
+    environment: Record<string, string | undefined>,
+    config: AcpConfig,
+  ): ModelCatalog | Promise<ModelCatalog>;
   /** Native-protocol log label, e.g. "grok.acp". */
   nativeSource: string;
+  /** Whether models behind this ACP harness can consume a referenced image.
+   * Most coding agents can open local files; opt out for text-only agents. */
+  images?: boolean;
   /** Message shown when the CLI is present but not signed in. */
   loginNote: string;
   /** How a user installs this harness's CLI; surfaced by the setup UI. */
@@ -88,6 +101,12 @@ export interface AcpSupport {
   /** Mutate the child env in place: strip a key, inject a policy. Receives the
    *  instance config so a support can vary with fullAuto. */
   transformEnv?(env: Record<string, string | undefined>, config: AcpConfig): void;
+  /** Mutate the child env after the turn model is known. Catalog refresh and
+   *  snapshot share `transformEnv` and must not see a per-turn overlay. */
+  applyTurnEnv?(
+    env: Record<string, string | undefined>,
+    ctx: { model?: string; requestedModel?: string },
+  ): void;
   /** Pick the ACP authenticate methodId from initialize's advertised
    * authMethods; return null to skip the authenticate step. */
   pickAuthMethod(authMethods: Array<{ id?: string }>): string | null;
@@ -97,6 +116,9 @@ export interface AcpSupport {
   /** snapshot(): can this harness actually run a turn? (env already carries the
    *  merged config). May be async for harnesses that have to ask the CLI. */
   isAuthenticated(env: Record<string, string | undefined>, config: AcpConfig): boolean | Promise<boolean>;
+  /** Refuse a first-party cloud turn before spawning when snapshot auth is
+   * false. Local injected models deliberately bypass this subscription gate. */
+  requireAuthenticationBeforeSpawn?: boolean;
   /** Classify provider-native failures without coupling the core to messages. */
   classifyError?(error: unknown): ProviderErrorCode | undefined;
   /** Compose the session/prompt text. Default prepends the persona. */
@@ -117,6 +139,12 @@ export interface AcpSupport {
     sessionId: string;
     config: AcpConfig;
     turn: SendTurnInput;
+    /** `session/new` (or `session/load`) advertised model list, verbatim. Some
+     * CLIs namespace their ACP model ids differently from their argv `--model`
+     * slugs (Cursor answers `default[]` where the CLI calls it `auto`), so a
+     * driver that only knows the argv slug cannot form a valid set_model
+     * without this. Empty when the agent advertised none. */
+    sessionModels: Array<{ modelId?: string; name?: string }>;
   }): Promise<void>;
 }
 
@@ -124,17 +152,6 @@ const INIT_TIMEOUT = 20_000;
 const SESSION_CONFIG_TIMEOUT = 20_000; // configureSession's per-request default
 const NEW_SESSION_TIMEOUT = 30_000;
 const LOAD_SESSION_TIMEOUT = 120_000; // history replay on a long thread is slow
-const PROVIDER_CREDENTIAL_ENV = [
-  "ANTHROPIC_API_KEY",
-  "FACTORY_API_KEY",
-  "GEMINI_API_KEY",
-  "GOOGLE_API_KEY",
-  "KIMI_API_KEY",
-  "MOONSHOT_API_KEY",
-  "OPENAI_API_KEY",
-  "OPENCODE_API_KEY",
-  "XAI_API_KEY",
-] as const;
 
 function decodeAcpConfig(defaultCli: string) {
   return (raw: unknown): AcpConfig => {
@@ -147,6 +164,10 @@ function decodeAcpConfig(defaultCli: string) {
   };
 }
 
+/**
+ * ACP JSON-RPC-over-stdio driver. Harness differences (argv, auth, catalog)
+ * live in `support`; this is the shared handshake and turn runtime.
+ */
 export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> {
   const DRIVER_KIND = support.driverKind;
   const SOURCE = support.nativeSource;
@@ -175,7 +196,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           PATH: augmentedPath(),
         };
         const allowedCredentials = new Set(support.credentialEnv ?? []);
-        for (const key of PROVIDER_CREDENTIAL_ENV) {
+        // two lists, one rule: foreign PROVIDER keys must not flip a CLI's
+        // billing off its own login, and WORKSPACE credentials (box token,
+        // voice key, …) are the harness's secrets — riding along in
+        // `...process.env` is not a grant. A driver keeps only what its
+        // credentialEnv allowlist names.
+        for (const key of [...PROVIDER_CREDENTIAL_ENV, ...WORKSPACE_CREDENTIAL_ENV]) {
           if (!allowedCredentials.has(key)) delete env[key];
         }
         support.transformEnv?.(env, config);
@@ -185,7 +211,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       const refreshModels = async () => {
         if (!support.resolveModels) return;
         try {
-          const resolved = await support.resolveModels(childEnv());
+          const resolved = await support.resolveModels(childEnv(), config);
           if (resolved.options.length) models = resolved;
         } catch {
           // Keep the last usable catalog when an optional discovery source is down.
@@ -223,6 +249,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const agents = turn.integrations?.agents;
         if (agents) {
           servers.push({ name: "agents", command: agents.command, args: agents.args, env: acpEnv(agents.env) });
+        }
+        const composio = turn.integrations?.composio;
+        if (composio) {
+          servers.push({
+            name: "composio",
+            command: composio.command,
+            args: composio.args,
+            env: acpEnv(composio.env),
+          });
         }
         // The bot's computer, mounted exactly like the Claude driver does.
         // Cloud boxes use the REST adapter; host and sandbox Cua connections
@@ -263,10 +298,25 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       const sendTurn = async (turn: SendTurnInput) => {
         const { threadId } = turn;
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
+        const controlsHost = turn.integrations?.localComputer?.scope === "local-computer";
+        if (controlsHost && config.fullAuto) {
+          throw new Error("local computer control requires interactive provider approvals");
+        }
         const turnId = newId();
         const cwd = turn.cwd ?? config.workspace ?? homedir();
         const env = childEnv();
+        if (
+          support.requireAuthenticationBeforeSpawn
+          && !skipSubscriptionAuthForLocalInject(turn.model)
+          && !(await support.isAuthenticated(env, config))
+        ) {
+          emit({ ...base(threadId, turnId), type: "turn.started" });
+          emit({ ...base(threadId, turnId), type: "runtime.error", message: support.loginNote, setup: true });
+          emit({ ...base(threadId, turnId), type: "turn.completed", ok: false, stopReason: "auth_required", cost: null });
+          return { turnId };
+        }
         const resolvedModel = support.resolveTurnModel?.(turn.model, env);
+        support.applyTurnEnv?.(env, { model: resolvedModel, requestedModel: turn.model });
         const cliTurn =
           resolvedModel !== undefined && resolvedModel !== turn.model
             ? { ...turn, model: resolvedModel }
@@ -312,6 +362,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
 
         const stop = () => killCliTree(child);
 
+        /** Emit buffered assistant text as its own item, then clear it. */
+        const flushAssistantText = () => {
+          const text = state.text;
+          state.text = "";
+          if (!text.trim()) return;
+          emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text });
+        };
+
         const settle = (ok: boolean, stopReason: string | null) => {
           if (state.settled) return;
           state.settled = true;
@@ -323,9 +381,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           }
           rpcPending.clear();
           active.delete(threadId);
-          if (state.text.trim()) {
-            emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text: state.text });
-          }
+          flushAssistantText();
           emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, cost: null });
           stop(); // the agent process does not exit on its own
         };
@@ -337,6 +393,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             return send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "method not found" } });
           }
           const params = msg.params ?? {};
+          flushAssistantText();
           const options: Array<{ optionId?: string; kind?: string }> = Array.isArray(params.options) ? params.options : [];
           const optionFor = (want: "allow" | "reject") => {
             const pattern = want === "allow" ? /^allow/i : /^(?:reject|deny)/i;
@@ -381,6 +438,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               requestId,
               behavior: optionId && behavior === "allow" ? "allow" : "deny",
               source: optionId ? source : "system",
+              approvalScope: controlsHost ? "local-computer" : undefined,
             });
           };
           const timer = setTimeout(() => {
@@ -396,6 +454,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             requestType: "permission",
             tool,
             summary,
+            approvalScope: controlsHost ? "local-computer" : undefined,
           });
         };
 
@@ -423,6 +482,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               break;
             }
             case "tool_call": {
+              flushAssistantText();
               emit({
                 ...base(threadId, turnId),
                 type: "item.started",
@@ -525,15 +585,17 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             );
             const methods: Array<{ id?: string }> = Array.isArray(init?.authMethods) ? init.authMethods : [];
             const methodId = support.pickAuthMethod(methods);
-            if (methodId) {
-              try {
-                await request("authenticate", { methodId }, INIT_TIMEOUT);
-              } catch {
-                if (support.authFailure === "fail") throw new Error(support.loginNote);
-                // else: proceed on an ambient login
+            if (!skipSubscriptionAuthForLocalInject(turn.model)) {
+              if (methodId) {
+                try {
+                  await request("authenticate", { methodId }, INIT_TIMEOUT);
+                } catch {
+                  if (support.authFailure === "fail") throw new Error(support.loginNote);
+                  // else: proceed on an ambient login
+                }
+              } else if (support.authFailure === "fail") {
+                throw new Error(support.loginNote);
               }
-            } else if (support.authFailure === "fail") {
-              throw new Error(support.loginNote);
             }
 
             const cursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
@@ -607,7 +669,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   sessionId,
                   config,
                   turn: cliTurn,
+                  sessionModels: Array.isArray(sessionResult?.models?.availableModels)
+                    ? sessionResult.models.availableModels
+                    : [],
                 });
+                // initialize's currentModelId is the CLI default (grok-4.6),
+                // not the model this turn asked for. After a successful pin,
+                // report the slug we set so the UI does not claim otherwise.
+                if (!selectedModel && cliTurn.model) selectedModel = cliTurn.model;
               }
             } catch (error) {
               // session.started is the only place the resume cursor is recorded,
@@ -691,7 +760,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             sessionModelSwitch: "unsupported",
             agentsMcp: true,
             computerMcp: true,
+            composioMcp: true,
+            images: support.images !== false,
             effortLevels: support.effortLevels,
+            localComputerMcp: !config.fullAuto,
           },
           sendTurn,
           interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),

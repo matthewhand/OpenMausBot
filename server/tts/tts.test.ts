@@ -122,8 +122,15 @@ describe("configuration", () => {
     // the two need different instructions, so they are different errors
     const { speak, NoVoiceConfigured } = await voice();
     expect(() => speak({}, "hi")).toThrow(NoVoiceConfigured);
+    expect(() => speak({}, "hi")).toThrow(NoVoiceConfigured);
     expect(() => speak({}, "hi")).toThrow(/key/i);
+    expect(() => speak({}, "hi")).toThrow(
+      "Add an ElevenLabs key in Settings on the computer to turn on voice.",
+    );
     expect(() => speak(cfg({ key: "k" }), "hi")).toThrow(/Pick a voice/i);
+    expect(() => speak(cfg({ key: "k" }), "hi")).toThrow(
+      "Pick a voice in the agent profile.",
+    );
   });
 
   it("distinguishes 'no baseUrl' from 'no voice' for OpenAI-compatible", async () => {

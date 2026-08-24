@@ -20,6 +20,19 @@ export interface ConnectorStatus {
   connected: boolean;
   pending?: boolean;
   status?: string;
+  accounts?: Array<{
+    id: string;
+    alias?: string;
+    status: string;
+  }>;
+}
+
+export function disconnectAccountConfirmation(
+  service: string,
+  account: { id: string; alias?: string },
+) {
+  const identity = account.alias ? `“${account.alias}” (${account.id})` : `“${account.id}”`;
+  return `Disconnect ${identity} from ${service}? Only this ${service} account will be revoked. Your other ${service} accounts will stay connected.`;
 }
 
 export function mergeCurrentConnectorStatus(
@@ -34,6 +47,22 @@ export function mergeCurrentConnectorStatus(
     next[slug] = state;
   }
   return next;
+}
+
+export function mergeCompleteConnectorStatus(
+  current: Record<string, ConnectorStatus>,
+  incoming: Record<string, ConnectorStatus>,
+  latestGenerations: ReadonlyMap<string, number>,
+  requestGenerations: ReadonlyMap<string, number>,
+) {
+  const next = { ...current };
+  for (const [slug, state] of Object.entries(current)) {
+    if (incoming[slug]) continue;
+    if (!state.connected && !state.accounts?.length) continue;
+    if ((latestGenerations.get(slug) ?? 0) !== (requestGenerations.get(slug) ?? 0)) continue;
+    next[slug] = { connected: false, pending: false, status: "not_connected", accounts: [] };
+  }
+  return mergeCurrentConnectorStatus(next, incoming, latestGenerations, requestGenerations);
 }
 
 function ServiceIcon({ card }: { card: ToolkitCard }) {
@@ -65,8 +94,11 @@ export function PluginsPanel() {
   const [cards, setCards] = useState<ToolkitCard[] | null>(null);
   const [source, setSource] = useState<"api" | "curated">("curated");
   const [configured, setConfigured] = useState(true);
+  const [mode, setMode] = useState<"managed" | "self-hosted" | "unavailable">("unavailable");
   const [status, setStatus] = useState<Record<string, ConnectorStatus>>({});
   const [pendingUrls, setPendingUrls] = useState<Record<string, string>>({});
+  const [aliasSlug, setAliasSlug] = useState<string | null>(null);
+  const [aliasDraft, setAliasDraft] = useState("");
   const [busySlug, setBusySlug] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -94,7 +126,34 @@ export function PluginsPanel() {
         ));
         for (const [slug, state] of Object.entries(services)) {
           const isCurrent = (statusGenerations.current.get(slug) ?? 0) === (requestGenerations.get(slug) ?? 0);
-          if (isCurrent && state.connected) setPendingUrls((current) => {
+          if (isCurrent && state.connected && !state.pending) setPendingUrls((current) => {
+            if (!current[slug]) return current;
+            const next = { ...current };
+            delete next[slug];
+            return next;
+          });
+        }
+        return services;
+      })
+      .catch(() => ({}))
+      .finally(() => setRefreshing(false));
+  }, []);
+
+  const refreshConnectedStatus = useCallback((): Promise<Record<string, ConnectorStatus>> => {
+    const requestGenerations = new Map(statusGenerations.current);
+    setRefreshing(true);
+    return api("/api/connectors/connected")
+      .then((r) => {
+        const services: Record<string, ConnectorStatus> = r.services ?? {};
+        setStatus((current) => mergeCompleteConnectorStatus(
+          current,
+          services,
+          statusGenerations.current,
+          requestGenerations,
+        ));
+        for (const [slug, state] of Object.entries(services)) {
+          const isCurrent = (statusGenerations.current.get(slug) ?? 0) === (requestGenerations.get(slug) ?? 0);
+          if (isCurrent && state.connected && !state.pending) setPendingUrls((current) => {
             if (!current[slug]) return current;
             const next = { ...current };
             delete next[slug];
@@ -120,13 +179,14 @@ export function PluginsPanel() {
         setCards(r.cards ?? []);
         setSource(r.source ?? "curated");
         setConfigured(Boolean(r.configured));
-        if (r.configured) void refreshStatus((r.cards ?? []).map((c: ToolkitCard) => c.slug));
+        setMode(r.mode ?? "unavailable");
+        if (r.configured) void refreshConnectedStatus();
       })
       .catch((e) => alive && setError(e.message));
     return () => {
       alive = false;
     };
-  }, [refreshStatus]);
+  }, [refreshConnectedStatus]);
 
   useEffect(() => {
     const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -193,7 +253,7 @@ export function PluginsPanel() {
     const timer = setInterval(() => {
       void refreshStatus([slug]).then((services) => {
         const state = services[slug];
-        if (++tries >= 24 || state?.connected || (state?.status && /^(expired|failed)$/i.test(state.status))) {
+        if (++tries >= 24 || (state?.connected && !state.pending) || (state?.status && /^(expired|failed)$/i.test(state.status))) {
           clearInterval(timer);
           pollTimers.current.delete(slug);
         }
@@ -202,14 +262,26 @@ export function PluginsPanel() {
     pollTimers.current.set(slug, timer);
   };
 
-  const connect = async (slug: string) => {
+  const connect = async (slug: string, alias?: string) => {
     statusGenerations.current.set(slug, (statusGenerations.current.get(slug) ?? 0) + 1);
     setBusySlug(slug);
     setError(null);
     try {
-      const { url } = await api(`/api/connectors/${slug}/authorize`, { method: "POST" });
+      const request: RequestInit = { method: "POST" };
+      if (alias) request.body = JSON.stringify({ alias });
+      const { url } = await api(`/api/connectors/${slug}/authorize`, request);
       setPendingUrls((current) => ({ ...current, [slug]: url }));
-      setStatus((current) => ({ ...current, [slug]: { connected: false, pending: true, status: "INITIATED" } }));
+      setStatus((current) => ({
+        ...current,
+        [slug]: {
+          ...current[slug],
+          connected: current[slug]?.connected ?? false,
+          pending: true,
+          status: "INITIATED",
+        },
+      }));
+      setAliasSlug(null);
+      setAliasDraft("");
       startPolling(slug);
       await openConnectUrl(url);
     } catch (e) {
@@ -219,14 +291,14 @@ export function PluginsPanel() {
     }
   };
 
-  const disconnect = (slug: string) => {
+  const disconnectAccount = (slug: string, accountId: string) => {
     const timer = pollTimers.current.get(slug);
     if (timer) {
       clearInterval(timer);
       pollTimers.current.delete(slug);
     }
     setBusySlug(slug);
-    api(`/api/connectors/${slug}`, { method: "DELETE" })
+    api(`/api/connectors/${slug}/accounts/${encodeURIComponent(accountId)}`, { method: "DELETE" })
       .then(() => refreshStatus([slug]))
       .catch((e) => setError(e.message))
       .finally(() => setBusySlug(null));
@@ -235,8 +307,10 @@ export function PluginsPanel() {
   const matching = (cards ?? []).filter(
     (c) => !search || `${c.label} ${c.slug} ${c.blurb}`.toLowerCase().includes(search.toLowerCase()),
   );
-  const visible = matching.filter((card) => tab === "marketplace" || status[card.slug]?.connected);
-  const connectedCount = Object.values(status).filter((service) => service.connected).length;
+  const visible = matching.filter((card) =>
+    tab === "marketplace" || status[card.slug]?.connected || Boolean(status[card.slug]?.accounts?.length)
+  );
+  const connectedCount = Object.values(status).filter((service) => service.connected || service.accounts?.length).length;
   const close = () => dispatch({ type: "togglePlugins", open: false });
 
   return (
@@ -254,12 +328,12 @@ export function PluginsPanel() {
       >
         <header className="flex items-start justify-between gap-4 px-6 pb-3 pt-6 sm:px-8 sm:pt-7">
           <div>
-            <h2 id="connected-apps-title" className="text-[22px] font-semibold tracking-[-0.01em] text-ink">Plugins</h2>
+            <h2 id="connected-apps-title" className="text-[22px] font-semibold tracking-[-0.01em] text-ink">Connected apps</h2>
             <p className="mt-1 text-[13px] text-ink-secondary">Connect the apps your bots can use.</p>
           </div>
           <div className="flex items-center gap-1">
             <button
-              onClick={() => refreshStatus(matching.map((c) => c.slug).slice(0, 40))}
+              onClick={() => refreshConnectedStatus()}
               className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"
               title="Refresh connection status"
             >
@@ -267,7 +341,7 @@ export function PluginsPanel() {
             </button>
             <button
               onClick={close}
-              aria-label="Close plugins"
+              aria-label="Close connected apps"
               className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"
             >
               <X size={21} />
@@ -276,7 +350,7 @@ export function PluginsPanel() {
         </header>
 
         <div className="flex flex-col gap-3 px-6 pb-4 pt-5 sm:flex-row sm:items-center sm:justify-between sm:px-8">
-          <div className="flex w-fit rounded-xl bg-raised/70 p-1" role="tablist" aria-label="Plugin view">
+          <div className="flex w-fit rounded-xl bg-raised/70 p-1" role="tablist" aria-label="Connected apps view">
             <button
               role="tab"
               aria-selected={tab === "marketplace"}
@@ -317,8 +391,8 @@ export function PluginsPanel() {
               <input
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
-                placeholder="Search plugins"
-                aria-label="Search plugins"
+                placeholder="Search apps"
+                aria-label="Search apps"
                 className="min-w-0 flex-1 bg-transparent text-[14px] text-ink placeholder:text-ink-secondary focus:outline-none"
               />
             </label>
@@ -331,7 +405,7 @@ export function PluginsPanel() {
           <>
         {!configured && (
           <div className="mx-6 mb-1 rounded-xl bg-warning/10 px-4 py-3 text-[13px] text-warning sm:mx-8">
-            Add your Composio project key to connect apps.{" "}
+            Connected apps are temporarily unavailable. You can retry after restarting, or configure your own connection service.{" "}
             <button
               className="font-medium underline underline-offset-2"
               onClick={() => {
@@ -343,7 +417,7 @@ export function PluginsPanel() {
             </button>
           </div>
         )}
-        {configured && source === "curated" && (
+        {configured && source === "curated" && mode === "self-hosted" && (
           <div className="mx-6 mb-1 text-[12px] text-ink-secondary sm:mx-8">
             Showing featured apps.{" "}
             <button
@@ -353,7 +427,7 @@ export function PluginsPanel() {
                 dispatch({ type: "toggleAppSettings", open: true });
               }}
             >
-              Use your Composio key
+              Update your Composio key
             </button>{" "}
             for the full catalog.
           </div>
@@ -373,51 +447,120 @@ export function PluginsPanel() {
               <div className="grid grid-cols-1 gap-x-10 md:grid-cols-2">
               {visible.map((card) => {
               const serviceStatus = status[card.slug];
-              const connected = serviceStatus?.connected;
               const pending = serviceStatus?.pending;
               const failed = serviceStatus?.status && /^(expired|failed)$/i.test(serviceStatus.status);
+              const accounts = serviceStatus?.accounts ?? [];
+              // connected with no accounts and nothing in flight = a no-auth
+              // toolkit: there is no OAuth to run, so "Connect" would mint a
+              // pointless authorize. It ships included.
+              const included = serviceStatus?.connected === true && !accounts.length && !pending && !failed;
+              const addingAccount = aliasSlug === card.slug;
               const busy = busySlug === card.slug;
               return (
                 <div
                   key={card.slug}
-                  className="flex min-h-[88px] items-center gap-3 border-b border-hairline/35 px-1 py-4"
+                  className="min-h-[88px] border-b border-hairline/35 px-1 py-4"
                 >
-                  <ServiceIcon card={card} />
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-[14px] font-medium text-ink">{card.label}</div>
-                    <div className="mt-0.5 truncate text-[12.5px] text-ink-secondary">
-                      {pending ? "Finish setup in your browser" : failed ? "Authorization expired — try again" : card.blurb}
+                  <div className="flex items-center gap-3">
+                    <ServiceIcon card={card} />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-[14px] font-medium text-ink">{card.label}</div>
+                      <div className="mt-0.5 truncate text-[12.5px] text-ink-secondary">
+                        {pending ? "Finish setup in your browser" : failed && !accounts.length ? "Authorization expired — try again" : card.blurb}
+                      </div>
                     </div>
+                    <button
+                      type="button"
+                      disabled={!configured || busy || included}
+                      onClick={() => {
+                        if (pending && pendingUrls[card.slug]) {
+                          setError(null);
+                          void openConnectUrl(pendingUrls[card.slug]).catch((e) => setError(e.message));
+                        } else if (accounts.length) {
+                          setAliasSlug((current) => current === card.slug ? null : card.slug);
+                          setAliasDraft("");
+                        } else void connect(card.slug);
+                      }}
+                      className="flex min-w-[88px] items-center justify-center gap-1.5 rounded-full bg-raised px-3 py-2 text-[12.5px] text-ink transition-colors hover:bg-raised-hover disabled:opacity-40"
+                    >
+                      {busy ? (
+                        <Loader2 size={13} className="mx-auto animate-spin" />
+                      ) : pending && pendingUrls[card.slug] ? (
+                        "Continue"
+                      ) : accounts.length ? (
+                        "Add account"
+                      ) : included ? (
+                        "Included"
+                      ) : failed ? (
+                        "Retry"
+                      ) : (
+                        "Connect"
+                      )}
+                    </button>
                   </div>
-                  <button
-                    disabled={!configured || busy}
-                    onClick={() => {
-                      if (connected) disconnect(card.slug);
-                      else if (pending && pendingUrls[card.slug]) {
-                        setError(null);
-                        void openConnectUrl(pendingUrls[card.slug]).catch((e) => setError(e.message));
-                      } else void connect(card.slug);
-                    }}
-                    className={cn(
-                      "flex min-w-[88px] items-center justify-center gap-1.5 rounded-full px-3 py-2 text-[12.5px] transition-colors disabled:opacity-40",
-                      connected
-                        ? "bg-transparent text-success hover:bg-danger/10 hover:text-danger"
-                        : "bg-raised text-ink hover:bg-raised-hover",
-                    )}
-                    title={connected ? `Disconnect ${card.label}` : undefined}
-                  >
-                    {busy ? (
-                      <Loader2 size={13} className="mx-auto animate-spin" />
-                    ) : connected ? (
-                      <><Check size={14} /> Connected</>
-                    ) : pending ? (
-                      "Continue"
-                    ) : failed ? (
-                      "Retry"
-                    ) : (
-                      "Connect"
-                    )}
-                  </button>
+                  {accounts.length > 0 && (
+                    <div className="ml-14 mt-3 space-y-2">
+                      {accounts.map((account) => {
+                        const active = /^active$/i.test(account.status);
+                        return (
+                          <div key={account.id} className="flex items-center gap-2 rounded-lg bg-raised/45 px-3 py-2">
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-ink">
+                                {active && <Check size={13} className="shrink-0 text-success" />}
+                                <span className="truncate">{account.alias || account.id}</span>
+                              </div>
+                              <div className="mt-0.5 truncate text-[10.5px] text-ink-secondary">
+                                {account.alias ? `${account.id} · ` : ""}{account.status.toLowerCase()}
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => {
+                                if (!window.confirm(disconnectAccountConfirmation(card.label, account))) return;
+                                disconnectAccount(card.slug, account.id);
+                              }}
+                              className="rounded-md px-2 py-1 text-[11px] text-ink-secondary transition-colors hover:bg-danger/10 hover:text-danger disabled:opacity-40"
+                              aria-label={`Disconnect ${account.alias || account.id} from ${card.label}`}
+                            >
+                              Disconnect
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {addingAccount && (
+                    <form
+                      className="ml-14 mt-3 flex items-center gap-2"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        const alias = aliasDraft.trim();
+                        if (!alias) {
+                          setError("Enter a label for the account, such as work or personal.");
+                          return;
+                        }
+                        void connect(card.slug, alias);
+                      }}
+                    >
+                      <input
+                        autoFocus
+                        value={aliasDraft}
+                        maxLength={64}
+                        onChange={(event) => setAliasDraft(event.target.value)}
+                        placeholder="Account label (work, personal…)"
+                        aria-label={`Label for another ${card.label} account`}
+                        className="min-w-0 flex-1 rounded-lg bg-raised px-3 py-2 text-[12px] text-ink placeholder:text-ink-secondary focus:outline-none focus:ring-1 focus:ring-accent"
+                      />
+                      <button
+                        type="submit"
+                        disabled={busy || !aliasDraft.trim()}
+                        className="rounded-lg bg-accent px-3 py-2 text-[12px] font-medium text-white disabled:opacity-40"
+                      >
+                        Continue
+                      </button>
+                    </form>
+                  )}
                 </div>
               );
               })}
@@ -427,7 +570,7 @@ export function PluginsPanel() {
           {cards !== null && visible.length === 0 && (
             <div className="flex min-h-56 flex-col items-center justify-center text-center">
               <div className="text-[14px] font-medium text-ink">
-                {tab === "connected" ? "No connected plugins yet" : "No plugins found"}
+                {tab === "connected" ? "No connected apps yet" : "No apps found"}
               </div>
               <div className="mt-1 text-[12.5px] text-ink-secondary">
                 {tab === "connected" ? "Connect an app from Marketplace and it will appear here." : "Try a different search."}

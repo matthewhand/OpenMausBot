@@ -10,9 +10,10 @@ import { peerAllowKey, type PeerAction } from "./peer-approval-key.ts";
 import { DATA_DIR } from "./config.ts";
 import * as mdb from "./message-db.ts";
 import { workspaceDir } from "./workspace.ts";
-import { newId, type ModelSelection, type ThreadId } from "./contracts.ts";
+import { newId, type CloudBackend, type ModelSelection, type ThreadId } from "./contracts.ts";
 import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
+import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
 
 export type MausColor =
   | "green"
@@ -48,14 +49,30 @@ export interface OptionCardData {
   held?: string;
   /** the narrow grant "always allow" remembers, e.g. "Bash:git" */
   allowKey?: string;
+  /** Local actions never share remembered grants with cloud/tool approvals. */
+  approvalScope?: "local-computer";
+}
+
+export interface ConnectorCardData {
+  /** Composio toolkit slug. It is validated server-side before every action. */
+  slug: string;
+  label: string;
+  description: string;
+  status: "required" | "authorizing" | "connected" | "failed";
+  /** Cards created by one agent request resume together after all connect. */
+  resumeKey: string;
+  error?: string;
+  dismissed?: boolean;
+  resumed?: boolean;
 }
 
 export interface Message {
   id: string;
   role: "bot" | "user";
-  kind: "text" | "options" | "activity" | "screen";
+  kind: "text" | "options" | "activity" | "screen" | "connector";
   text?: string;
   card?: OptionCardData;
+  connector?: ConnectorCardData;
   /** activity messages: tool name + outcome. `spoken` is the same chip as
    * a phrase a voice can read ("reading a file") — computed once here so
    * call mode never has to re-derive it from the raw tool name, and absent
@@ -63,6 +80,10 @@ export interface Message {
   /** `setup` marks an error the user fixes by installing or configuring
    * something — the UI offers setup instead of a retry that cannot work. */
   tool?: { name: string; ok?: boolean; spoken?: string; setup?: boolean };
+  /** user messages sent INTO a running turn (capabilities.queueing): the
+   * model saw it mid-turn, so the transcript marks it — a reader should
+   * know the reply above it may already account for this line */
+  steered?: boolean;
   /** screen messages: a frame of the bot's computer (base64 image) */
   png?: string;
   mime?: string;
@@ -77,6 +98,14 @@ export interface Message {
   /** comm chips: "Messaged @X" in the caller's chat, linking to the
    * bot⇄bot channel where the exchange is mirrored. */
   comm?: { groupId: string; withBotId: string; withName: string; withColor: string };
+  /** user messages sent while the bot was mid-turn, waiting in the
+   * steer-queue to auto-send on settle. Cleared when the drain consumes
+   * them; a true stranded by a restart is inert because the client only
+   * shows the affordance while the bot is busy. */
+  queued?: boolean;
+  /** steer-queue entry this drained user line came from. The client pending
+   * chip matches on this id, not on equal text. Absent on ordinary sends. */
+  queueId?: string;
 }
 
 export type GroupDefaultResponder =
@@ -102,6 +131,25 @@ export interface GroupRecord {
   dm?: boolean;
   /** transient: the member currently running a turn (never persisted) */
   busyBotId?: string | null;
+  /** the room's shared desk: where member turns run their shell tools,
+   * overriding each member's own folder. The room pins its own copy on its
+   * first turn (pinnedCwd). Absent = each member's own default. */
+  cwd?: string;
+  /** the folder this room's turns actually run in, pinned on the first
+   * turn that dispatches. null = each member's own default; absent = not
+   * pinned yet. See pinGroupCwd for why it never moves. */
+  pinnedCwd?: string | null;
+  /** the one message pinned to the top of this room's transcript. A pin id
+   * that no longer resolves (edited away, deleted) simply renders nothing. */
+  pinnedMessageId?: string;
+  /** sidebar section heading this room is filed under; shares the bots'
+   * namespace so one heading can hold a project's room and its people */
+  section?: string;
+  /** New user-created rooms start with setup pending. Null timestamps are
+   * intentional: records from before room setup has existed omit both keys
+   * and remain immediately usable. */
+  setupCompletedAt?: number | null;
+  setupSkippedAt?: number | null;
 }
 
 /** One task = one conversation with its own context.
@@ -118,16 +166,28 @@ export interface TaskRecord {
   createdAt: number;
   /** provider-native continuation per instance, for THIS task only */
   resumeCursors: Record<string, unknown>;
-  /** cumulative token spend across this task's settled turns — providers
-   * report running totals per turn; the fold adds each turn's final total
-   * here when the turn completes. Informational, not billing. */
-  usage?: { input: number; output: number; turns: number };
+  /** which instance dispatched the most recent turn. A cursor alone can't
+   * say whether an engine's session is current — another engine may have
+   * taken turns since — so this is what decides an inline replay. Absent
+   * on tasks from before the field existed. */
+  lastInstanceId?: string;
+  /** what this task has spent: banked once per turn from turn.completed */
+  usage?: TaskUsage;
   /** the folder this task's turns run in, pinned on its first turn from
    * the bot's `cwd` at that moment. Pinned, not read live: Claude keeps
    * sessions per project directory and Codex threads carry their cwd, so
    * a folder that moved under a live session would break resume. `null`
    * = pinned to the default (home); absent = not pinned yet. */
   cwd?: string | null;
+}
+
+export interface TaskUsage {
+  input: number;
+  output: number;
+  /** null until any turn reports a cost — most engines never do. Records
+   * written by builds before cost existed lack the field; read as null. */
+  costUsd: number | null;
+  turns: number;
 }
 
 /** Everything the BOT authored is scrubbed of content-shaped secrets before
@@ -147,6 +207,14 @@ function redactBotAuthored<T extends Omit<Message, "id" | "at"> & { at?: number 
     if (typeof card.subtitle === "string") card.subtitle = redactSecretsInText(card.subtitle);
     if (typeof card.summary === "string") card.summary = redactSecretsInText(card.summary);
     out.card = card;
+  }
+  if (out.connector) {
+    out.connector = {
+      ...out.connector,
+      label: redactSecretsInText(out.connector.label),
+      description: redactSecretsInText(out.connector.description),
+      error: out.connector.error ? redactSecretsInText(out.connector.error) : undefined,
+    };
   }
   return out;
 }
@@ -192,6 +260,10 @@ export interface BotRecord {
   notifications: boolean;
   color: MausColor;
   mascotExpression?: MausExpression | null;
+  /** App-owned attachment served as this bot's custom profile image. */
+  avatarUrl?: string;
+  /** Mascot, or the crop applied to avatarUrl. */
+  avatarCrop?: BotAvatarCrop;
   unread: boolean;
   modelSelection: ModelSelection;
   /** provider-native continuation per instance (e.g. claude session id) */
@@ -199,6 +271,8 @@ export interface BotRecord {
   /** which computer the bot acts on: its cloud box, this Mac (local CUA),
    * or none. Unset = auto (box when it exists, else local when available). */
   computer?: "cloud" | "vm" | "local" | "off";
+  /** Which cloud computer backs `computer: "cloud"`; absent means Box. */
+  cloudBackend?: CloudBackend;
   /** where NEW tasks run their shell tools; each task pins its own copy
    * on its first turn (TaskRecord.cwd). Absent = the home folder. */
   cwd?: string;
@@ -222,8 +296,13 @@ export interface BotRecord {
   rewound?: boolean;
   pinned?: boolean;
   hidden?: boolean;
-  /** The single workspace-wide coordinator. The store enforces that at
-   * most one bot owns this role, even if an older/corrupt file says more. */
+  /** Optional labeled divider used to organize this bot in the sidebar. */
+  section?: string;
+  /** the one message pinned to the top of this bot's active thread; a pin
+   * that no longer resolves (branch switched away, deleted) renders nothing */
+  pinnedMessageId?: string;
+  /** The coordinator for this bot's sidebar section. The store enforces
+   * at most one Chief per section (including the unsectioned area). */
   chiefOfStaff?: boolean;
   /** Pause for human approval before this bot talks to a peer (ask_bot,
    * delegate_bot). Off by default: a chief-of-staff-style bot is most
@@ -261,6 +340,10 @@ const COLORS: MausColor[] = [
   "teal",
   "coral",
 ];
+
+/** Sections are persisted as display labels, so exact trimmed labels are
+ * their identity. Missing/blank means the unsectioned (General) team. */
+export const sectionKey = (section?: string | null): string => section?.trim() || "";
 
 /** Resolve @mentions in a message against a bot roster: `@` must start a
  * word, the name must end on a word boundary (so "@New Bottle" never matches
@@ -397,7 +480,7 @@ export class Store {
     // busy never survives a restart — no turn does either. Rooms saved
     // before default responders existed adopt their first member as lead.
     let botsMigrated = false;
-    let chiefSeen = false;
+    const chiefSectionsSeen = new Set<string>();
     let groupsMigrated = false;
     for (const b of this.bots) {
       // transient state never survives a restart — and if a previous
@@ -406,11 +489,25 @@ export class Store {
       if (b.busy || (b.activity !== undefined && b.activity !== "idle")) botsMigrated = true;
       b.busy = false;
       b.activity = "idle";
+      if (b.cloudBackend !== undefined && b.cloudBackend !== "box" && b.cloudBackend !== "vps") {
+        delete b.cloudBackend;
+        botsMigrated = true;
+      }
+      const avatar = botAvatarProfile(b);
+      if (b.avatarUrl !== undefined && avatar.avatarUrl !== b.avatarUrl) {
+        delete b.avatarUrl;
+        botsMigrated = true;
+      }
+      if (b.avatarCrop !== undefined && avatar.avatarCrop !== b.avatarCrop) {
+        delete b.avatarCrop;
+        botsMigrated = true;
+      }
     }
     for (const b of this.bots) {
       if (!b.chiefOfStaff) continue;
-      if (!chiefSeen) {
-        chiefSeen = true;
+      const key = sectionKey(b.section);
+      if (!chiefSectionsSeen.has(key)) {
+        chiefSectionsSeen.add(key);
         if (b.hidden) {
           b.hidden = false;
           botsMigrated = true;
@@ -507,7 +604,7 @@ export class Store {
     return this.groups.find((g) => g.threadId === threadId);
   }
 
-  createGroup(name: string, memberIds: string[], dm = false): GroupRecord {
+  createGroup(name: string, memberIds: string[], dm = false, section?: string): GroupRecord {
     const group: GroupRecord = {
       id: newId(),
       threadId: newId(),
@@ -519,6 +616,8 @@ export class Store {
       createdAt: Date.now(),
       dm: dm || undefined,
       busyBotId: null,
+      section,
+      ...(dm ? {} : { setupCompletedAt: null, setupSkippedAt: null }),
     };
     this.groups.unshift(group);
     this.saveGroups();
@@ -533,7 +632,7 @@ export class Store {
     );
   }
 
-  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId">>): GroupRecord | null {
+  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd" | "section" | "setupCompletedAt" | "setupSkippedAt">>): GroupRecord | null {
     const group = this.group(id);
     if (!group) return null;
     Object.assign(group, patch);
@@ -713,7 +812,7 @@ export class Store {
 
   createBot(
     profile: Partial<
-      Pick<BotRecord, "name" | "title" | "description" | "color" | "mascotExpression" | "modelSelection">
+      Pick<BotRecord, "name" | "title" | "description" | "color" | "mascotExpression" | "modelSelection" | "section">
     > = {},
     opts: {
       /** false = no greeting/onboarding seed. Imported bots must not open
@@ -722,6 +821,7 @@ export class Store {
     } = {},
   ): BotRecord {
     const name = profile.name?.trim() || pickBotName(this.bots.map((b) => b.name));
+    const section = sectionKey(profile.section);
     const bot: BotRecord = {
       id: newId(),
       threadId: newId(),
@@ -736,6 +836,7 @@ export class Store {
       resumeCursors: {},
       createdAt: Date.now(),
     };
+    if (section) bot.section = section;
     bot.tasks = [{ threadId: bot.threadId, title: UNTITLED_TASK, createdAt: bot.createdAt, resumeCursors: {} }];
     this.bots.unshift(bot);
     this.saveBots();
@@ -794,18 +895,21 @@ export class Store {
     return bot;
   }
 
-  /** Elect one Chief of Staff (or clear the role) as one persisted change.
+  /** Elect one Chief of Staff in its section (or clear one section) as one persisted change.
    * The changed records are returned so the server can update every open
    * window, including the bot that just handed the role over. */
-  setChiefOfStaff(id: string | null): BotRecord[] | null {
-    if (id && !this.bot(id)) return null;
+  setChiefOfStaff(id: string | null, section?: string | null): BotRecord[] | null {
+    const selected = id ? this.bot(id) : null;
+    if (id && !selected) return null;
+    const targetSection = sectionKey(selected?.section ?? section);
     const changed: BotRecord[] = [];
     for (const bot of this.bots) {
+      if (sectionKey(bot.section) !== targetSection) continue;
       const next = bot.id === id;
       if (Boolean(bot.chiefOfStaff) === next && !(next && bot.hidden)) continue;
       if (next) {
         bot.chiefOfStaff = true;
-        // The workspace's main contact must stay reachable in the sidebar.
+        // A section's main contact must stay reachable in the sidebar.
         bot.hidden = false;
       } else {
         bot.chiefOfStaff = false;
@@ -830,6 +934,43 @@ export class Store {
     this.emit({ type: "bot", botId });
   }
 
+  /** Record which instance just took a turn on this task. Called at
+   * dispatch, not at cursor time — transcript-replay engines never
+   * produce a cursor, and they still count as having run last. */
+  markTaskDispatched(botId: string, threadId: string, instanceId: string) {
+    const task = this.taskByThread(botId, threadId);
+    if (!task || task.lastInstanceId === instanceId) return;
+    task.lastInstanceId = instanceId;
+    this.saveBots();
+  }
+
+  /** Bank one settled turn onto its task. Called once per turn.completed;
+   * the running per-driver token indicator is deliberately not used here
+   * because its meaning differs by driver. */
+  addTaskUsage(
+    botId: string,
+    threadId: string,
+    turn: { input?: number; output?: number; costUsd: number | null },
+  ): TaskUsage | null {
+    const task = this.taskByThread(botId, threadId);
+    if (!task) return null;
+    const prev: TaskUsage = { input: 0, output: 0, costUsd: null, turns: 0, ...task.usage };
+    const cost = typeof turn.costUsd === "number" && Number.isFinite(turn.costUsd) ? turn.costUsd : null;
+    const prevCost = typeof prev.costUsd === "number" ? prev.costUsd : null;
+    // providers occasionally report NaN or a negative on a partial turn —
+    // never let that poison a running tally
+    const clean = (n: number | undefined) => (typeof n === "number" && Number.isFinite(n) ? Math.max(0, Math.trunc(n)) : 0);
+    task.usage = {
+      input: prev.input + clean(turn.input),
+      output: prev.output + clean(turn.output),
+      costUsd: cost === null ? prevCost : (prevCost ?? 0) + cost,
+      turns: prev.turns + 1,
+    };
+    this.saveBots();
+    this.emit({ type: "bot", botId });
+    return task.usage;
+  }
+
   /** The folder a task's turn runs in. Pins on first call from the bot's
    * current folder — unless the task already has a session (a thread from
    * before folders existed), which pins to the default so the folder can't
@@ -852,6 +993,25 @@ export class Store {
       this.emit({ type: "bot", botId });
     }
     return task.cwd;
+  }
+
+  /** The folder a room's member turns run in. Pins on the first turn that
+   * dispatches, from the room's `cwd` at that moment. Pinned, not read
+   * live, for the same reason tasks pin (see pinTaskCwd): engines key
+   * their sessions and files to the folder a thread starts in, and a room
+   * lives on ONE thread forever — so changing the room's folder applies to
+   * future rooms, never under a room that already started working
+   * somewhere. Returns the pinned value: a path, or null = each member's
+   * own default. */
+  pinGroupCwd(groupId: string): string | null {
+    const group = this.group(groupId);
+    if (!group) return null;
+    if (group.pinnedCwd === undefined) {
+      group.pinnedCwd = group.cwd ?? null;
+      this.saveGroups();
+      this.emit({ type: "group", groupId: group.id });
+    }
+    return group.pinnedCwd;
   }
 
   // ── tasks ─────────────────────────────────────────────────────────────
@@ -910,23 +1070,6 @@ export class Store {
     const task = this.bot(botId)?.tasks?.find((t) => t.threadId === threadId);
     if (!task) return null;
     task.title = title.trim().slice(0, 80) || UNTITLED_TASK;
-    this.saveBots();
-    this.emit({ type: "bot", botId });
-    return task;
-  }
-
-  /** Add one settled turn's final token totals to its task's tally. */
-  addTaskUsage(botId: string, threadId: string, usage: { input: number; output: number }): TaskRecord | null {
-    const task = this.taskByThread(botId, threadId);
-    if (!task) return null;
-    const prev = task.usage ?? { input: 0, output: 0, turns: 0 };
-    const input = Number.isFinite(usage.input) ? Math.max(0, Math.trunc(usage.input)) : 0;
-    const output = Number.isFinite(usage.output) ? Math.max(0, Math.trunc(usage.output)) : 0;
-    task.usage = {
-      input: prev.input + input,
-      output: prev.output + output,
-      turns: prev.turns + 1,
-    };
     this.saveBots();
     this.emit({ type: "bot", botId });
     return task;

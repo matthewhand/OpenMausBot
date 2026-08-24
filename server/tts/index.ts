@@ -12,16 +12,15 @@ export class NoVoiceConfigured extends Error {
   readonly reason: "key" | "voice" | "baseUrl";
 
   constructor(reason: "key" | "voice" | "baseUrl", provider?: string) {
-    const providerName = provider === "openai-compatible" ? "OpenAI-compatible" : "ElevenLabs";
     let msg: string;
     if (reason === "key") {
       msg = provider === "openai-compatible"
         ? "Add an API key in App Settings if your server requires one, or leave it empty for local servers."
-        : `Add an ${providerName} key in App Settings to turn on voice.`;
+        : "Add an ElevenLabs key in Settings on the computer to turn on voice.";
     } else if (reason === "baseUrl") {
       msg = "Add a base URL in App Settings for your OpenAI-compatible server.";
     } else {
-      msg = "Pick a voice in App Settings.";
+      msg = "Pick a voice in the agent profile.";
     }
     super(msg);
     this.reason = reason;

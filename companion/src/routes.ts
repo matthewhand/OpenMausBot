@@ -32,6 +32,18 @@ export interface RouteRequest {
   authenticated: boolean;
 }
 
+/** The one companion route that crosses into full interactive desktop
+ * control. Both the allowlist and capability gate consume this classifier so
+ * their security decisions cannot drift apart. */
+export const CLOUD_DESKTOP_JOIN_ROUTE = {
+  method: "POST",
+  path: /^\/api\/bots\/[\w-]+\/computer\/join$/,
+} as const;
+
+export function isCloudDesktopJoin(method: string, path: string): boolean {
+  return method === CLOUD_DESKTOP_JOIN_ROUTE.method && CLOUD_DESKTOP_JOIN_ROUTE.path.test(path);
+}
+
 /** Every request the iOS app makes, and nothing else.
  *
  * Ids are `[\w-]+`, matching the harness's own route patterns. The paths
@@ -39,9 +51,6 @@ export interface RouteRequest {
  * fails to match and is denied rather than forwarded — the failure mode of
  * a strict pattern is a closed door, which is the one to have. */
 const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
-  // liveness — not used by the app, but it is the first thing anyone curls
-  // when pairing will not work, and it discloses nothing
-  { method: "GET", path: /^\/api\/health$/ },
   // configured-or-not booleans. The write side is refused below: reading
   // which providers are set up is not reading their keys.
   { method: "GET", path: /^\/api\/config$/ },
@@ -55,15 +64,58 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "POST", path: /^\/api\/bots\/[\w-]+\/interrupt$/ },
   { method: "POST", path: /^\/api\/bots\/[\w-]+\/read$/ },
   { method: "POST", path: /^\/api\/bots\/[\w-]+\/always-allow$/ },
+  { method: "POST", path: /^\/api\/bots\/[\w-]+\/messages\/[\w-]+\/edit$/ },
+  { method: "POST", path: /^\/api\/bots\/[\w-]+\/active-branch$/ },
+  { method: "POST", path: /^\/api\/bots\/[\w-]+\/tasks$/ },
+  { method: "POST", path: /^\/api\/bots\/[\w-]+\/tasks\/[\w-]+$/ },
+  { method: "PATCH", path: /^\/api\/bots\/[\w-]+\/tasks\/[\w-]+$/ },
+  { method: "DELETE", path: /^\/api\/bots\/[\w-]+\/tasks\/[\w-]+$/ },
+  // Paired-safe profile subset. The harness route itself rejects fields
+  // outside identity, avatar, notifications, and voice preferences.
+  { method: "PATCH", path: /^\/api\/bots\/[\w-]+\/profile$/ },
+  { method: "POST", path: /^\/api\/bots\/[\w-]+\/avatar\/generate$/ },
+  // Full cloud desktop access. The route is narrow and the proxy applies a
+  // second, per-device capability check before it reaches the harness.
+  CLOUD_DESKTOP_JOIN_ROUTE,
 
-  // rooms
+  // rooms — making one, and talking in one
+  { method: "POST", path: /^\/api\/groups$/ },
   { method: "POST", path: /^\/api\/groups\/[\w-]+\/messages$/ },
   { method: "POST", path: /^\/api\/groups\/[\w-]+\/read$/ },
 
   // a transcript, its images, and answering an approval
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/messages$/ },
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/image$/ },
+  { method: "POST", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/reactions$/ },
+  { method: "GET", path: /^\/api\/threads\/[\w-]+\/export$/ },
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/respond$/ },
+  { method: "GET", path: /^\/api\/search$/ },
+
+  // App-owned profile images. Upload is image-only and capped at 10 MB by
+  // the harness; GET is a single bare generated filename, never a path.
+  { method: "POST", path: /^\/api\/attachments$/ },
+  { method: "GET", path: /^\/api\/attachments\/[\w-]+\.(?:png|jpe?g|gif|webp)$/i },
+
+  // Renderer-neutral voice operations. Neither route reads or writes the
+  // workspace ElevenLabs key; the phone receives labels or audio only.
+  { method: "GET", path: /^\/api\/tts\/voices$/ },
+  { method: "POST", path: /^\/api\/tts\/speak$/ },
+
+  // Routines create ordinary tasks using an existing agent configuration.
+  // Webhook management remains explicitly denied below.
+  { method: "GET", path: /^\/api\/routines$/ },
+  { method: "POST", path: /^\/api\/routines$/ },
+  { method: "PATCH", path: /^\/api\/routines\/[\w-]+$/ },
+  { method: "DELETE", path: /^\/api\/routines\/[\w-]+$/ },
+  { method: "POST", path: /^\/api\/routines\/[\w-]+\/run$/ },
+
+  // Multi-account Composio management exposes opaque ids and aliases only.
+  // Revocation stays on the Mac: the account DELETE route is deliberately
+  // absent — a paired phone can see and add accounts, never remove one.
+  { method: "GET", path: /^\/api\/connectors\/catalog$/ },
+  { method: "GET", path: /^\/api\/connectors\/connected$/ },
+  { method: "GET", path: /^\/api\/connectors$/ },
+  { method: "POST", path: /^\/api\/connectors\/[\w-]+\/authorize$/ },
 ];
 
 /** Route families worth naming in the refusal.
@@ -89,7 +141,10 @@ const EXPLAINED: ReadonlyArray<{ path: RegExp; error: string }> = [
     error: "webhooks are set up on your computer",
   },
   { path: /^\/api\/connectors(\/|$)/, error: "connected apps are set up on your computer" },
-  { path: /^\/api\/routines(\/|$)/, error: "routines are set up on your computer" },
+  {
+    path: /^\/api\/routines(\/|$)/,
+    error: "this routine operation is only available on your computer",
+  },
   { path: /^\/api\/teams(\/|$)/, error: "teams are imported and exported on your computer" },
 ];
 
@@ -102,6 +157,11 @@ const EXPLAINED: ReadonlyArray<{ path: RegExp; error: string }> = [
 export function denyReason({ path, method, authenticated }: RouteRequest): Denial | null {
   // Pairing is the one thing a device does before it has a credential.
   if (method === "POST" && path === "/api/pair") return null;
+  // Liveness is the other: it exists to be the first thing anyone curls when
+  // pairing will not work, and behind the token check it answered 401 to
+  // exactly the person it was for — which reads as "broken" rather than
+  // "unpaired". It discloses nothing a port scan would not.
+  if (method === "GET" && path === "/api/health") return null;
 
   if (!authenticated) {
     return { status: 401, error: "pair this device from the OpenMausBot companion on your computer" };

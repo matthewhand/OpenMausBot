@@ -7,17 +7,23 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  Bug,
+  Clock,
   Copy,
   Crown,
   Folder,
+  ListTree,
   Loader2,
   Monitor,
   Pencil,
+  Pin,
+  PinOff,
   RefreshCw,
   Square,
   Webhook,
   X,
 } from "lucide-react";
+import { costCaption, formatTokens, formatUsd, hasFiniteCost, usageChip } from "@/lib/usage";
 import {
   useStore,
   useStreaming,
@@ -29,7 +35,7 @@ import {
   type Message,
 } from "@/state/store";
 import { EngineSetup } from "./EngineSetup";
-import { MausAvatar } from "./Avatar";
+import { BotAvatar, MausAvatar } from "./Avatar";
 import { stateForBot } from "@/lib/mascot";
 import { showWorkingDots } from "@/lib/turn-tail";
 import { ChatMarkdown } from "./ChatMarkdown";
@@ -37,6 +43,7 @@ import { OptionCard } from "./OptionCard";
 import { ApprovalCard } from "./ApprovalCard";
 import { CommChip } from "./CommPopup";
 import { Composer } from "./Composer";
+import { ConnectorCard } from "./ConnectorCard";
 import { ModelPicker } from "./ModelPicker";
 import { RenameTitle } from "./RenameTitle";
 import { TaskPicker } from "./TaskPicker";
@@ -44,9 +51,19 @@ import { ReactionBar, ReactionChips } from "./Reactions";
 import { SpeakButton } from "./SpeakButton";
 import { CallButton, CallOverlay } from "./CallView";
 import { cn } from "@/lib/cn";
+import { COMPACT_BUBBLE, COMPACT_SQUARE } from "@/lib/compact-chip";
+import { useFocusMessage } from "@/lib/focus-message";
 import { webhookMessageView } from "@/lib/webhook-message";
+import { attachmentBasename, splitAttachedImages } from "@/lib/composer-attachments";
 import { BOTTOM_FOLLOW_THRESHOLD, shouldResumeBottomFollow } from "@/lib/bottom-follow";
-import { expandWindowStart, resolveTranscriptWindow, tailWindowStart } from "@/lib/transcript-window";
+import {
+  TRANSCRIPT_WINDOW_SIZE,
+  expandWindowStart,
+  focusWindowRange,
+  resolveTranscriptWindow,
+  tailWindowStart,
+} from "@/lib/transcript-window";
+import { timelineEvents } from "@/lib/taskTimeline";
 
 /** Long user messages collapse behind a fade so pasted walls of text don't
  * bury the conversation; bots get full markdown. */
@@ -68,6 +85,50 @@ function DaySeparator({ at }: { at: number }) {
   return (
     <div className="py-3 text-center text-[13px] text-ink-secondary">
       {dayLabel(at)} {formatTime(at)}
+    </div>
+  );
+}
+
+function TaskTimeline({ messages, busy }: { messages: Message[]; busy: boolean }) {
+  const [open, setOpen] = useState(false);
+  const events = useMemo(() => timelineEvents(messages), [messages]);
+  if (events.length === 0) return null;
+  const recent = events.slice(-8);
+  return (
+    <div className="mx-auto w-full max-w-[900px] px-5 pt-1">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        className="flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-left text-[12.5px] text-ink-secondary hover:bg-raised/50 hover:text-ink"
+      >
+        <span className="flex items-center gap-1.5"><ListTree size={14} /> Execution timeline{busy ? " · running" : ""}</span>
+        <ChevronDown size={14} className={cn("transition-transform", open && "rotate-180")} />
+      </button>
+      {open && (
+        <ol className="ml-2 border-l border-hairline/40 pb-2 pl-3">
+          {recent.map((event) => (
+            <li key={event.id} className="relative flex items-center gap-2 py-1 text-[12px] text-ink-secondary">
+              <span
+                aria-hidden="true"
+                className={cn(
+                  "absolute -left-[17px] size-2 rounded-full",
+                  event.state === "failed"
+                    ? "bg-danger"
+                    : event.state === "complete"
+                      ? "bg-success"
+                      : event.state === "running"
+                        ? "animate-pulse bg-accent"
+                        : "bg-ink-secondary",
+                )}
+              />
+              <span className="sr-only">{event.state}: </span>
+              <span className="truncate">{event.label}</span>
+              <time className="ml-auto shrink-0 text-[11px] text-ink-secondary/70">{formatTime(event.at)}</time>
+            </li>
+          ))}
+        </ol>
+      )}
     </div>
   );
 }
@@ -277,7 +338,8 @@ function Bubble({
   const [expanded, setExpanded] = useState(false);
   const text = message.text ?? "";
   const webhookView = user ? webhookMessageView(text) : null;
-  const visibleText = webhookView?.task ?? text;
+  const attachedImages = user && !webhookView ? splitAttachedImages(text) : null;
+  const visibleText = webhookView?.task ?? attachedImages?.display ?? text;
   const collapsible =
     user && !webhookView && !expanded && (visibleText.length > USER_COLLAPSE_CHARS || visibleText.split("\n").length > USER_COLLAPSE_LINES);
 
@@ -313,6 +375,24 @@ function Bubble({
         )}
         {user && message.kind === "text" && <ReactionBar threadId={bot.threadId} message={message} />}
         {user && <CopyButton text={visibleText} />}
+        <button
+          onClick={() =>
+            dispatch({
+              type: "updateBot",
+              botId: bot.id,
+              patch: { pinnedMessageId: bot.pinnedMessageId === message.id ? "" : message.id },
+            })
+          }
+          aria-label={bot.pinnedMessageId === message.id ? "Unpin message" : "Pin message"}
+          className="rounded-md p-1.5 text-ink-secondary opacity-0 transition-opacity hover:bg-raised hover:text-ink focus-visible:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100"
+          title={
+            bot.pinnedMessageId === message.id
+              ? "Unpin this message"
+              : "Pin this message to the top of the thread"
+          }
+        >
+          {bot.pinnedMessageId === message.id ? <PinOff size={14} /> : <Pin size={14} />}
+        </button>
         <div
           className={cn(
             "max-w-[70%] rounded-2xl text-[15px] leading-relaxed",
@@ -340,11 +420,37 @@ function Bubble({
             </div>
           ) : user ? (
             <>
+              {attachedImages && attachedImages.images.length > 0 && (
+                <div className="mb-2 flex flex-wrap justify-end gap-2">
+                  {attachedImages.images.map((path) => (
+                    <a
+                      key={path}
+                      href={`/api/attachments/${encodeURIComponent(attachmentBasename(path))}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="block max-w-[260px] overflow-hidden rounded-lg border border-hairline/40"
+                      title={path}
+                    >
+                      <img
+                        src={`/api/attachments/${encodeURIComponent(attachmentBasename(path))}`}
+                        alt="Attached image"
+                        loading="lazy"
+                        className="block max-h-[220px] w-full object-cover"
+                      />
+                    </a>
+                  ))}
+                </div>
+              )}
               <div
                 className={cn(collapsible && "max-h-40 overflow-hidden [mask-image:linear-gradient(to_bottom,black_60%,transparent)]")}
               >
-                {text}
+                {visibleText}
               </div>
+              {message.steered && (
+                <div className="mt-1 text-[11px] text-ink-secondary/70" title="Sent while the bot was working — it saw this before its next step, inside the same turn.">
+                  sent mid-turn
+                </div>
+              )}
               {collapsible && (
                 <button onClick={() => setExpanded(true)} className="mt-1 text-[12.5px] text-ink-secondary hover:text-ink">
                   Show full message
@@ -390,6 +496,13 @@ function Bubble({
           {formatTime(message.at)}
         </span>
       </div>
+      {/* busy-gated so a flag stranded by a server restart shows nothing */}
+      {user && message.queued && bot.busy && (
+        <div className="mt-1 flex items-center gap-1 pr-1 text-[11px] text-ink-secondary/70">
+          <Clock size={11} aria-hidden="true" />
+          <span>Queued — sends when this turn finishes</span>
+        </div>
+      )}
       <ReactionChips threadId={bot.threadId} message={message} align={user ? "right" : "left"} />
       {versions.length > 1 && (
         <div className="mt-1 flex items-center gap-0.5 pr-1 text-[12px] text-ink-secondary">
@@ -523,7 +636,7 @@ const MessagesList = memo(function MessagesList({
     <>
       {messages.length === 0 && !bot.busy && (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 py-24 text-center">
-          <MausAvatar color={bot.color} state="idle" size={64} motion="none" motionKey={0} />
+          <BotAvatar bot={bot} state="idle" size={64} motion="none" motionKey={0} />
           <RenameTitle
             value={bot.name}
             onCommit={(name) => dispatch({ type: "updateBot", botId: bot.id, patch: { name } })}
@@ -540,6 +653,8 @@ const MessagesList = memo(function MessagesList({
         const newDay = !prev || new Date(prev.at).toDateString() !== new Date(m.at).toDateString();
         const row = (() => {
           switch (m.kind) {
+            case "connector":
+              return m.connector ? <ConnectorCard botId={bot.id} threadId={bot.threadId} message={m} /> : null;
             case "options":
               // a live permission ask gets the approval box; questions and
               // the onboarding quiz keep the list card
@@ -578,7 +693,7 @@ const MessagesList = memo(function MessagesList({
         })();
         if (!row) return null;
         return (
-          <div key={m.id} className="contents">
+          <div key={m.id} className="contents" data-mid={m.id}>
             {newDay && <DaySeparator at={m.at} />}
             {row}
           </div>
@@ -587,6 +702,53 @@ const MessagesList = memo(function MessagesList({
     </>
   );
 });
+
+/** The one pinned message, above the transcript: sender, one line, click to
+ * jump, X to unpin. Resolves the pin id against the full message list; a
+ * pin that no longer resolves renders nothing (edited away or deleted). */
+function PinnedBanner({
+  bot,
+  pinnedId,
+  messages,
+  onJump,
+  onUnpin,
+}: {
+  bot: Bot;
+  pinnedId?: string;
+  messages: Message[];
+  onJump: (messageId: string) => void;
+  onUnpin: () => void;
+}) {
+  const pinned = messages.find((m) => m.id === pinnedId);
+  if (!pinned || pinned.kind !== "text") return null;
+  const sender =
+    pinned.role === "user" ? "You" : (pinned.from?.name ?? bot.name);
+  const text = (pinned.text ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  return (
+    <div className="mx-auto w-full max-w-[900px] px-5">
+      <div className="mb-2 flex items-center gap-2 rounded-lg border border-accent/25 bg-accent/[0.07] px-3 py-1.5">
+        <Pin size={12} className="shrink-0 text-accent" />
+        <button
+          onClick={() => onJump(pinned.id)}
+          className="flex min-w-0 flex-1 items-baseline gap-2 text-left"
+          title="Jump to the pinned message"
+        >
+          <span className="shrink-0 text-[11.5px] font-medium text-accent">{sender}</span>
+          <span className="truncate text-[12.5px] text-ink-secondary">{text}</span>
+        </button>
+        <button
+          onClick={onUnpin}
+          aria-label="Unpin message"
+          title="Unpin"
+          className="shrink-0 rounded p-0.5 text-ink-secondary hover:bg-raised hover:text-ink"
+        >
+          <X size={13} />
+        </button>
+      </div>
+    </div>
+  );
+}
 
 export function ChatView({ bot }: { bot: Bot }) {
   const { state, dispatch } = useStore();
@@ -607,18 +769,28 @@ export function ChatView({ bot }: { bot: Bot }) {
   // never flashes into the new one. Everything derived below (lastBotTextId,
   // lastUserMessage, working dots) stays computed from the FULL list.
   const transcriptKey = `${bot.id}:${bot.threadId}`;
-  const [transcriptWindow, setTranscriptWindow] = useState(() => ({
+  const [transcriptWindow, setTranscriptWindow] = useState<{
+    key: string;
+    start: number;
+    end: number | null;
+  }>(() => ({
     key: transcriptKey,
     start: tailWindowStart(messages.length),
+    end: null,
   }));
   if (transcriptWindow.key !== transcriptKey) {
-    setTranscriptWindow({ key: transcriptKey, start: tailWindowStart(messages.length) });
+    setTranscriptWindow({ key: transcriptKey, start: tailWindowStart(messages.length), end: null });
   }
   const {
     visible: windowedMessages,
     hiddenCount,
+    laterCount,
     startIndex,
-  } = useMemo(() => resolveTranscriptWindow(messages, transcriptWindow.start), [messages, transcriptWindow.start]);
+    endIndex,
+  } = useMemo(
+    () => resolveTranscriptWindow(messages, transcriptWindow.start, TRANSCRIPT_WINDOW_SIZE, transcriptWindow.end),
+    [messages, transcriptWindow.start, transcriptWindow.end],
+  );
 
   const lastBotTextId = useMemo(
     () => [...messages].reverse().find((m) => m.role === "bot" && m.kind === "text")?.id,
@@ -666,6 +838,23 @@ export function ChatView({ bot }: { bot: Bot }) {
   }, []);
 
   useEffect(() => setBottomFollow(true), [bot.id, setBottomFollow]);
+
+  // A search result may be hundreds of rows before the mounted tail. Open a
+  // bounded window around it first; useFocusMessage then scrolls and flashes
+  // the row after React commits that window.
+  const appliedFocus = useRef<number | null>(null);
+  useEffect(() => {
+    const focus = state.focusMessage;
+    if (!focus || focus.consumed || focus.threadId !== bot.threadId || appliedFocus.current === focus.nonce) return;
+    const targetIndex = messages.findIndex((message) => message.id === focus.messageId);
+    if (targetIndex < 0) return;
+    appliedFocus.current = focus.nonce;
+    const range = focusWindowRange(messages.length, targetIndex);
+    setBottomFollow(false);
+    setTranscriptWindow({ key: transcriptKey, start: range.start, end: range.end });
+  }, [bot.threadId, messages, setBottomFollow, state.focusMessage, transcriptKey]);
+  useFocusMessage(bot.threadId, messages.length > 0);
+
   // deps track the FULL messages.length, so expanding the window (which only
   // changes windowedMessages) can never re-trigger this bottom scrollTo
   useEffect(() => {
@@ -685,7 +874,7 @@ export function ChatView({ bot }: { bot: Bot }) {
     // event pin the viewport back to the bottom
     setBottomFollow(false);
     const start = expandWindowStart(startIndex);
-    setTranscriptWindow((w) => ({ key: w.key, start }));
+    setTranscriptWindow((w) => ({ ...w, start }));
   };
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -696,6 +885,12 @@ export function ChatView({ bot }: { bot: Bot }) {
     // downward user scroll
     previousScrollTop.current = el.scrollTop;
   }, [transcriptWindow.start]);
+
+  const showLater = () => {
+    setBottomFollow(false);
+    const nextEnd = Math.min(messages.length, endIndex + TRANSCRIPT_WINDOW_SIZE);
+    setTranscriptWindow((w) => ({ ...w, end: nextEnd >= messages.length ? null : nextEnd }));
+  };
 
   // keyboard is a scroll gesture too (upstream lesson): PageUp/Home break
   // follow like an upward wheel; the at-end onScroll check re-arms it
@@ -715,13 +910,18 @@ export function ChatView({ bot }: { bot: Bot }) {
   };
   const jumpToLatest = () => {
     setBottomFollow(true);
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+    setTranscriptWindow({ key: transcriptKey, start: tailWindowStart(messages.length), end: null });
+    requestAnimationFrame(() => {
+      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+    });
   };
 
   // on Windows the frameless window's min/max/close overlay sits at the
   // top-right: the header becomes the drag strip and clears room for it
   const isWin = window.ogb?.platform === "win32";
+  // SAFETY: Electron supports this nonstandard CSS property, which React's type declarations omit.
   const drag = isWin ? ({ WebkitAppRegion: "drag" } as React.CSSProperties) : undefined;
+  // SAFETY: Electron supports this nonstandard CSS property, which React's type declarations omit.
   const noDrag = isWin ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined;
 
   return (
@@ -731,7 +931,9 @@ export function ChatView({ bot }: { bot: Bot }) {
       {/* Header */}
       <div
         className={cn(
-          "flex items-center justify-between px-5 py-3",
+          // @container so the chips on the right can fold to icon bubbles
+          // when the column is narrow (side panel open, small window)
+          "@container/chathead flex items-center justify-between px-5 py-3",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
           isWin && "pr-[148px]",
@@ -740,12 +942,13 @@ export function ChatView({ bot }: { bot: Bot }) {
       >
         <div className="flex min-w-0 items-center gap-2.5 rounded-lg px-1.5 py-1" style={noDrag}>
           <button
-            onClick={() => dispatch({ type: "toggleSettings" })}
-            className="flex shrink-0 items-center rounded-lg p-0.5 hover:bg-raised/50"
-            title="Bot settings"
+            onClick={() => dispatch({ type: "toggleSettings", open: true })}
+            className="flex size-10 shrink-0 items-center justify-center rounded-lg hover:bg-raised/50"
+            title="Open agent profile"
+            aria-label={`Open ${bot.name}'s profile`}
           >
-            <MausAvatar
-              color={bot.color}
+            <BotAvatar
+              bot={bot}
               state={stateForBot({ ...bot, messages })}
               size={28}
               motion={mascotMotion?.kind ?? "none"}
@@ -755,6 +958,8 @@ export function ChatView({ bot }: { bot: Bot }) {
           <RenameTitle
             value={bot.name}
             onCommit={(name) => dispatch({ type: "updateBot", botId: bot.id, patch: { name } })}
+            onActivate={() => dispatch({ type: "toggleSettings", open: true })}
+            showEditButton
             className="truncate text-[15px] font-semibold text-ink"
             inputClassName="max-w-[220px] rounded bg-inset px-1.5 py-0.5 text-[15px] font-semibold"
           />
@@ -765,18 +970,22 @@ export function ChatView({ bot }: { bot: Bot }) {
           )}
           {bot.busy && <Loader2 size={14} className="animate-spin text-ink-secondary" />}
         </div>
-        <div className="flex items-center gap-2" style={noDrag}>
+        <div className="flex shrink-0 items-center gap-2" style={noDrag}>
           {bot.busy && (
             <button
               onClick={() => dispatch({ type: "interrupt", botId: bot.id })}
-              className="flex items-center gap-1.5 rounded-full border border-hairline/40 bg-raised/60 px-2.5 py-1 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink"
+              className={cn(
+                "flex items-center gap-1.5 rounded-full border border-hairline/40 bg-raised/60 px-2.5 py-1 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink",
+                COMPACT_BUBBLE,
+              )}
               title="Stop this turn"
             >
               <Square size={12} className="fill-current" />
-              Stop
+              <span className="@max-4xl/chathead:hidden">Stop</span>
             </button>
           )}
           <TaskPicker bot={bot} />
+          <UsageChip bot={bot} />
           <WorkingFolderChip bot={bot} />
           <ModelPicker bot={bot} />
           <CallButton bot={bot} />
@@ -790,6 +999,18 @@ export function ChatView({ bot }: { bot: Bot }) {
           >
             <Monitor size={18} />
           </button>
+          <button
+            onClick={() => dispatch({ type: "toggleInspector" })}
+            aria-label="Inspector"
+            aria-pressed={state.inspectorOpen}
+            className={cn(
+              "rounded-md p-1.5 hover:bg-raised",
+              state.inspectorOpen ? "text-accent" : "text-ink-secondary hover:text-ink",
+            )}
+            title="Inspector — runtime events and raw protocol for this thread"
+          >
+            <Bug size={18} />
+          </button>
         </div>
       </div>
 
@@ -801,6 +1022,21 @@ export function ChatView({ bot }: { bot: Bot }) {
           </div>
         </div>
       )}
+
+      {/* Pinned message banner */}
+      <PinnedBanner
+        bot={bot}
+        pinnedId={bot.pinnedMessageId}
+        messages={messages}
+        onJump={(messageId) =>
+          dispatch({ type: "focusMessage", threadId: bot.threadId, messageId })
+        }
+        onUnpin={() =>
+          dispatch({ type: "updateBot", botId: bot.id, patch: { pinnedMessageId: "" } })
+        }
+      />
+
+      <TaskTimeline messages={messages} busy={bot.busy ?? false} />
 
       {/* Messages */}
       <div
@@ -858,6 +1094,16 @@ export function ChatView({ bot }: { bot: Bot }) {
             onSubmitEdit={submitEdit}
             onRegenerate={regenerate}
           />
+          {laterCount > 0 && (
+            <div className="flex justify-center">
+              <button
+                onClick={showLater}
+                className="rounded-full border border-hairline/40 bg-panel px-3 py-1 text-[12.5px] text-ink-secondary hover:bg-raised hover:text-ink"
+              >
+                Show later messages ({laterCount} more)
+              </button>
+            </div>
+          )}
           {provisioning && (
             <div className="flex justify-start">
               <div className="flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px] text-ink-secondary">
@@ -912,6 +1158,35 @@ export function ChatView({ bot }: { bot: Bot }) {
   );
 }
 
+/** What the open task has spent — quiet until the first turn settles.
+ * Click opens the bot's settings, where the Usage card has the breakdown. */
+function UsageChip({ bot }: { bot: Bot }) {
+  const { state, dispatch } = useStore();
+  const usage = bot.tasks?.find((t) => t.threadId === bot.threadId)?.usage;
+  const text = usage ? usageChip(usage) : "";
+  if (!usage || !text) return null;
+  const billing = state.instances.find((i) => i.instanceId === bot.modelSelection.instanceId)?.snapshot.billing;
+  const detail = [
+    `${usage.turns} turn${usage.turns === 1 ? "" : "s"}`,
+    `${formatTokens(usage.input)} in · ${formatTokens(usage.output)} out`,
+    hasFiniteCost(usage.costUsd) ? `${formatUsd(usage.costUsd)} ${costCaption(billing)}` : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  // folded: one figure — cost when the engine reports one, else tokens
+  const short = usage.costUsd !== null ? formatUsd(usage.costUsd) : formatTokens(usage.input + usage.output);
+  return (
+    <button
+      onClick={() => dispatch({ type: "toggleSettings", open: true })}
+      className="whitespace-nowrap rounded-full border border-hairline/40 bg-raised/60 px-2.5 py-1 text-[12px] tabular-nums text-ink-secondary hover:bg-raised hover:text-ink @max-4xl/chathead:px-2"
+      title={detail}
+    >
+      <span className="@max-4xl/chathead:hidden">{text}</span>
+      <span className="hidden @max-4xl/chathead:inline">{short}</span>
+    </button>
+  );
+}
+
 /** The folder this task's tools run in — quiet unless it's somewhere other
  * than home. Shows the pinned task folder when there is one, else the bot's
  * folder a first turn would pin. Click opens bot settings to change it. */
@@ -924,11 +1199,14 @@ function WorkingFolderChip({ bot }: { bot: Bot }) {
   return (
     <button
       onClick={() => dispatch({ type: "toggleSettings", open: true })}
-      className="flex max-w-[180px] items-center gap-1.5 rounded-full border border-hairline/40 bg-raised/60 px-2.5 py-1 text-[12.5px] text-ink-secondary hover:bg-raised hover:text-ink"
+      className={cn(
+        "flex max-w-[180px] items-center gap-1.5 rounded-full border border-hairline/40 bg-raised/60 px-2.5 py-1 text-[12.5px] text-ink-secondary hover:bg-raised hover:text-ink",
+        COMPACT_SQUARE,
+      )}
       title={`Working folder: ${folder}`}
     >
-      <Folder size={12} />
-      <span className="truncate font-mono">{name}</span>
+      <Folder size={12} className="@max-4xl/chathead:size-[14px]" />
+      <span className="truncate font-mono @max-4xl/chathead:hidden">{name}</span>
     </button>
   );
 }

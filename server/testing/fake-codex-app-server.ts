@@ -4,17 +4,17 @@
 // initialize/thread/turn handshake, then plays a scripted turn. Like the
 // real app-server, it never exits on its own — the driver kills it.
 //
-//   FAKE_CODEX_MODE   happy (default) | approval | resume | stream |
-//                     logged-out | unauthorized
+//   FAKE_CODEX_MODE   happy (default) | approval | resume | stream | windows-command |
+//                     mcp-elicitation | logged-in-stdout | logged-out | unauthorized
 //   FAKE_CODEX_DUMP   path to write {argv, env, calls, decision} as JSON
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 
 const mode = process.env.FAKE_CODEX_MODE ?? "happy";
 
 if (process.argv[2] === "--version") {
-  process.stdout.write("codex-cli 0.146.0\n");
+  process.stdout.write("codex-cli 0.147.0\n");
   process.exit(0);
 }
 if (process.argv[2] === "login" && process.argv[3] === "status") {
@@ -22,7 +22,10 @@ if (process.argv[2] === "login" && process.argv[3] === "status") {
     process.stderr.write("Not logged in\n");
     process.exit(1);
   }
-  process.stdout.write("Logged in using ChatGPT\n");
+  // Codex 0.147.0 reports a successful login on stderr; retain a mode for
+  // older versions that wrote the same status on stdout.
+  const statusStream = mode === "logged-in-stdout" ? process.stdout : process.stderr;
+  statusStream.write("Logged in using ChatGPT\n");
   process.exit(0);
 }
 const calls: Array<{ method: string; params: unknown }> = [];
@@ -42,6 +45,7 @@ const dump = () => {
 
 const finishTurn = () => {
   notify("item/completed", { item: { id: "i1", type: "commandExecution", status: "completed" } });
+  notify("item/completed", { item: { id: "w1", type: "webSearch", status: "completed" } });
   if (mode === "stream") {
     // token deltas, then the whole message — the driver must not double-emit
     notify("item/agentMessage/delta", { itemId: "m1", delta: "done from " });
@@ -69,7 +73,7 @@ process.stdin.on("data", (chunk) => {
     }
 
     // response to our own server->client request (approval decision)
-    if (msg.id === 100 && (msg.result !== undefined || msg.error !== undefined)) {
+    if ((msg.id === 100 || msg.id === 101) && (msg.result !== undefined || msg.error !== undefined)) {
       decision = msg.result ?? { error: msg.error };
       finishTurn();
       continue;
@@ -81,6 +85,32 @@ process.stdin.on("data", (chunk) => {
       case "initialize":
         out({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
         break;
+      case "model/list":
+        if (msg.params?.cursor === "page-2") {
+          out({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: {
+              data: [
+                { id: "gpt-hidden", displayName: "Hidden", hidden: true, isDefault: false },
+                { id: "gpt-page-two", displayName: "GPT Page Two", hidden: false, isDefault: false },
+              ],
+              nextCursor: null,
+            },
+          });
+        } else {
+          out({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: {
+              data: [
+                { id: "gpt-fake-default", displayName: "GPT Fake Default", hidden: false, isDefault: true },
+              ],
+              nextCursor: "page-2",
+            },
+          });
+        }
+        break;
       case "thread/resume":
         if (mode === "resume") {
           out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: msg.params?.threadId } } });
@@ -91,7 +121,7 @@ process.stdin.on("data", (chunk) => {
       case "thread/start":
         out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: "codex-thread-1" }, model: "fake-codex-model" } });
         break;
-      case "turn/start":
+      case "turn/start": {
         if (mode === "unauthorized") {
           out({
             jsonrpc: "2.0",
@@ -103,15 +133,65 @@ process.stdin.on("data", (chunk) => {
           });
           break;
         }
+        // transient-failure script for retry tests. FAKE_CODEX_TRANSIENTS is
+        // how many launches fail transiently; the launch count lives in a
+        // state FILE because child processes cannot mutate the parent's env.
+        // FAKE_CODEX_PARTIAL_FAILS makes the FIRST failing turn stream a text
+        // delta first, so the partial-output guard has something to see.
+        if (process.env.FAKE_CODEX_TRANSIENTS && process.env.FAKE_CODEX_STATE) {
+          let launched = 0;
+          try {
+            launched = Number(readFileSync(process.env.FAKE_CODEX_STATE, "utf8")) || 0;
+          } catch {}
+          const quota = Number(process.env.FAKE_CODEX_TRANSIENTS) || 0;
+          writeFileSync(process.env.FAKE_CODEX_STATE, String(launched + 1));
+          if (launched < quota) {
+            if (process.env.FAKE_CODEX_PARTIAL_FAILS) {
+              out({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
+              notify("item/agentMessage/delta", { itemId: "m1", delta: "half an answer" });
+              notify("turn/completed", { turn: { status: "failed", error: { message: "provider overloaded, try again" } } });
+              break;
+            }
+            out({
+              jsonrpc: "2.0",
+              id: msg.id,
+              error: { code: -32603, message: "provider returned 503: upstream capacity exceeded" },
+            });
+            break;
+          }
+        }
         out({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
-        notify("item/started", { item: { id: "i1", type: "commandExecution", command: "ls -la" } });
-        if (mode === "approval") {
-          out({ jsonrpc: "2.0", id: 100, method: "execCommandApproval", params: { command: "rm -rf scratch" } });
+        const command = mode === "windows-command"
+          ? [
+              "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\"",
+              "-Command",
+              `\"Get-Content -Raw -LiteralPath 'C:\\Users\\Ada\\workspaces\\${"very-long-folder\\".repeat(8)}NOTES.md'\"`,
+            ].join(" ")
+          : "ls -la";
+        notify("item/started", { item: { id: "i1", type: "commandExecution", command } });
+        notify("item/started", { item: { id: "w1", type: "webSearch", query: "OpenMausBot" } });
+        if (mode === "mcp-elicitation") {
+          out({
+            jsonrpc: "2.0",
+            id: 101,
+            method: "mcpServer/elicitation/request",
+            params: {
+              serverName: "agents",
+              mode: "form",
+              _meta: { codex_approval_kind: "mcp_tool_call", tool_params: {} },
+              message: 'Allow the agents MCP server to run tool "list_bots"?',
+              requestedSchema: { type: "object", properties: {} },
+            },
+          });
+        } else if (mode === "approval" || mode === "windows-command") {
+          const approvalCommand = mode === "windows-command" ? command : "rm -rf scratch";
+          out({ jsonrpc: "2.0", id: 100, method: "execCommandApproval", params: { command: approvalCommand } });
           // turn continues from the approval response handler above
         } else {
           finishTurn();
         }
         break;
+      }
       default:
         if (msg.id !== undefined) out({ jsonrpc: "2.0", id: msg.id, result: {} });
     }

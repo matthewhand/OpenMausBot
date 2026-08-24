@@ -5,7 +5,8 @@
 // session/prompt, and streams session/update notifications for a scripted
 // turn. Failure modes mirror how real ACP agents misbehave:
 //
-//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | hang | no-auth | auth-required | permission
+//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | fail-after-text | hang | no-auth | auth-required | permission
+//                   | interleave (message → tool → message → tool → message)
 //                   | no-session-config (reject session/set_mode + set_model
 //                     with -32601, i.e. an agent predating those methods)
 //                   | ask-peer (spawn the injected "agents" MCP server from
@@ -13,6 +14,13 @@
 //                     peer, and reply with what the peer said — the comms e2e)
 //                   | delegate-peer (same as ask-peer but uses delegate_bot —
 //                     returns immediately, the peer runs after our turn)
+//                   | create-peer (a Chief creates a specialist, then delegates
+//                     work to it through the returned id)
+//                   | echo-gated (reply by echoing the full prompt, and when
+//                     FAKE_ACP_GATE_FILE is set hold the turn open until that
+//                     file exists — a deterministic busy window for the
+//                     steer-queue e2e, with the echo pinning exactly what a
+//                     drained turn was sent)
 //   FAKE_ACP_DUMP   path to write {argv, env} as JSON, so a test can assert
 //                   argv shape (agent/stdio flags) and env hygiene
 //   FAKE_ACP_MODELS      comma-separated model ids. Enables the opencode-shaped
@@ -27,7 +35,7 @@
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 
 const mode = process.env.FAKE_ACP_MODE ?? "happy";
 // opencode-shaped surface: the session carries its own model catalog and the
@@ -49,29 +57,94 @@ const configOptions = () =>
         },
       ]
     : null;
+// cursor-shaped surface: the session advertises `models.availableModels` with
+// parameterised ids (`default[]`) that differ from the argv `--model` slugs
+// (`auto`). Off unless FAKE_ACP_SESSION_MODELS is set, so every existing mode
+// stays byte-identical. Format: "id|Name,id|Name" — the name is optional.
+const acpModels = (process.env.FAKE_ACP_SESSION_MODELS ?? "")
+  .split(",")
+  .filter(Boolean)
+  .map((entry) => {
+    const [modelId, name] = entry.split("|");
+    return name ? { modelId, name } : { modelId };
+  });
+const sessionModels = () =>
+  acpModels.length ? { currentModelId: acpModels[0].modelId, availableModels: acpModels } : null;
+
 const argv = process.argv.slice(2);
+const dumpEnv = Object.fromEntries(
+  [
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "SystemRoot",
+    "FAKE_ACP_MODE",
+    "FAKE_ACP_RPC_DUMP",
+    "TEST_POLICY",
+    "OPENCODE_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "XAI_API_KEY",
+    "BOX_TOKEN",
+    "OMB_TTS_KEY",
+    "FACTORY_API_KEY",
+    "UNSLOTH_STUDIO_AUTH_TOKEN",
+    "CURSOR_API_KEY",
+    "CURSOR_AUTH_TOKEN",
+    "KIMI_MODEL_NAME",
+    "KIMI_MODEL_API_KEY",
+    "KIMI_MODEL_BASE_URL",
+    "KIMI_MODEL_PROVIDER_TYPE",
+    "KIMI_MODEL_DISPLAY_NAME",
+    "TEST_TURN_MODEL",
+  ].flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]] as const)),
+);
+const dumpState: Record<string, unknown> = { argv, env: dumpEnv };
 if (process.env.FAKE_ACP_DUMP) {
-  const dumpEnv = Object.fromEntries(
-    [
-      "PATH",
-      "HOME",
-      "USERPROFILE",
-      "SystemRoot",
-      "FAKE_ACP_MODE",
-      "FAKE_ACP_RPC_DUMP",
-      "TEST_POLICY",
-      "OPENCODE_API_KEY",
-      "OPENAI_API_KEY",
-      "OPENROUTER_API_KEY",
-      "ANTHROPIC_API_KEY",
-      "XAI_API_KEY",
-      "UNSLOTH_STUDIO_AUTH_TOKEN",
-    ].flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]] as const)),
-  );
   writeFileSync(process.env.FAKE_ACP_DUMP, JSON.stringify({ argv, env: dumpEnv }, null, 2));
 }
 if (argv.includes("--version")) {
   console.log("fake-acp 1.0.0");
+  process.exit(0);
+}
+// Cursor's driver probes `agent status` / `agent models` on the same binary
+// it later spawns for ACP. Answer those without entering the JSON-RPC loop
+// so catalog/auth tests do not hang on stdin.
+if (argv[0] === "status" || argv[0] === "whoami") {
+  const authenticated = process.env.FAKE_ACP_AUTH !== "0";
+  console.log(JSON.stringify({ isAuthenticated: authenticated }));
+  process.exit(0);
+}
+if (argv[0] === "models" || argv.includes("--list-models")) {
+  if (models.length) {
+    const verbose = argv.includes("--verbose");
+    console.log(
+      models.flatMap((slug) => verbose
+        ? [
+            slug,
+            JSON.stringify({
+              id: slug.slice(slug.indexOf("/") + 1),
+              providerID: slug.slice(0, slug.indexOf("/")),
+              name: slug,
+              status: "active",
+              limit: { context: 200_000 },
+            }, null, 2),
+          ]
+        : [slug]).join("\n"),
+    );
+    process.exit(0);
+  }
+  console.log(
+    [
+      "Available models",
+      "",
+      "auto - Auto (default)",
+      "composer-2.5 - Composer 2.5 (current)",
+      "gpt-5.3-codex - Codex 5.3",
+      "cursor-live - Cursor Live",
+    ].join("\n"),
+  );
   process.exit(0);
 }
 
@@ -150,6 +223,17 @@ function playTurn() {
   out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "tool_call_update", toolCallId: "tc-1", status: "completed" } } });
 }
 
+/** Scripted text → tool → text → tool → text turn for order-contract tests. */
+function playInterleaveTurn() {
+  out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "before one" } } } });
+  out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "tool_call", toolCallId: "tc-1", title: "run" } } });
+  out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "tool_call_update", toolCallId: "tc-1", status: "completed" } } });
+  out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "before two" } } } });
+  out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "tool_call", toolCallId: "tc-2", title: "run" } } });
+  out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "tool_call_update", toolCallId: "tc-2", status: "completed" } } });
+  out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "after" } } } });
+}
+
 let buf = "";
 process.stdin.on("data", (c) => {
   buf += c;
@@ -201,14 +285,27 @@ function handle(msg: any) {
         break;
       }
       const servers: McpEntry[] = Array.isArray(msg.params?.mcpServers) ? msg.params.mcpServers : [];
+      if (process.env.FAKE_ACP_DUMP) {
+        dumpState.mcpServers = servers;
+        writeFileSync(process.env.FAKE_ACP_DUMP, JSON.stringify(dumpState, null, 2));
+      }
       agentsMcp = servers.find((s: any) => s?.name === "agents") ?? null;
+      if (process.env.FAKE_ACP_DUMP) {
+        writeFileSync(`${process.env.FAKE_ACP_DUMP}.mcp.json`, JSON.stringify(servers, null, 2));
+      }
       const opts = configOptions();
-      result(msg.id, opts ? { sessionId: "fake-acp-session", configOptions: opts } : { sessionId: "fake-acp-session" });
+      const mdls = sessionModels();
+      result(msg.id, {
+        sessionId: "fake-acp-session",
+        ...(opts ? { configOptions: opts } : {}),
+        ...(mdls ? { models: mdls } : {}),
+      });
       break;
     }
     case "session/load": {
       const opts = configOptions();
-      result(msg.id, opts ? { configOptions: opts } : {});
+      const mdls = sessionModels();
+      result(msg.id, { ...(opts ? { configOptions: opts } : {}), ...(mdls ? { models: mdls } : {}) });
       break;
     }
     // per-session settings (droid sets model/autonomy here, not via argv).
@@ -220,6 +317,11 @@ function handle(msg: any) {
       if (mode === "no-session-config") {
         // an older agent that predates these methods
         return out({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "method not found" } });
+      }
+      if (mode === "set-model-invalid-params" && msg.method === "session/set_model") {
+        // an agent whose ACP model namespace does not contain the id it was
+        // sent — Cursor's answer when handed an argv slug like `auto`.
+        return out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Invalid params" } });
       }
       const settingId = msg.method === "session/set_mode" ? "modeId" : "modelId";
       if (typeof msg.params?.sessionId !== "string" || typeof msg.params?.[settingId] !== "string") {
@@ -260,6 +362,16 @@ function handle(msg: any) {
         setInterval(() => {}, 1_000);
         return;
       }
+      if (mode === "fail-after-text") {
+        // Stream real text, THEN fail the turn — the shape of a crash
+        // mid-answer. This is the one case where the routine-failed/done
+        // notification dedup is load-bearing: the reply is non-empty, so
+        // nothing else suppresses the generic done.
+        out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "half a report, then a crash" } } } });
+        recordMethod("session/prompt.error");
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "fake acp: turn failed after streaming" } });
+        return;
+      }
       const complete = () => {
         recordMethod("session/prompt.result");
         result(
@@ -292,6 +404,57 @@ function handle(msg: any) {
           });
         return;
       }
+      if (mode === "create-peer" && agentsMcp) {
+        void driveMcp(agentsMcp, [
+          {
+            name: "create_bot",
+            args: () => ({
+              name: "Pixel",
+              role: "Product designer",
+              instructions: "Design and review the user experience.",
+            }),
+          },
+          {
+            name: "delegate_bot",
+            args: (created) => ({
+              bot_id: /id: ([\w-]+)/.exec(created)?.[1] ?? "",
+              message: "Review the new onboarding flow.",
+              reason: "design review",
+            }),
+          },
+        ])
+          .then((reply) => {
+            out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: `team created: ${reply}` } } } });
+            complete();
+          })
+          .catch((e) => {
+            const message = e instanceof Error ? e.message : String(e);
+            out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: `create error: ${message}` } } } });
+            complete();
+          });
+        return;
+      }
+      if (mode === "echo-gated") {
+        // echoing the WHOLE prompt (system + turn text) lets a test assert
+        // both what a drained turn was sent and what it was NOT sent (e.g.
+        // the webhook untrusted-data paragraph a steered turn must not get)
+        const promptText = String(msg.params?.prompt?.[0]?.text ?? "");
+        const finish = () => {
+          out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: `echo: ${promptText}` } } } });
+          complete();
+        };
+        const gate = process.env.FAKE_ACP_GATE_FILE;
+        if (gate && !existsSync(gate)) {
+          const poll = setInterval(() => {
+            if (!existsSync(gate)) return;
+            clearInterval(poll);
+            finish();
+          }, 50);
+          return;
+        }
+        finish();
+        return;
+      }
       if (mode === "delegate-peer" && agentsMcp) {
         // async peer-handoff e2e: queue the delegation and return
         // immediately; the harness fires the peer's depth-1 turn after our
@@ -318,7 +481,8 @@ function handle(msg: any) {
           });
         return;
       }
-      if (mode !== "empty-reply") playTurn();
+      if (mode === "interleave") playInterleaveTurn();
+      else if (mode !== "empty-reply") playTurn();
       if (mode === "permission") {
         // ask the client to approve a tool, then complete once answered
         pendingPermissionId = 9001;
