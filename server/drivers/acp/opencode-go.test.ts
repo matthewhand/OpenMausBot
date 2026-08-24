@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach } from "vitest";
+﻿import { describe, expect, it, beforeEach } from "vitest";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -28,8 +28,9 @@ describe("OpenCode Go catalog", () => {
       }), { status: 200 }),
     );
 
-    expect(models.default).toBe("opencode-go/minimax-m3");
+    expect(models.default).toBe("opencode/x-preview-f-free");
     expect(models.options.filter((option) => !option.custom).map((option) => option.id)).toEqual([
+      "opencode/x-preview-f-free",
       "opencode-go/minimax-m3",
       "opencode-go/kimi-k3",
       "opencode-go/glm-5.2",
@@ -46,7 +47,7 @@ describe("OpenCode Go catalog", () => {
       throw new Error("network down");
     });
 
-    expect(fallback.default).toBe("opencode-go/minimax-m3");
+    expect(fallback.default).toBe("opencode/x-preview-f-free");
     expect(fallback.options.some((option) => option.id === "opencode-go/extra-live" && option.custom)).toBe(true);
   });
 
@@ -65,7 +66,7 @@ describe("OpenCode Go catalog", () => {
       config: driver.defaultConfig(),
     });
 
-    expect(instance.models.default).toBe("opencode-go/minimax-m3");
+    expect(instance.models.default).toBe("opencode/x-preview-f-free");
     expect(instance.models.options.some((option) => option.custom)).toBe(false);
     await instance.refreshModels?.();
     expect(instance.models.options.some((option) => option.id === "opencode-go/extra-two" && option.custom)).toBe(true);

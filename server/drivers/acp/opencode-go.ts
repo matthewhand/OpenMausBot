@@ -10,13 +10,26 @@ import type { ModelCatalog, ProviderErrorCode } from "../../contracts.ts";
 
 const CATALOG_URL = "https://opencode.ai/zen/go/v1/models";
 const STATIC_MODELS: ModelCatalog = {
-  default: "opencode-go/minimax-m3",
+  default: "opencode/x-preview-f-free",
   options: [
+    { id: "opencode/x-preview-f-free", label: "Zen · Ox Alpha Free" },
     { id: "opencode-go/minimax-m3", label: "Minimax M3" },
     { id: "opencode-go/kimi-k3", label: "Kimi K3" },
     { id: "opencode-go/glm-5.2", label: "GLM 5.2" },
   ],
 };
+
+/** Migrate the model name published during Ox Alpha's first preview. The
+ * current CLI calls the same model `x-preview-f-free`; prefer Go only for a
+ * bot with an explicit OPENCODE_API_KEY, otherwise use Zen's anonymous/free
+ * route — a key alone does not imply an active Go subscription. */
+export function normalizeLegacyOpenCodeModel(
+  model: string,
+  env: Record<string, string | undefined> = process.env,
+): string {
+  if (model !== "opencode-go/ox-alpha-free") return model;
+  return env.OPENCODE_API_KEY ? "opencode-go/x-preview-f-free" : "opencode/x-preview-f-free";
+}
 
 let lastSuccessfulCatalog: ModelCatalog | null = null;
 
@@ -197,7 +210,8 @@ const support = (fetcher: typeof fetch): AcpSupport => ({
   spawnArgs: () => ["acp"],
   credentialEnv: ["OPENCODE_API_KEY"],
   selectModel: { configId: "model" },
-  resolveTurnModel: (model, env) => (model ? ensureOpenCodeInjectModel(model, env) : model),
+  resolveTurnModel: (model, env) =>
+    model ? ensureOpenCodeInjectModel(normalizeLegacyOpenCodeModel(model, env), env) : model,
   transformEnv: stripForeignProviderKeys,
   pickAuthMethod: () => null,
   authFailure: "continue",
