@@ -120,7 +120,7 @@ export function PluginsPanel() {
         setCards(r.cards ?? []);
         setSource(r.source ?? "curated");
         setConfigured(Boolean(r.configured));
-        if (r.configured) void refreshStatus((r.cards ?? []).map((c: ToolkitCard) => c.slug).slice(0, 40));
+        if (r.configured) void refreshStatus((r.cards ?? []).map((c: ToolkitCard) => c.slug));
       })
       .catch((e) => alive && setError(e.message));
     return () => {
@@ -220,6 +220,11 @@ export function PluginsPanel() {
   };
 
   const disconnect = (slug: string) => {
+    const timer = pollTimers.current.get(slug);
+    if (timer) {
+      clearInterval(timer);
+      pollTimers.current.delete(slug);
+    }
     setBusySlug(slug);
     api(`/api/connectors/${slug}`, { method: "DELETE" })
       .then(() => refreshStatus([slug]))

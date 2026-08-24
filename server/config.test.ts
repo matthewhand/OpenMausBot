@@ -23,6 +23,22 @@ describe("configuration boundaries", () => {
     });
   });
 
+  it("parses and validates TTS model configuration", () => {
+    const stored = parseStoredConfig({
+      tts: { provider: "openai-compatible", baseUrl: "http://127.0.0.1:9093/v1", model: "kokoro" },
+    });
+    expect(stored.tts).toEqual({
+      provider: "openai-compatible",
+      baseUrl: "http://127.0.0.1:9093/v1",
+      model: "kokoro",
+    });
+
+    const patched = parseConfigPatch({
+      tts: { model: "tts-1-hd" },
+    });
+    expect(patched.tts).toEqual({ model: "tts-1-hd" });
+  });
+
   it("rejects malformed stored instances and API patches", () => {
     expect(() => parseStoredConfig({ instances: { claude: { driver: 42 } } })).toThrow("instances.claude.driver");
     expect(() => parseConfigPatch({ opencodeGo: { apiKey: 42 } })).toThrow("opencodeGo.apiKey");

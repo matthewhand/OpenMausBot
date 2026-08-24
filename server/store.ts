@@ -2,7 +2,7 @@
 // thread→instance binding and per-instance resume cursors — upstream's
 // ProviderSessionDirectory, recipe step 6: persist the binding from day
 // one). messages-<threadId>.json holds the folded transcript.
-import { existsSync, readFileSync, mkdirSync, rmSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, renameSync, rmSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 import { writeFileAtomic } from "./atomic.ts";
@@ -355,14 +355,43 @@ export class Store {
   constructor(defaultSelection: () => ModelSelection) {
     this.defaultSelection = defaultSelection;
     mkdirSync(DATA_DIR, { recursive: true });
-    try {
-      this.bots = JSON.parse(readFileSync(BOTS_FILE, "utf8"));
-    } catch {
+    if (existsSync(BOTS_FILE)) {
+      try {
+        const parsed = JSON.parse(readFileSync(BOTS_FILE, "utf8"));
+        if (Array.isArray(parsed)) {
+          this.bots = parsed;
+        } else {
+          throw new Error("bots.json is not an array");
+        }
+      } catch (err) {
+        const backup = `${BOTS_FILE}.corrupted.${Date.now()}`;
+        try {
+          renameSync(BOTS_FILE, backup);
+        } catch {}
+        console.error(`store: failed to load bots.json, backed up to ${backup}`, err);
+        this.bots = [];
+      }
+    } else {
       this.bots = [];
     }
-    try {
-      this.groups = JSON.parse(readFileSync(GROUPS_FILE, "utf8"));
-    } catch {
+
+    if (existsSync(GROUPS_FILE)) {
+      try {
+        const parsed = JSON.parse(readFileSync(GROUPS_FILE, "utf8"));
+        if (Array.isArray(parsed)) {
+          this.groups = parsed;
+        } else {
+          throw new Error("groups.json is not an array");
+        }
+      } catch (err) {
+        const backup = `${GROUPS_FILE}.corrupted.${Date.now()}`;
+        try {
+          renameSync(GROUPS_FILE, backup);
+        } catch {}
+        console.error(`store: failed to load groups.json, backed up to ${backup}`, err);
+        this.groups = [];
+      }
+    } else {
       this.groups = [];
     }
     // busy never survives a restart — no turn does either. Rooms saved

@@ -11,8 +11,9 @@ export function readLanAuthToken(
   try {
     const fromQuery = new URLSearchParams(search.startsWith("?") ? search.slice(1) : search).get("access_token");
     if (fromQuery) {
-      storage?.setItem(STORAGE_KEY, fromQuery);
-      return fromQuery;
+      const trimmed = fromQuery.trim();
+      storage?.setItem(STORAGE_KEY, trimmed);
+      return trimmed;
     }
     return storage?.getItem(STORAGE_KEY) ?? "";
   } catch {
@@ -41,8 +42,43 @@ export function consumeLanAuthTokenFromLocation(
   if (!loc || !hist) return;
   const params = new URLSearchParams(loc.search.startsWith("?") ? loc.search.slice(1) : loc.search);
   if (!params.has("access_token")) return;
-  readLanAuthToken(loc.search);
+  const token = readLanAuthToken(loc.search);
   params.delete("access_token");
   const next = params.toString();
   hist.replaceState(null, "", `${loc.pathname}${next ? `?${next}` : ""}${loc.hash}`);
+  if (token && typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent("omb:auth-change", { detail: token }));
+  }
+}
+
+export function saveLanAuthToken(
+  token: string,
+  storage: Pick<Storage, "setItem" | "removeItem"> | null = typeof localStorage === "undefined" ? null : localStorage,
+): void {
+  try {
+    const trimmed = token.trim();
+    if (trimmed) {
+      storage?.setItem(STORAGE_KEY, trimmed);
+    } else {
+      storage?.removeItem(STORAGE_KEY);
+    }
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("omb:auth-change", { detail: trimmed }));
+    }
+  } catch {
+    /* ignore storage errors */
+  }
+}
+
+export function clearLanAuthToken(
+  storage: Pick<Storage, "removeItem"> | null = typeof localStorage === "undefined" ? null : localStorage,
+): void {
+  try {
+    storage?.removeItem(STORAGE_KEY);
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("omb:auth-change", { detail: "" }));
+    }
+  } catch {
+    /* ignore storage errors */
+  }
 }

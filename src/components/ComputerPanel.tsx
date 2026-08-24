@@ -17,25 +17,14 @@ import {
   Settings,
   X,
 } from "lucide-react";
-import { useStore, type Bot } from "@/state/store";
+import { useStore, api, type Bot } from "@/state/store";
 import type { Routine } from "@/lib/routines";
 import { ApiKeyRow } from "./ApiKeys";
 import { cn } from "@/lib/cn";
 import { frameSrc } from "@/lib/frame-src";
 import { canOpenExternalUrl } from "@/lib/loopback-viewer";
-import { lanAuthHeaders } from "@/lib/lan-auth";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { RoutineEditor } from "./RoutinesPage";
-
-async function api(path: string, init?: RequestInit): Promise<any> {
-  const res = await fetch(path, {
-    ...init,
-    headers: { "content-type": "application/json", ...lanAuthHeaders(), ...(init?.headers ?? {}) },
-  });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error ?? `${res.status} ${res.statusText}`);
-  return body;
-}
 
 type Phase =
   | "checking"

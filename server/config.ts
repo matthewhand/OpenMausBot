@@ -36,13 +36,16 @@ const appConfigSchema = z.object({
   /** Voice. Supports ElevenLabs and OpenAI-compatible servers (Kokoro, etc.).
    * `provider` defaults to "elevenlabs" for backward compatibility.
    * `key` is the credential and is never echoed back; `voice` is the chosen
-   * voice id. OpenAI-compatible servers need `baseUrl` and optionally `key`. */
+   * voice id. OpenAI-compatible servers need `baseUrl` and optionally `key`.
+   * `model` is the OpenAI-compatible speech model slug (default tts-1). LiteLLM
+   * kokoro routes need model=kokoro rather than tts-1. */
   tts: z
     .object({
       provider: z.enum(["elevenlabs", "openai-compatible"]).optional(),
       key: optionalText,
       voice: optionalText,
       baseUrl: optionalText,
+      model: optionalText,
     })
     .optional(),
   /** Non-secret profile details shown in the sidebar. */
@@ -106,7 +109,13 @@ export interface AppConfig {
    * `provider` defaults to "elevenlabs" for backward compatibility.
    * `key` is the credential and is never echoed back; `voice` is the chosen
    * voice id. OpenAI-compatible servers need `baseUrl` and optionally `key`. */
-  tts?: { provider?: "elevenlabs" | "openai-compatible"; key?: string; voice?: string; baseUrl?: string };
+  tts?: {
+    provider?: "elevenlabs" | "openai-compatible";
+    key?: string;
+    voice?: string;
+    baseUrl?: string;
+    model?: string;
+  };
   /** The person using the app (collected in onboarding, shown in the
    * sidebar). Not a secret — echoed back by GET /api/config. */
   profile?: { name?: string; email?: string };
@@ -189,6 +198,7 @@ export function loadConfig(): AppConfig {
     provider: process.env.OMB_TTS_PROVIDER as "elevenlabs" | "openai-compatible" | undefined,
     key: process.env.OMB_TTS_KEY,
     baseUrl: process.env.OMB_TTS_BASE_URL,
+    model: process.env.OMB_TTS_MODEL,
     ...cfg.tts,
   };
   return cfg;

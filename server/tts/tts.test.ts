@@ -110,10 +110,11 @@ describe("configuration", () => {
     expect(JSON.stringify(described)).not.toContain("sk-secret");
   });
 
-  it("reports baseUrl for OpenAI-compatible (not a secret)", async () => {
+  it("reports baseUrl and model for OpenAI-compatible (not a secret)", async () => {
     const { describeVoice } = await voice();
-    const described = describeVoice(cfg({ provider: "openai-compatible", baseUrl: "http://localhost", voice: "v-1" }));
+    const described = describeVoice(cfg({ provider: "openai-compatible", baseUrl: "http://localhost", model: "kokoro", voice: "v-1" }));
     expect(described.baseUrl).toBe("http://localhost");
+    expect(described.model).toBe("kokoro");
     expect(described.configured).toBe(true);
   });
 
@@ -227,6 +228,15 @@ describe("OpenAI-compatible", () => {
     expect(call.headers.authorization).toBe("Bearer sk-test");
   });
 
+  it("verifies with custom model parameter when provided", async () => {
+    refuse = null;
+    seen.length = 0;
+    const { verifyKey } = await voice();
+    expect(await verifyKey("", "openai-compatible", baseUrl(), "kokoro")).toEqual({ ok: true });
+    const call = seen.at(-1)!;
+    expect(JSON.parse(call.body)).toMatchObject({ model: "kokoro" });
+  });
+
   it("lists voices from the server", async () => {
     const { listVoices } = await voice();
     const voices = await listVoices(openaiCfg({ voice: "af_heart" }));
@@ -245,6 +255,13 @@ describe("OpenAI-compatible", () => {
     expect(call.method).toBe("POST");
     expect(call.url).toContain("/audio/speech");
     expect(JSON.parse(call.body)).toMatchObject({ model: "tts-1", input: "hello there", voice: "af_heart" });
+  });
+
+  it("sends a custom OpenAI-compatible model slug", async () => {
+    seen.length = 0;
+    const { speak } = await voice();
+    await speak(openaiCfg({ voice: "af_sky", model: "kokoro" }), "hello there");
+    expect(JSON.parse(seen.at(-1)!.body)).toMatchObject({ model: "kokoro", voice: "af_sky" });
   });
 
   it("sends Authorization header when key is provided", async () => {

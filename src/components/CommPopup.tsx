@@ -124,12 +124,24 @@ export function CommPopup({
           {!group && (
             <div className="py-10 text-center text-[13px] text-ink-secondary">This exchange is no longer available.</div>
           )}
-          {group && messages.length === 0 && (
+          {group && messages.length === 0 && !group.busyBotId && (
             <div className="py-10 text-center text-[13px] text-ink-secondary">No messages in this exchange yet.</div>
           )}
           {messages.map((m) => (
             <CommPopupRow key={m.id} message={m} />
           ))}
+          {group?.busyBotId && (
+            <div className="flex flex-col items-start">
+              <div className="mb-1 flex items-center gap-1.5 pl-0.5">
+                <MausAvatar color={withColor} state="happy" size={14} />
+                <span className="text-[11px] font-medium text-ink-secondary">{withName}</span>
+              </div>
+              <div className="flex items-center gap-2 rounded-2xl bg-card px-3.5 py-2 text-[13px] text-ink-secondary">
+                <span className="inline-block size-2 animate-pulse rounded-full bg-accent" />
+                <span>Thinking…</span>
+              </div>
+            </div>
+          )}
         </div>
 
         {group && (

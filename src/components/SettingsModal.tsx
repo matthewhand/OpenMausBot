@@ -3,19 +3,21 @@
 // is the stuff shared by every bot: who you are, your keys, and the
 // machine your bots can borrow.
 import { useEffect, useRef, useState } from "react";
-import { KeyRound, Monitor, Smartphone, Terminal, User, Volume2, X } from "lucide-react";
+import { KeyRound, Monitor, Network, Smartphone, Terminal, User, Volume2, X } from "lucide-react";
 import { api, useStore, type AppSettingsSection } from "@/state/store";
 import { ApiKeyRow } from "./ApiKeys";
 import { useUpdaterState } from "@/lib/updater";
 import { EnginesSettings } from "./EnginesSettings";
 import { LocalComputerSection } from "./LocalComputerSection";
 import { CompanionSection } from "./CompanionSection";
-import { Card } from "./SettingsPrimitives";
+import { Card, CommandLine } from "./SettingsPrimitives";
 import { VoiceSettings } from "./VoiceSettings";
+import { clearLanAuthToken, readLanAuthToken, saveLanAuthToken } from "@/lib/lan-auth";
 import { cn } from "@/lib/cn";
 
 const SECTIONS: Array<{ id: AppSettingsSection; label: string; icon: typeof User }> = [
   { id: "general", label: "General", icon: User },
+  { id: "lan", label: "LAN Access", icon: Network },
   { id: "connections", label: "Connections", icon: KeyRound },
   { id: "engines", label: "Engines", icon: Terminal },
   { id: "companion", label: "Companion", icon: Smartphone },
@@ -93,6 +95,162 @@ function UpdatesRow() {
             : "Check for updates"}
       </button>
     </Card>
+  );
+}
+
+function InlineInterAgentChatRow() {
+  const { state, dispatch } = useStore();
+  return (
+    <Card
+      title="Inline Inter-Agent Chat"
+      subtitle="Display bot-to-bot exchanges solely as inline chips in the transcript, hiding automated pair channels from the sidebar."
+    >
+      <div className="flex items-center justify-between">
+        <span className="text-[13px] text-ink">Hide bot-to-bot channels from sidebar</span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={state.inlineInterAgentChat}
+          onClick={() => dispatch({ type: "setInlineInterAgentChat", enabled: !state.inlineInterAgentChat })}
+          className={cn(
+            "relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none",
+            state.inlineInterAgentChat ? "bg-accent" : "bg-raised hover:bg-raised-hover",
+          )}
+        >
+          <span
+            className={cn(
+              "pointer-events-none inline-block size-5 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out",
+              state.inlineInterAgentChat ? "translate-x-5" : "translate-x-0",
+            )}
+          />
+        </button>
+      </div>
+    </Card>
+  );
+}
+
+function LanAuthRow() {
+  const [token, setToken] = useState(() => readLanAuthToken());
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState("");
+  const [saved, setSaved] = useState(false);
+
+  const save = () => {
+    saveLanAuthToken(val);
+    setToken(readLanAuthToken());
+    setEditing(false);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  const clear = () => {
+    clearLanAuthToken();
+    setToken("");
+    setEditing(false);
+  };
+
+  return (
+    <Card
+      title="LAN Access Token"
+      subtitle="Bearer token stored in this browser for connecting to OpenMausBot servers running with OMB_AUTH_TOKEN."
+    >
+      {editing ? (
+        <div className="flex flex-col gap-2">
+          <input
+            type="password"
+            value={val}
+            onChange={(e) => setVal(e.target.value)}
+            placeholder="Paste access token…"
+            autoComplete="off"
+            className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:outline-none"
+          />
+          <div className="flex justify-end gap-2">
+            <button
+              onClick={() => setEditing(false)}
+              className="rounded-lg bg-raised px-3 py-1.5 text-[12px] text-ink hover:bg-raised-hover"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={save}
+              className="rounded-lg bg-accent px-3 py-1.5 text-[12px] text-white hover:opacity-90"
+            >
+              Save Token
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex items-center justify-between">
+          <div className="text-[13px] text-ink-secondary">
+            {token ? (
+              <span className="flex items-center gap-1.5 text-success">
+                <span className="size-1.5 rounded-full bg-success" /> Stored in browser (••••••••)
+              </span>
+            ) : (
+              "No token stored on this browser"
+            )}
+            {saved && <span className="ml-2 text-[11px] text-success">Saved</span>}
+          </div>
+          <div className="flex gap-2">
+            {token && (
+              <button
+                onClick={clear}
+                className="rounded-lg border border-hairline/40 px-3 py-1.5 text-[12px] text-danger hover:bg-raised"
+              >
+                Clear
+              </button>
+            )}
+            <button
+              onClick={() => {
+                setVal(token);
+                setEditing(true);
+              }}
+              className="rounded-lg border border-hairline/40 px-3 py-1.5 text-[12px] text-ink hover:bg-raised"
+            >
+              {token ? "Change" : "Set Token"}
+            </button>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function LanAccessSection() {
+  const [token] = useState(() => readLanAuthToken());
+  const origin = typeof window !== "undefined" ? window.location.origin : "http://localhost:8800";
+  const shareableUrl = token ? `${origin}/?access_token=${encodeURIComponent(token)}` : origin;
+
+  return (
+    <div className="flex flex-col gap-4">
+      <LanAuthRow />
+
+      <Card
+        title="Direct Connection Link"
+        subtitle="Share this URL to instantly connect to OpenMausBot from your phone, tablet, or another computer on the local network with authentication pre-filled."
+      >
+        <CommandLine command={shareableUrl} />
+      </Card>
+
+      <Card
+        title="LAN Subnet Bypass (Zero-Auth Subnets)"
+        subtitle="To allow entire subnets to access OpenMausBot without entering a token, start the server with OMB_LAN_BYPASS_CIDR."
+      >
+        <div className="flex flex-col gap-2">
+          <div className="text-[12.5px] text-ink-secondary">
+            Example: Bypass authentication for all devices on the <code className="rounded bg-inset px-1 py-0.5 font-mono text-[11.5px] text-ink">10.0.0.0/24</code> subnet:
+          </div>
+          <CommandLine command='$env:OMB_LAN_BYPASS_CIDR="10.0.0.0/24"' />
+        </div>
+      </Card>
+
+      <Card
+        title="Headless Server Startup"
+        subtitle="Command to run OpenMausBot bound to all local network interfaces (0.0.0.0:8800) with LAN authentication:"
+      >
+        <CommandLine command='$env:OMB_HOST="0.0.0.0"; $env:OMB_PORT="8800"; $env:OMB_AUTH_TOKEN=(Get-Content .omb-lan-token).Trim(); node server/index.ts' />
+      </Card>
+    </div>
   );
 }
 
@@ -198,9 +356,12 @@ export function SettingsModal() {
                 <Card title="Profile" subtitle="Shown in the sidebar. Saved as you go.">
                   <ProfileFields />
                 </Card>
+                <InlineInterAgentChatRow />
                 <UpdatesRow />
               </>
             )}
+
+            {section === "lan" && <LanAccessSection />}
 
             {section === "connections" && (
               <Card

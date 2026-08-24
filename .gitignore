@@ -15,3 +15,5 @@ electron/resources/OpenMausBot Speech.app
 release
 .omb-scratch
 .claude/worktrees/
+.env
+.omb-lan-token

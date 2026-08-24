@@ -2,6 +2,11 @@
 
 Run OpenMausBot as a Windows service that starts automatically at boot, without requiring an interactive desktop session. This is ideal for running OpenMausBot on Windows Server or as a headless background service.
 
+> **Cross-Platform Daemons:**
+> - For **Linux (systemd)**, use [`scripts/linux/install-service.sh`](../scripts/linux/install-service.sh)
+> - For **macOS (launchd)**, use [`scripts/macos/install-service.sh`](../scripts/macos/install-service.sh)
+> - For headless LAN access guide across all platforms, see [Headless Web UI and LAN Access](./headless-lan-access.md)
+
 ## Overview
 
 This setup uses **NSSM (Non-Sucking Service Manager)** to wrap the Node.js server as a Windows service. NSSM provides:
@@ -285,11 +290,9 @@ Stop-Service OpenMausBot
 # Modify configuration
 $nssmExe = "$env:TEMP\nssm\nssm.exe"
 
-# Change port
-& $nssmExe set OpenMausBot AppEnvironmentExtra "OMB_PORT=9000"
-
-# Add or update auth token
-& $nssmExe set OpenMausBot AppEnvironmentExtra "OMB_AUTH_TOKEN=new-token"
+# IMPORTANT: Each `nssm set AppEnvironmentExtra` call REPLACES all previous
+# values. Always pass every variable in a single command.
+& $nssmExe set OpenMausBot AppEnvironmentExtra "OMB_HOST=0.0.0.0" "OMB_PORT=9000" "OMB_AUTH_TOKEN=new-token"
 
 # Start the service
 Start-Service OpenMausBot
@@ -410,7 +413,9 @@ However, NSSM is **strongly recommended** over Task Scheduler because:
 
 ## Related Documentation
 
-- [LAN Access Setup](./headless-lan-access.md) - PR #1, required before installing service
+- [LAN Access Setup](./headless-lan-access.md) - Headless setup and LAN access across Linux, macOS, and Windows
+- [Linux systemd Install Script](../scripts/linux/install-service.sh) - Service installer for Linux
+- [macOS launchd Install Script](../scripts/macos/install-service.sh) - Service installer for macOS
 - [Windows Release Build](./.claude/skills/windows-release/SKILL.md) - Building Windows installer
 
 ## Support

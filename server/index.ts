@@ -5,7 +5,7 @@ import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { isIP } from "node:net";
-import { dirname, extname, join } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { z } from "zod";
@@ -13,6 +13,7 @@ import { z } from "zod";
 import { approvalKey, autoDecision } from "./auto-approve.ts";
 import { validateBotCwd } from "./bot-cwd.ts";
 import * as box from "./box.ts";
+import { isIpInCidrs, normalizeClientIp, parseBypassConfig } from "./cidr.ts";
 import * as composio from "./composio.ts";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
 import {
@@ -23,6 +24,35 @@ import {
   setupCommands,
   type LifecycleAction,
 } from "./container-computer.ts";
+
+function loadDotEnv() {
+  if (process.env.NODE_ENV === "test" || process.env.VITEST) return;
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  if (home.includes("omb-") || home.includes("tmp") || home.includes("Temp")) return;
+  for (const envPath of [join(process.cwd(), ".env"), join(dirname(fileURLToPath(import.meta.url)), "..", ".env")]) {
+    if (existsSync(envPath)) {
+      try {
+        const content = readFileSync(envPath, "utf8");
+        for (const line of content.split("\n")) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith("#")) continue;
+          const eqIdx = trimmed.indexOf("=");
+          if (eqIdx <= 0) continue;
+          const key = trimmed.slice(0, eqIdx).trim();
+          let val = trimmed.slice(eqIdx + 1).trim();
+          if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+            val = val.slice(1, -1);
+          }
+          if (!(key in process.env)) {
+            process.env[key] = val;
+          }
+        }
+      } catch {}
+    }
+  }
+}
+loadDotEnv();
+
 import {
   ensureDirs,
   instanceConfigs,
@@ -83,20 +113,42 @@ const HOST = process.env.OMB_HOST || "127.0.0.1";
 // /api/internal/* which has COMMS_TOKEN) require the Authorization header.
 // Defaults to disabled for backward compatibility and local-only use.
 const AUTH_TOKEN = process.env.OMB_AUTH_TOKEN || null;
+// Subnets / CIDRs allowed to bypass LAN authentication without a token (e.g. "10.0.0.0/24" or "true" for all RFC1918 private subnets).
+const LAN_BYPASS_CONFIG =
+  process.env.OMB_LAN_BYPASS_CIDR || process.env.OMB_LAN_BYPASS || process.env.OMB_AUTH_BYPASS_CIDR || null;
+const LAN_BYPASS_CIDRS = parseBypassConfig(LAN_BYPASS_CONFIG);
 // CORS origin for LAN access. Set to "*" or a specific origin (e.g., "http://10.0.0.32:5199").
 // Defaults to null (no CORS headers) for localhost-only setups.
 const CORS_ORIGIN = process.env.OMB_CORS_ORIGIN || null;
 const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
-const STATIC_DIR = process.env.OMB_STATIC_DIR || null;
+const STATIC_DIR =
+  process.env.OMB_STATIC_DIR ||
+  (() => {
+    const fromCwd = join(process.cwd(), "dist");
+    if (existsSync(join(fromCwd, "index.html"))) return fromCwd;
+    const fromModule = join(dirname(fileURLToPath(import.meta.url)), "..", "dist");
+    if (existsSync(join(fromModule, "index.html"))) return fromModule;
+    return null;
+  })();
 const MIME: Record<string, string> = {
   ".html": "text/html",
   ".js": "text/javascript",
+  ".mjs": "text/javascript",
   ".css": "text/css",
   ".svg": "image/svg+xml",
   ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
   ".ico": "image/x-icon",
   ".json": "application/json",
   ".woff2": "font/woff2",
+  ".woff": "font/woff",
+  ".ttf": "font/ttf",
+  ".webmanifest": "application/manifest+json",
+  ".wasm": "application/wasm",
+  ".txt": "text/plain",
+  ".map": "application/json",
 };
 
 ensureDirs();
@@ -121,11 +173,27 @@ function tokenEquals(got: string, expected: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-function authorizedLan(header: string | string[] | undefined, queryToken: string | null): boolean {
-  if (!AUTH_TOKEN) return true;
+function isLanAuthRequired(req: IncomingMessage): boolean {
+  if (!AUTH_TOKEN) return false;
+  if (LAN_BYPASS_CIDRS.length > 0) {
+    const clientIp = normalizeClientIp(req.socket?.remoteAddress);
+    if (isIpInCidrs(clientIp, LAN_BYPASS_CIDRS)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function authorizedLan(req: IncomingMessage, header: string | string[] | undefined, queryToken: string | null): boolean {
+  if (!isLanAuthRequired(req)) return true;
   const raw = Array.isArray(header) ? header[0] : header;
-  const fromHeader = raw?.startsWith("Bearer ") ? raw.slice("Bearer ".length) : "";
-  return tokenEquals(fromHeader || queryToken || "", AUTH_TOKEN);
+  let fromHeader = "";
+  if (raw) {
+    const match = raw.trim().match(/^Bearer\s+(.+)$/i);
+    if (match) fromHeader = match[1].trim();
+  }
+  const query = queryToken ? queryToken.trim() : "";
+  return tokenEquals(fromHeader || query, AUTH_TOKEN!);
 }
 
 function authorizedComms(header: string | string[] | undefined): boolean {
@@ -356,8 +424,16 @@ function broadcast(payload: Record<string, unknown>) {
   // detection stays honest, but never retain their base64 payloads.
   replayBuffer.push({ seq, kind, frame: kind === "screen" ? null : frame });
   if (replayBuffer.length > REPLAY_MAX) replayBuffer.shift();
+  const MAX_SSE_BUFFER = 1024 * 1024; // 1MB backpressure ceiling
   for (const client of [...sseClients]) {
     if (!wants(client, kind)) continue;
+    if (client.res.destroyed || !client.res.writable || client.res.writableLength > MAX_SSE_BUFFER) {
+      sseClients.delete(client);
+      try {
+        client.res.destroy();
+      } catch {}
+      continue;
+    }
     try {
       client.res.write(frame);
     } catch {
@@ -1771,6 +1847,10 @@ let providerConfigBusy = false;
 
 // ── HTTP plumbing ─────────────────────────────────────────────────────
 function json(res: ServerResponse, status: number, body: unknown) {
+  if (res.headersSent) {
+    if (!res.writableEnded) res.end();
+    return;
+  }
   const data = JSON.stringify(body);
   res.writeHead(status, { "content-type": "application/json" });
   res.end(data);
@@ -1791,9 +1871,6 @@ function readBody(req: IncomingMessage): Promise<any> {
       if (done) return;
       bytes += typeof c === "string" ? Buffer.byteLength(c) : c.length;
       if (bytes > 1_000_000) {
-        // Keep draining the socket, but stop retaining attacker-controlled
-        // bytes. Destroying the request here prevents the caller from
-        // receiving the useful 413 response.
         return fail(413, "body too large");
       }
       data += c;
@@ -1806,10 +1883,18 @@ function readBody(req: IncomingMessage): Promise<any> {
       } catch {
         return fail(400, "invalid JSON body");
       }
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        return fail(400, "JSON body must be an object");
+      }
       done = true;
       resolve(body);
     });
     req.on("error", (e) => fail(400, e instanceof Error ? e.message : String(e)));
+    req.on("close", () => {
+      if (!done && !req.readableEnded) {
+        fail(400, "request connection closed prematurely");
+      }
+    });
   });
 }
 
@@ -1880,7 +1965,7 @@ const server = createServer(async (req, res) => {
     // LAN mode (OMB_AUTH_TOKEN) is the explicit exception: the Host is a LAN
     // address and the origin is whatever CORS_ORIGIN allows. Auth is checked
     // after the internal-comms routes.
-    const lanMode = Boolean(AUTH_TOKEN);
+    const lanMode = Boolean(AUTH_TOKEN) || HOST === "0.0.0.0" || LAN_BYPASS_CIDRS.length > 0;
     if (!lanMode && !isLoopbackHost(req.headers.host)) {
       return json(res, 403, { error: "forbidden: loopback host required" });
     }
@@ -2029,10 +2114,10 @@ const server = createServer(async (req, res) => {
 
     // ── LAN access authentication ──────────────────────────────────────
     // When OMB_AUTH_TOKEN is set, all public /api/ endpoints (except /api/health)
-    // require the token. EventSource cannot send headers, so GET also accepts
-    // ?access_token= (same value). Compare is constant-time like /api/internal.
+    // require the token, unless bypassed via OMB_LAN_BYPASS_CIDR.
+    // EventSource cannot send headers, so GET also accepts ?access_token=.
     if (AUTH_TOKEN && path.startsWith("/api/") && path !== "/api/health") {
-      if (!authorizedLan(req.headers.authorization, url.searchParams.get("access_token"))) {
+      if (!authorizedLan(req, req.headers.authorization, url.searchParams.get("access_token"))) {
         return json(res, 401, { error: "unauthorized: valid OMB_AUTH_TOKEN required" });
       }
     }
@@ -2158,10 +2243,13 @@ const server = createServer(async (req, res) => {
           res.write(": keepalive\n\n");
         } catch {}
       }, 25_000);
-      req.on("close", () => {
+      const cleanup = () => {
         clearInterval(keepalive);
         sseClients.delete(client);
-      });
+      };
+      req.on("close", cleanup);
+      res.on("close", cleanup);
+      res.on("error", cleanup);
       return;
     }
 
@@ -2631,22 +2719,22 @@ const server = createServer(async (req, res) => {
     if (m && method === "DELETE") {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
-      // a running turn dies with its bot
-      await registry.get(bot.modelSelection.instanceId)?.adapter.interruptTurn(bot.threadId).catch(() => {});
+      const allThreadIds = new Set([bot.threadId, ...(bot.tasks ?? []).map((t) => t.threadId)]);
+      for (const threadId of allThreadIds) {
+        await registry.get(bot.modelSelection.instanceId)?.adapter.interruptTurn(threadId).catch(() => {});
+        lastReply.delete(threadId);
+        discardDelegations(commsBus, threadId);
+        for (const dir of [EVENTS_DIR, NATIVE_DIR]) {
+          try {
+            unlinkSync(join(dir, `${threadId}.ndjson`));
+          } catch {}
+        }
+      }
       stopScreenPoller(bot.id);
       routines!.disableForBot(bot.id);
       webhooks.disableForBot(bot.id);
-      lastReply.delete(bot.threadId);
-      // a peer approval naming this bot can never be meaningfully answered
-      // now, and its caller would otherwise wait out the 15-minute timeout
       cancelPeerApprovalsFor(bot.id);
-      discardDelegations(commsBus, bot.threadId);
       store.deleteBot(bot.id);
-      for (const dir of [EVENTS_DIR, NATIVE_DIR]) {
-        try {
-          unlinkSync(join(dir, `${bot.threadId}.ndjson`));
-        } catch {}
-      }
       return json(res, 200, { ok: true });
     }
 
@@ -2914,7 +3002,12 @@ const server = createServer(async (req, res) => {
     // child proves it is OURS by echoing its pid (a stray dev server has
     // the same API shape but a different pid)
     if (method === "GET" && path === "/api/health") {
-      return json(res, 200, { app: "openmausbot", pid: process.pid, static: Boolean(STATIC_DIR) });
+      return json(res, 200, {
+        app: "openmausbot",
+        pid: process.pid,
+        static: Boolean(STATIC_DIR),
+        authRequired: isLanAuthRequired(req),
+      });
     }
 
     // ── provider instances (model picker) ──
@@ -3036,7 +3129,9 @@ const server = createServer(async (req, res) => {
         const provider = newTts.provider ?? cfg.tts?.provider ?? "elevenlabs";
         // For OpenAI-compatible, verify if baseUrl is provided (key is optional)
         if (provider === "openai-compatible" && newTts.baseUrl?.trim()) {
-          const check = await tts.verifyKey(newTts.key?.trim() ?? "", provider, newTts.baseUrl.trim());
+          const model = newTts.model !== undefined ? newTts.model.trim() : cfg.tts?.model;
+          const keyToVerify = newTts.key !== undefined ? newTts.key.trim() : (cfg.tts?.key ?? "");
+          const check = await tts.verifyKey(keyToVerify, provider, newTts.baseUrl.trim(), model);
           if (!check.ok) return json(res, 400, { error: check.message });
         }
         // For ElevenLabs, verify if key is provided
@@ -3071,6 +3166,75 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    // ── custom MCP server verification ─────────────────────────────────
+    if (method === "POST" && path === "/api/mcp/verify") {
+      const body = await readBody(req);
+      const transport = body?.transport;
+      const rawUrl = typeof body?.url === "string" ? body.url.trim() : "";
+      const name = typeof body?.name === "string" && body.name.trim() ? body.name.trim() : undefined;
+      const rawHeaders = body?.headers && typeof body.headers === "object" && !Array.isArray(body.headers)
+        ? (body.headers as Record<string, unknown>)
+        : undefined;
+      const headers: Record<string, string> | undefined = rawHeaders
+        ? Object.fromEntries(
+            Object.entries(rawHeaders)
+              .filter(([k, v]) => typeof k === "string" && k.trim() && (typeof v === "string" || typeof v === "number"))
+              .map(([k, v]) => [k.trim(), String(v).trim()]),
+          )
+        : undefined;
+
+      if (transport !== "http" && transport !== "sse") {
+        return json(res, 400, { error: "transport must be 'http' or 'sse'" });
+      }
+      if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) {
+        return json(res, 400, { error: "url must start with http:// or https://" });
+      }
+
+      // For a saved server name, if headers are omitted, look up stored headers from config.
+      const savedHeaders = name ? cfg.mcpServers?.find((s) => s.name === name)?.headers : undefined;
+      const effectiveHeaders: Record<string, string> = headers !== undefined ? headers : (savedHeaders ?? {});
+
+      const start = performance.now();
+      try {
+        const response = await fetch(rawUrl, {
+          method: transport === "sse" ? "GET" : "POST",
+          headers: transport === "sse"
+            ? { accept: "text/event-stream", ...effectiveHeaders }
+            : {
+                "content-type": "application/json",
+                accept: "application/json, text/event-stream",
+                ...effectiveHeaders,
+              },
+          ...(transport === "http" ? { body: JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 1 }) } : {}),
+          signal: AbortSignal.timeout(5000),
+        });
+
+        const latencyMs = Math.round(performance.now() - start);
+
+        try {
+          if (response.body) {
+            await response.body.cancel();
+          }
+        } catch {
+          /* ignore stream close error */
+        }
+
+        if (response.ok) {
+          return json(res, 200, { ok: true, latencyMs });
+        }
+
+        const statusText = response.statusText ? ` ${response.statusText}` : "";
+        return json(res, 200, {
+          ok: false,
+          error: `HTTP ${response.status}${statusText}`.trim(),
+        });
+      } catch (err: unknown) {
+        const isTimeout = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+        const message = isTimeout ? "Connection timed out after 5s" : (err instanceof Error ? err.message : String(err));
+        return json(res, 200, { ok: false, error: message });
+      }
+    }
+
     // ── voice ─────────────────────────────────────────────────────────
     // Splitting text into utterances lives HERE, not in the renderer, for
     // the same reason approvalKey does — it is the piece most likely to be
@@ -3078,8 +3242,9 @@ const server = createServer(async (req, res) => {
     // that produced it.
     if (method === "POST" && path === "/api/tts/prepare") {
       const body = await readBody(req);
+      const voiceId = typeof body.voiceId === "string" && body.voiceId.trim() ? body.voiceId.trim() : undefined;
       return json(res, 200, {
-        ready: tts.voiceReady(cfg, typeof body.voiceId === "string" ? body.voiceId : undefined),
+        ready: tts.voiceReady(cfg, voiceId),
         utterances: toUtterances(String(body.text ?? "")),
       });
     }
@@ -3099,7 +3264,8 @@ const server = createServer(async (req, res) => {
       // voice account into an unbounded, billable synthesis job.
       if (text.length > 500) return json(res, 413, { error: "voice utterances are limited to 500 characters" });
       try {
-        const audio = await tts.speak(cfg, text, typeof body.voiceId === "string" ? body.voiceId : undefined);
+        const voiceId = typeof body.voiceId === "string" && body.voiceId.trim() ? body.voiceId.trim() : undefined;
+        const audio = await tts.speak(cfg, text, voiceId);
         res.writeHead(200, {
           "content-type": audio.mime,
           "content-length": String(audio.bytes.byteLength),
@@ -3158,19 +3324,22 @@ const server = createServer(async (req, res) => {
 
     // packaged app: the server serves the built UI too (window → :8799 for
     // everything, no dev proxy to die). OMB_STATIC_DIR is set by Electron.
-    if (method === "GET" && !path.startsWith("/api/") && STATIC_DIR) {
-      const safe = path === "/" ? "/index.html" : path.replace(/\.\./g, "");
-      const file = join(STATIC_DIR, safe);
+    if ((method === "GET" || method === "HEAD") && !path.startsWith("/api/") && STATIC_DIR) {
+      const target = path === "/" ? "index.html" : path.replace(/^\/+/, "");
+      const file = resolve(STATIC_DIR, target);
+      if (!file.startsWith(resolve(STATIC_DIR))) {
+        return json(res, 403, { error: "forbidden" });
+      }
       try {
         const data = readFileSync(file);
         res.writeHead(200, { "content-type": MIME[extname(file)] ?? "application/octet-stream" });
-        return res.end(data);
+        return res.end(method === "HEAD" ? undefined : data);
       } catch {
         // SPA fallback
         try {
           const data = readFileSync(join(STATIC_DIR, "index.html"));
           res.writeHead(200, { "content-type": "text/html" });
-          return res.end(data);
+          return res.end(method === "HEAD" ? undefined : data);
         } catch {
           /* fall through to 404 */
         }
@@ -3188,6 +3357,11 @@ server.listen(PORT, HOST, () => {
   console.log(`openmausbot server on http://${HOST}:${PORT}`);
   if (AUTH_TOKEN) {
     console.log("⚠️  LAN authentication enabled (OMB_AUTH_TOKEN is set)");
+    if (LAN_BYPASS_CIDRS.length > 0) {
+      console.log(`ℹ️  LAN bypass enabled for CIDRs: ${LAN_BYPASS_CIDRS.map((c) => c.raw).join(", ")}`);
+    }
+  } else if (LAN_BYPASS_CIDRS.length > 0) {
+    console.log(`ℹ️  LAN bypass CIDRs configured: ${LAN_BYPASS_CIDRS.map((c) => c.raw).join(", ")}`);
   }
   if (CORS_ORIGIN) {
     console.log(`✓ CORS enabled for origin: ${CORS_ORIGIN}`);
@@ -3202,10 +3376,20 @@ server.listen(PORT, HOST, () => {
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
+    const forceExitTimer = setTimeout(() => process.exit(1), 5000);
+    forceExitTimer.unref?.();
+
     localVmIdle.cancel();
     watchdog.stop();
     routines?.stop();
     webhookIngress?.server.close();
+    server.close();
+    for (const client of sseClients) {
+      try {
+        client.res.end();
+      } catch {}
+    }
+    sseClients.clear();
     void registry.disposeAll().finally(() => process.exit(0));
   });
 }

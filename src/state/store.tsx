@@ -20,7 +20,7 @@ import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib
 import { currentCall } from "@/lib/call";
 import { showNotification } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
-import { consumeLanAuthTokenFromLocation, eventsUrl, lanAuthHeaders } from "@/lib/lan-auth";
+import { consumeLanAuthTokenFromLocation, eventsUrl, lanAuthHeaders, readLanAuthToken } from "@/lib/lan-auth";
 
 export type { MausColor } from "@/lib/mascot";
 
@@ -186,7 +186,7 @@ export interface ConfigStatus {
    * `provider` = which provider is selected; `configured` = credentials are
    * saved; `ready` = credentials AND a voice. Secrets are never echoed back.
    * `baseUrl` is echoed for OpenAI-compatible (not a secret). */
-  tts?: { provider: "elevenlabs" | "openai-compatible"; configured: boolean; ready: boolean; voice: string; baseUrl: string };
+  tts?: { provider: "elevenlabs" | "openai-compatible"; configured: boolean; ready: boolean; voice: string; baseUrl: string; model?: string };
   /** who's using the app — collected in onboarding, shown in the sidebar */
   profile?: { name: string; email: string };
   /** Custom remote MCP servers: names, urls, and enabled state. Headers are write-only. */
@@ -241,6 +241,7 @@ export interface InstanceInfo {
 
 export type AppSettingsSection =
   | "general"
+  | "lan"
   | "connections"
   | "engines"
   | "companion"
@@ -270,12 +271,16 @@ interface AppState {
   /** bots whose cloud computer is being provisioned */
   provisioning: Record<string, boolean>;
   connected: boolean;
+  authRequired: boolean;
+  authError: string | null;
   error: string | null;
   mascotMotion: {
     botId: string;
     nonce: number;
     kind: Exclude<MausMotion, "none">;
   } | null;
+  /** When true, bot⇄bot (g.dm) exchanges are shown as inline pills in the transcript only, not in the sidebar */
+  inlineInterAgentChat: boolean;
 }
 
 type Action =
@@ -345,6 +350,7 @@ type Action =
   | { type: "setModel"; botId: string; selection: ModelSelection }
   | { type: "interrupt"; botId: string }
   | { type: "connected"; value: boolean }
+  | { type: "authRequired"; required: boolean; error?: string | null }
   | { type: "error"; message: string | null }
   | { type: "toggleSettings"; open?: boolean }
   | { type: "togglePlugins"; open?: boolean }
@@ -374,7 +380,8 @@ type Action =
           | "modelSelection"
         >
       >;
-    };
+    }
+  | { type: "setInlineInterAgentChat"; enabled: boolean };
 
 function updateBot(state: AppState, botId: string, fn: (b: Bot) => Bot): AppState {
   return { ...state, bots: state.bots.map((b) => (b.id === botId ? fn(b) : b)) };
@@ -654,7 +661,17 @@ function reducer(state: AppState, action: Action): AppState {
     case "setModel":
       return updateBot(state, action.botId, (b) => ({ ...b, modelSelection: action.selection }));
     case "connected":
-      return { ...state, connected: action.value };
+      return {
+        ...state,
+        connected: action.value,
+        ...(action.value ? { authRequired: false, authError: null } : {}),
+      };
+    case "authRequired":
+      return {
+        ...state,
+        authRequired: action.required,
+        authError: action.error ?? null,
+      };
     case "error":
       return {
         ...(action.message && state.selectedId
@@ -766,12 +783,24 @@ function reducer(state: AppState, action: Action): AppState {
       return state;
     case "taskSwitched":
       return updateBot(state, action.bot.id, (bot) => ({ ...bot, ...action.bot, messages: action.bot.messages ?? [] }));
+    case "deleteGroup": {
+      const groups = state.groups.filter((g) => g.id !== action.groupId);
+      const selectedId = state.selectedId === action.groupId ? (state.bots[0]?.id ?? "") : state.selectedId;
+      return { ...state, groups, selectedId };
+    }
+    case "setInlineInterAgentChat": {
+      if (typeof localStorage !== "undefined" && typeof localStorage?.setItem === "function") {
+        try {
+          localStorage.setItem("omb-inline-inter-agent-chat", String(action.enabled));
+        } catch {}
+      }
+      return { ...state, inlineInterAgentChat: action.enabled };
+    }
     case "newBot":
     case "duplicateBot":
     case "interrupt":
     case "createGroup":
     case "sendGroup":
-    case "deleteGroup":
     case "interruptGroup":
     case "createRoutine":
     case "updateRoutine":
@@ -806,8 +835,14 @@ const initialState: AppState = {
   screens: {},
   provisioning: {},
   connected: false,
+  authRequired: false,
+  authError: null,
   error: null,
   mascotMotion: null,
+  inlineInterAgentChat:
+    typeof localStorage !== "undefined" && typeof localStorage?.getItem === "function"
+      ? localStorage.getItem("omb-inline-inter-agent-chat") === "true"
+      : false,
 };
 
 // ── API client ─────────────────────────────────────────────────────────
@@ -817,6 +852,13 @@ export async function api(path: string, init?: RequestInit): Promise<any> {
     headers: { "content-type": "application/json", ...lanAuthHeaders(), ...(init?.headers ?? {}) },
   });
   const body = await res.json().catch(() => ({}));
+  if (res.status === 401) {
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(
+        new CustomEvent("omb:unauthorized", { detail: body.error || "Authentication required" }),
+      );
+    }
+  }
   if (!res.ok) throw new Error(body.error ?? `${res.status} ${res.statusText}`);
   return body;
 }
@@ -846,7 +888,9 @@ const StoreContext = createContext<{
 } | null>(null);
 
 export function StoreProvider({ children }: { children: ReactNode }) {
-  consumeLanAuthTokenFromLocation();
+  useEffect(() => {
+    consumeLanAuthTokenFromLocation();
+  }, []);
   const [state, rawDispatch] = useReducer(reducer, initialState);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -1042,9 +1086,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             .catch(showError);
           break;
         }
-        case "deleteBot":
+        case "deleteBot": {
+          const pending = patchTimers.current.get(action.botId);
+          if (pending) {
+            clearTimeout(pending.timer);
+            patchTimers.current.delete(action.botId);
+          }
           api(`/api/bots/${action.botId}`, { method: "DELETE" }).catch(showError);
           break;
+        }
         case "markUnread":
           api(`/api/bots/${action.botId}`, { method: "PATCH", body: JSON.stringify({ unread: true }) }).catch(
             () => {},
@@ -1148,6 +1198,26 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     return wrapped;
   }, []);
 
+  const [authToken, setAuthToken] = useState(() => readLanAuthToken());
+
+  useEffect(() => {
+    const onAuthChange = (e: Event) => {
+      const custom = e as CustomEvent<string>;
+      setAuthToken(custom.detail ?? readLanAuthToken());
+      rawDispatch({ type: "authRequired", required: false, error: null });
+    };
+    const onUnauthorized = (e: Event) => {
+      const custom = e as CustomEvent<string>;
+      rawDispatch({ type: "authRequired", required: true, error: custom.detail });
+    };
+    window.addEventListener("omb:auth-change", onAuthChange);
+    window.addEventListener("omb:unauthorized", onUnauthorized);
+    return () => {
+      window.removeEventListener("omb:auth-change", onAuthChange);
+      window.removeEventListener("omb:unauthorized", onUnauthorized);
+    };
+  }, []);
+
   // ── initial load + SSE fold ──────────────────────────────────────────
   useEffect(() => {
     let alive = true;
@@ -1155,7 +1225,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       Promise.all([
         api("/api/bots")
           .then(({ bots, groups }) => alive && rawDispatch({ type: "hydrate", bots, groups: groups ?? [] }))
-          .catch(() => {}),
+          .catch((err) => {
+            if (err?.message?.toLowerCase().includes("unauthorized") || err?.message?.includes("401")) {
+              if (alive) rawDispatch({ type: "authRequired", required: true, error: err.message });
+            }
+          }),
         api("/api/instances")
           .then(({ instances }) => alive && rawDispatch({ type: "instances", instances }))
           .catch(() => {}),
@@ -1211,7 +1285,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // server replays what we missed when it can, and re-downloading every
     // transcript on a reconnect it already covered is pure waste.
     es.onopen = () => rawDispatch({ type: "connected", value: true });
-    es.onerror = () => rawDispatch({ type: "connected", value: false });
+    es.onerror = () => {
+      rawDispatch({ type: "connected", value: false });
+      if (readLanAuthToken()) {
+        api("/api/instances").catch((err) => {
+          if (
+            alive &&
+            (String(err?.message).includes("401") || String(err?.message).toLowerCase().includes("unauthorized"))
+          ) {
+            rawDispatch({ type: "authRequired", required: true, error: "Invalid access token" });
+          }
+        });
+      }
+    };
     handleFrame = (frame) => {
       switch (frame.kind) {
         case "message": {
@@ -1342,8 +1428,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               xai: frame.xai,
               composio: frame.composio,
               box: frame.box,
+              opencodeGo: frame.opencodeGo,
               tts: frame.tts,
               profile: frame.profile,
+              mcpServers: frame.mcpServers,
             },
           });
           api("/api/instances")
@@ -1374,7 +1462,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       clearTimeout(hydrationFallback);
       es.close();
     };
-  }, []);
+  }, [authToken]);
 
   // Re-probe the engines on demand. A CLI installed while the app is running
   // is invisible until something asks again — the setup screens expose this

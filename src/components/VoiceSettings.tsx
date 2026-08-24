@@ -6,10 +6,8 @@ import { useEffect, useState } from "react";
 import { Check, Loader2, Volume2 } from "lucide-react";
 
 import { api, useStore, type ConfigStatus } from "@/state/store";
-import { speaker } from "@/lib/tts";
+import { speaker, SAMPLE } from "@/lib/tts";
 import { cn } from "@/lib/cn";
-
-const SAMPLE = "Morning. Overnight the tests went green, and I left two notes for you in the thread.";
 
 export function VoiceSettings() {
   const { state, dispatch } = useStore();
@@ -20,12 +18,43 @@ export function VoiceSettings() {
   );
   const [key, setKey] = useState("");
   const [baseUrl, setBaseUrl] = useState(tts?.baseUrl ?? "");
+  const [model, setModel] = useState(tts?.model ?? "");
   const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [voices, setVoices] = useState<Array<{ id: string; label: string; description?: string }>>([]);
   const [loadingVoices, setLoadingVoices] = useState(false);
+  const [auditioningVoiceId, setAuditioningVoiceId] = useState<string | null>(null);
 
   const configured = Boolean(tts?.configured);
+
+  useEffect(() => {
+    return speaker.subscribe((s) => {
+      if (s.status === "idle") {
+        setAuditioningVoiceId(null);
+      }
+      if (s.error) {
+        setError(s.error);
+      }
+    });
+  }, []);
+
+  const handleAudition = async (voiceId?: string) => {
+    const target = voiceId || tts?.voice;
+    if (!target) return;
+    setAuditioningVoiceId(target);
+    setError(null);
+    try {
+      await speaker.speak(SAMPLE, target);
+      if (speaker.state.error) {
+        setError(speaker.state.error);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAuditioningVoiceId(null);
+    }
+  };
 
   // Update local provider state when config changes
   useEffect(() => {
@@ -33,7 +62,8 @@ export function VoiceSettings() {
       setProvider(tts.provider as "elevenlabs" | "openai-compatible");
     }
     if (tts?.baseUrl !== undefined) setBaseUrl(tts.baseUrl);
-  }, [tts?.provider, tts?.baseUrl]);
+    if (tts?.model !== undefined) setModel(tts.model);
+  }, [tts?.provider, tts?.baseUrl, tts?.model]);
 
   useEffect(() => {
     if (!configured) {
@@ -53,15 +83,18 @@ export function VoiceSettings() {
     return () => {
       alive = false;
     };
-  }, [configured]);
+  }, [configured, tts?.baseUrl, tts?.model, tts?.provider]);
 
   const save = (patch: Record<string, unknown>) => {
     setSaving(true);
     setError(null);
+    setSaved(false);
     return api("/api/config", { method: "PUT", body: JSON.stringify({ tts: patch }) })
       .then((status: ConfigStatus) => {
         dispatch({ type: "configStatus", config: status });
         setKey("");
+        setSaved(true);
+        window.setTimeout(() => setSaved(false), 2500);
       })
       .catch((e: Error) => setError(e.message))
       .finally(() => setSaving(false));
@@ -77,11 +110,19 @@ export function VoiceSettings() {
 
   const saveCredentials = () => {
     if (provider === "openai-compatible") {
-      if (!baseUrl.trim()) {
+      const trimmedUrl = (baseUrl || tts.baseUrl || "").trim();
+      if (!trimmedUrl) {
         setError("Base URL is required for OpenAI-compatible servers.");
         return;
       }
-      void save({ baseUrl: (baseUrl || tts.baseUrl || "").trim(), key: key.trim() || "" });
+      const patch: Record<string, unknown> = {
+        baseUrl: trimmedUrl,
+        model: model.trim() || undefined,
+      };
+      if (key.trim()) {
+        patch.key = key.trim();
+      }
+      void save(patch);
     } else {
       if (!key.trim()) {
         setError("ElevenLabs key is required.");
@@ -151,59 +192,69 @@ export function VoiceSettings() {
       )}
 
       {provider === "openai-compatible" && (
-        <>
+        <div className="space-y-4">
           <div className="mt-4">
             <div className="mb-1.5 flex items-center gap-2 text-[13px] text-ink-secondary">
               <span className={cn("size-1.5 rounded-full", configured ? "bg-success" : "bg-raised-hover")} />
               <span>Base URL</span>
               {configured && <span className="text-[11px] text-success">Connected</span>}
             </div>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={baseUrl || tts.baseUrl || ""}
-                onChange={(e) => setBaseUrl(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && baseUrl.trim() && saveCredentials()}
-                placeholder="http://127.0.0.1:9093/v1"
-                aria-label="Base URL"
-                autoComplete="off"
-                className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
-              />
-              <button
-                onClick={saveCredentials}
-                disabled={saving || !baseUrl.trim()}
-                className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
-              </button>
-            </div>
+            <input
+              type="text"
+              value={baseUrl || tts.baseUrl || ""}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && saveCredentials()}
+              placeholder="http://127.0.0.1:8000/v1"
+              aria-label="Base URL"
+              autoComplete="off"
+              className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+            />
             <div className="mt-1.5 text-[12px] text-ink-secondary">
-              For local Kokoro or any OpenAI-compatible TTS server. Defaults to port 9093 for local setups.
+              OpenAI-compatible speech API endpoint URL.
             </div>
           </div>
-          <div className="mt-4">
+
+          <div>
+            <div className="mb-1.5 text-[13px] text-ink-secondary">Model (optional)</div>
+            <input
+              type="text"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && saveCredentials()}
+              placeholder="tts-1"
+              aria-label="Model"
+              autoComplete="off"
+              className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+            />
+          </div>
+
+          <div>
             <div className="mb-1.5 text-[13px] text-ink-secondary">API Key (optional)</div>
-            <div className="flex gap-2">
-              <input
-                type="password"
-                value={key}
-                onChange={(e) => setKey(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && saveCredentials()}
-                placeholder="Optional for local servers"
-                aria-label="API Key"
-                autoComplete="off"
-                className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
-              />
-              <button
-                onClick={saveCredentials}
-                disabled={saving}
-                className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
-              </button>
-            </div>
+            <input
+              type="password"
+              value={key}
+              onChange={(e) => setKey(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && saveCredentials()}
+              placeholder={configured ? "••••••••  (optional for local servers)" : "Optional for local servers"}
+              aria-label="API Key"
+              autoComplete="off"
+              className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+            />
           </div>
-        </>
+
+          <div className="flex items-center justify-between pt-1">
+            <span className="text-[12px] text-success">
+              {saved ? "Voice settings saved" : ""}
+            </span>
+            <button
+              onClick={saveCredentials}
+              disabled={saving || !baseUrl.trim()}
+              className="flex items-center justify-center gap-1.5 rounded-lg bg-raised px-4 py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save server settings</>}
+            </button>
+          </div>
+        </div>
       )}
 
       {configured && (
@@ -225,13 +276,13 @@ export function VoiceSettings() {
               ))}
             </select>
             <button
-              onClick={() => void speaker.speak(SAMPLE)}
-              disabled={!tts.ready}
+              onClick={() => void handleAudition()}
+              disabled={!tts.ready || auditioningVoiceId !== null}
               title={tts.ready ? "Hear this voice" : "Pick a voice first"}
               aria-label="Hear this voice"
               className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
             >
-              <Volume2 size={14} /> Try
+              {auditioningVoiceId ? <Loader2 size={14} className="animate-spin" /> : <Volume2 size={14} />} Try
             </button>
           </div>
         </div>

@@ -34,11 +34,30 @@ describe("consumeLanAuthTokenFromLocation", () => {
   });
 });
 
+describe("saveLanAuthToken and clearLanAuthToken", () => {
+  it("saves a token and clears it from storage", async () => {
+    const { saveLanAuthToken, clearLanAuthToken } = await import("./lan-auth");
+    const store = new Map<string, string>();
+    const storage = {
+      setItem: (k: string, v: string) => {
+        store.set(k, v);
+      },
+      removeItem: (k: string) => {
+        store.delete(k);
+      },
+    };
+    saveLanAuthToken("my-token-123", storage);
+    expect(store.get("ombAuthToken")).toBe("my-token-123");
+
+    clearLanAuthToken(storage);
+    expect(store.has("ombAuthToken")).toBe(false);
+  });
+});
+
 describe("eventsUrl", () => {
   it("leaves the path alone when there is no token", () => {
     const storage = { getItem: () => null, setItem: () => {} };
     expect(readLanAuthToken("", storage)).toBe("");
-    // eventsUrl reads live localStorage; we only assert the helper shape here
     expect(eventsUrl("/api/events").startsWith("/api/events")).toBe(true);
   });
 });

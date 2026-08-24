@@ -1,0 +1,16 @@
+OpenMausBot combined PR review harness
+
+Open the LAN UI: http://10.0.0.32:5199
+Harness API health: http://10.0.0.32:8800/api/health
+Old installer (not this review): 127.0.0.1:8799
+
+Auth token file: C:\OpenMausBot-src\.omb-lan-token
+Token last4: 0b8a (64 hex chars). UI vite proxy injects Authorization for /api.
+Direct API calls need: Authorization: Bearer <token>
+
+TTS prefilled: openai-compatible http://10.0.0.30:8000/v1 model kokoro voice af_heart
+Custom MCP prefilled: deepwiki SSE, apisguru HTTP (Claude driver only)
+Data dir isolated: C:\OpenMausBot-src\.review-data (does not touch ~/.openmausbot)
+
+Windows service: NOT installed. scripts\\windows present.
+Git branch: review/combined-prs-1-4 (local only, not pushed)

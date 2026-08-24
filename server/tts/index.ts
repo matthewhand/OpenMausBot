@@ -63,15 +63,16 @@ export function describeVoice(cfg: AppConfig) {
     ready: voiceConfigured(cfg),
     voice: cfg.tts?.voice ?? "",
     baseUrl: cfg.tts?.baseUrl ?? "",
+    model: cfg.tts?.model ?? "",
   };
 }
 
-export function verifyKey(key: string, provider: "elevenlabs" | "openai-compatible", baseUrl?: string) {
+export function verifyKey(key: string, provider: "elevenlabs" | "openai-compatible", baseUrl?: string, model?: string) {
   if (provider === "openai-compatible") {
     if (!baseUrl) {
       return Promise.resolve({ ok: false, message: "Base URL is required for OpenAI-compatible servers." } as const);
     }
-    return openaiCompatible.verifyKey(baseUrl, key || undefined);
+    return openaiCompatible.verifyKey(baseUrl, key || undefined, model || undefined);
   }
   return elevenlabs.verifyKey(key);
 }
@@ -98,7 +99,7 @@ export function speak(cfg: AppConfig, text: string, voiceId?: string) {
     if (!baseUrl) throw new NoVoiceConfigured("baseUrl", provider);
     const voice = voiceId || cfg.tts?.voice;
     if (!voice) throw new NoVoiceConfigured("voice", provider);
-    return openaiCompatible.synthesize(text, voice, baseUrl, cfg.tts?.key);
+    return openaiCompatible.synthesize(text, voice, baseUrl, cfg.tts?.key, cfg.tts?.model);
   }
 
   // ElevenLabs: check key first, then voice (matches the original behavior)

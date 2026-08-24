@@ -338,8 +338,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           }
           const params = msg.params ?? {};
           const options: Array<{ optionId?: string; kind?: string }> = Array.isArray(params.options) ? params.options : [];
-          const optionFor = (want: "allow" | "reject") =>
-            options.find((o) => String(o.kind ?? "").startsWith(want) && typeof o.optionId === "string")?.optionId ?? null;
+          const optionFor = (want: "allow" | "reject") => {
+            const pattern = want === "allow" ? /^allow/i : /^(?:reject|deny)/i;
+            return options.find((o) => pattern.test(String(o.kind ?? "")) && typeof o.optionId === "string")?.optionId ?? null;
+          };
           const cancelled = { outcome: { outcome: "cancelled" } };
           const missing = (want: string) =>
             emit({

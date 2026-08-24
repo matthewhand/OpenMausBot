@@ -40,6 +40,7 @@ $nssmExe = "$env:TEMP\nssm\nssm.exe"
 if (-not (Test-Path $nssmExe)) {
     Write-Error "NSSM not found at $nssmExe. The service may have been installed differently."
     Write-Host "Trying to remove service using sc.exe..." -ForegroundColor Yellow
+    Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
     sc.exe delete $ServiceName
     exit $LASTEXITCODE
 }

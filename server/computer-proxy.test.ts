@@ -469,4 +469,18 @@ describe("computer proxy (fake box)", () => {
     expect(repeated.result.content).toHaveLength(1);
     expect(repeated.result.content[0].text).toMatch(/identical/i);
   });
+
+  it("exposes and runs execute_shell_cmd", async () => {
+    rpc({
+      jsonrpc: "2.0",
+      id: 17,
+      method: "tools/call",
+      params: {
+        name: "execute_shell_cmd",
+        arguments: { command: "echo hello-shell" },
+      },
+    });
+    const res = await waitFor(17);
+    expect(res.result.content[0].text).toContain("exit 0");
+  });
 });

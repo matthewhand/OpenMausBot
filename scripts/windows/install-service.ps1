@@ -15,6 +15,7 @@ param(
     [string]$Port = "8799",
     [string]$Host = "0.0.0.0",
     [string]$AuthToken = "",
+    [string]$LanBypassCidr = "",
     [string]$CorsOrigin = "*",
     [string]$InstallDir = "",
     [switch]$Help
@@ -31,6 +32,7 @@ Options:
   -Port <port>           Server port (default: 8799)
   -Host <host>           Bind address (default: 0.0.0.0 for LAN access)
   -AuthToken <token>     Authentication token (required for LAN)
+  -LanBypassCidr <cidr>  Subnets/CIDRs to allow without auth (e.g. "10.0.0.0/24" or "true")
   -CorsOrigin <origin>   CORS origin (default: *)
   -InstallDir <path>     OpenMausBot installation directory (auto-detected)
   -Help                  Show this help message
@@ -66,7 +68,9 @@ if (-not $InstallDir) {
         "$env:LOCALAPPDATA\Programs\OpenMausBot",
         "$env:PROGRAMFILES\OpenMausBot",
         "${env:PROGRAMFILES(X86)}\OpenMausBot",
-        "$PSScriptRoot"  # Current directory (for source installations)
+        (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent),  # Repo root (scripts/windows -> scripts -> root)
+        "$PSScriptRoot",
+        "$PWD"  # Current working directory
     )
     
     foreach ($path in $possiblePaths) {
@@ -133,6 +137,7 @@ if (-not (Test-Path $nssmExe)) {
         
         # Find the correct architecture
         $arch = if ([Environment]::Is64BitOperatingSystem) { "win64" } else { "win32" }
+        New-Item -ItemType Directory -Path $nssmDir -Force | Out-Null
         Copy-Item "$env:TEMP\nssm-2.24\$arch\nssm.exe" $nssmExe -Force
         
         Remove-Item $nssmZip -Force
@@ -176,14 +181,18 @@ Write-Host "Configuring service..." -ForegroundColor Cyan
 # Set working directory
 & $nssmExe set $ServiceName AppDirectory $InstallDir
 
-# Set environment variables
-& $nssmExe set $ServiceName AppEnvironmentExtra "OMB_HOST=$Host" "OMB_PORT=$Port"
+# Set environment variables (must be a single call — NSSM overwrites on each set)
+$envVars = @("OMB_HOST=$Host", "OMB_PORT=$Port")
 if (-not [string]::IsNullOrWhiteSpace($AuthToken)) {
-    & $nssmExe set $ServiceName AppEnvironmentExtra "OMB_AUTH_TOKEN=$AuthToken"
+    $envVars += "OMB_AUTH_TOKEN=$AuthToken"
+}
+if (-not [string]::IsNullOrWhiteSpace($LanBypassCidr)) {
+    $envVars += "OMB_LAN_BYPASS_CIDR=$LanBypassCidr"
 }
 if (-not [string]::IsNullOrWhiteSpace($CorsOrigin)) {
-    & $nssmExe set $ServiceName AppEnvironmentExtra "OMB_CORS_ORIGIN=$CorsOrigin"
+    $envVars += "OMB_CORS_ORIGIN=$CorsOrigin"
 }
+& $nssmExe set $ServiceName AppEnvironmentExtra $envVars
 
 # Set up logging
 $logDir = "$env:PROGRAMDATA\OpenMausBot\logs"
@@ -233,7 +242,8 @@ if ($service.Status -eq 'Running') {
     # Test the endpoint
     Start-Sleep -Seconds 5
     try {
-        $url = "http://${Host}:${Port}/api/health"
+        $checkHost = if ($Host -eq "0.0.0.0") { "127.0.0.1" } else { $Host }
+        $url = "http://${checkHost}:${Port}/api/health"
         $response = Invoke-RestMethod -Uri $url -TimeoutSec 5
         if ($response.app -eq "openmausbot") {
             Write-Host "✓ Server is responding at $url" -ForegroundColor Green

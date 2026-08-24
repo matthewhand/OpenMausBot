@@ -43,17 +43,17 @@ function authHeader(key?: string): Record<string, string> {
 /** Verify the server is reachable and the key (if provided) works. We check
  * against a cheap speech request rather than a models or voices endpoint that
  * may not exist on all OpenAI-compatible servers. */
-export async function verifyKey(baseUrl: string, key?: string): Promise<VerifyResult> {
+export async function verifyKey(baseUrl: string, key?: string, model = "tts-1"): Promise<VerifyResult> {
   try {
     const url = `${baseUrl.replace(/\/$/, "")}/audio/speech`;
     const res = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeader(key) },
-      body: JSON.stringify({ model: "tts-1", input: "test", voice: "alloy" }),
+      body: JSON.stringify({ model: model || "tts-1", input: "test", voice: "alloy" }),
       signal: AbortSignal.timeout(20_000),
     });
-    // 200 = success, 400 = server understood but rejected params (still valid), others are real failures
-    if (res.ok || res.status === 400) return { ok: true };
+    // 200 = success, 400/422 = server understood but rejected params (still reachable & valid), others are real failures
+    if (res.ok || res.status === 400 || res.status === 422) return { ok: true };
     return { ok: false, message: message(res.status, "checking that server", await safeJson(res)) };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -76,16 +76,21 @@ export async function listVoices(baseUrl: string, key?: string): Promise<Voice[]
     });
     if (!res.ok) return fallbackVoices();
     const body = await safeJson(res);
-    // Try both OpenAI shape ({ voices: [...] }) and direct array shape
-    const list = Array.isArray(body) ? body : body?.voices ?? [];
+    // Try direct array shape, { voices: [...] }, and { data: [...] }
+    const list = Array.isArray(body) ? body : body?.voices ?? body?.data ?? [];
     if (!Array.isArray(list) || list.length === 0) return fallbackVoices();
-    return list
-      .map((v: any): Voice => ({
-        id: String(v.voice_id ?? v.id ?? ""),
-        label: String(v.name ?? v.label ?? v.id ?? "Voice"),
-        description: v.description || v.labels?.description || undefined,
-      }))
+    const voices = list
+      .map((v: any): Voice => {
+        if (typeof v === "string") {
+          return { id: v, label: v };
+        }
+        const id = String(v.voice_id ?? v.id ?? "");
+        const label = String(v.name ?? v.label ?? v.id ?? (id || "Voice"));
+        const description = v.description || v.labels?.description || undefined;
+        return { id, label, description };
+      })
       .filter((v: Voice) => v.id);
+    return voices.length > 0 ? voices : fallbackVoices();
   } catch {
     return fallbackVoices();
   }
@@ -114,14 +119,17 @@ export async function synthesize(
   voiceId: string,
   baseUrl: string,
   key?: string,
+  model = "tts-1",
 ): Promise<Audio> {
+  const selectedModel = model?.trim() || "tts-1";
   const url = `${baseUrl.replace(/\/$/, "")}/audio/speech`;
   const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeader(key) },
-    body: JSON.stringify({ model: "tts-1", input: text, voice: voiceId }),
+    body: JSON.stringify({ model: selectedModel, input: text, voice: voiceId }),
     signal: AbortSignal.timeout(60_000),
   });
   if (!res.ok) throw new Error(message(res.status, "speaking", await safeJson(res)));
-  return { bytes: new Uint8Array(await res.arrayBuffer()), mime: "audio/mpeg" };
+  const mime = res.headers.get("content-type")?.split(";")[0]?.trim() || "audio/mpeg";
+  return { bytes: new Uint8Array(await res.arrayBuffer()), mime };
 }
