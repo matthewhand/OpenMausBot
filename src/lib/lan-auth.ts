@@ -8,7 +8,19 @@ export const LAN_AUTH_STORAGE_KEY = "ombAuthToken";
 type TokenStorage = Pick<Storage, "getItem" | "setItem">;
 
 function defaultTokenStorage(): TokenStorage | null {
-  return typeof localStorage === "undefined" ? null : localStorage;
+  try {
+    return localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function currentSearch(): string {
+  try {
+    return window.location.search;
+  } catch {
+    return "";
+  }
 }
 
 function resolveTokenStorage(storage?: TokenStorage | null): TokenStorage | null {
@@ -16,7 +28,7 @@ function resolveTokenStorage(storage?: TokenStorage | null): TokenStorage | null
 }
 
 export function readLanAuthToken(
-  search = typeof window === "undefined" ? "" : window.location.search,
+  search = currentSearch(),
   storage: TokenStorage | null = defaultTokenStorage(),
 ): string {
   try {
@@ -31,28 +43,22 @@ export function readLanAuthToken(
   }
 }
 
-export function lanAuthHeaders(storage?: TokenStorage | null): Record<string, string> {
-  const token = readLanAuthToken(typeof window === "undefined" ? "" : window.location.search, resolveTokenStorage(storage));
-  return token ? { Authorization: `Bearer ${token}` } : {};
-}
-
-function headerRecord(headers?: HeadersInit): Record<string, string> {
-  if (!headers) return {};
-  if (typeof Headers !== "undefined" && headers instanceof Headers) {
-    return Object.fromEntries(headers.entries());
-  }
-  if (Array.isArray(headers)) return Object.fromEntries(headers);
-  return { ...(headers as Record<string, string>) };
+export function lanAuthHeaders(storage?: TokenStorage | null) {
+  const token = readLanAuthToken(currentSearch(), resolveTokenStorage(storage));
+  if (!token) return {};
+  return { Authorization: `Bearer ${token}` };
 }
 
 /** JSON API init used by store `api()` and ComputerPanel screenshot polls. */
 export function lanAuthRequestInit(init?: RequestInit, storage?: TokenStorage | null): RequestInit {
-  return {
-    ...init,
-    headers: {
-      "content-type": "application/json",
-      ...lanAuthHeaders(storage),
-      ...headerRecord(init?.headers),
-    },
-  };
+  const headers = new Headers();
+  headers.set("content-type", "application/json");
+  const token = readLanAuthToken(currentSearch(), resolveTokenStorage(storage));
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  if (init?.headers) {
+    new Headers(init.headers).forEach((value, key) => {
+      headers.set(key, value);
+    });
+  }
+  return { ...init, headers };
 }
