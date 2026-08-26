@@ -80,6 +80,9 @@ import { listenWebhookIngress, webhookCredential, type WebhookIngress } from "./
 import { memberTurnSelection } from "./member-turn.ts";
 import { WebhookManager } from "./webhooks.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
+import { assertSupportedNode } from "./node-preflight.ts";
+
+assertSupportedNode();
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
 const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
