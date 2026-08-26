@@ -33,7 +33,7 @@ describe("nodeVersionError", () => {
   it("keeps the exported minimum in sync with package.json engines", () => {
     const pkg = JSON.parse(
       readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"),
-    ) as { engines: { node: string } };
+    );
     expect(pkg.engines.node).toBe(`>=${MIN_NODE_MAJOR}`);
   });
 
@@ -49,6 +49,7 @@ describe("assertSupportedNode", () => {
 
   it("exits 1 with the readable message on Node 22", () => {
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    // SAFETY: the mock must not terminate vitest; production exit(1) never returns.
     const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
     assertSupportedNode("v22.14.0");
     expect(exit).toHaveBeenCalledWith(1);
@@ -58,6 +59,7 @@ describe("assertSupportedNode", () => {
 
   it("does not exit on Node 24+", () => {
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    // SAFETY: the mock must not terminate vitest; production exit(1) never returns.
     const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
     assertSupportedNode("v24.20.0");
     expect(exit).not.toHaveBeenCalled();

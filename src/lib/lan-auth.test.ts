@@ -21,6 +21,10 @@ function memoryStorage(initial?: Record<string, string>) {
 
 const srcRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+function headerValue(headers: HeadersInit | undefined, name: string): string | null {
+  return new Headers(headers).get(name);
+}
+
 describe("readLanAuthToken", () => {
   it("bootstraps from ?access_token= and persists it", () => {
     const { store, storage } = memoryStorage();
@@ -67,10 +71,8 @@ describe("screenshot / API Bearer contract", () => {
     await fetch("/api/local-computer/screenshot", init);
 
     expect(init.method).toBe("POST");
-    expect(init.headers).toMatchObject({
-      "content-type": "application/json",
-      Authorization: "Bearer lan-secret",
-    });
+    expect(headerValue(init.headers, "content-type")).toBe("application/json");
+    expect(headerValue(init.headers, "Authorization")).toBe("Bearer lan-secret");
     expect(calls).toEqual([
       { url: "/api/local-computer/screenshot", init },
     ]);
@@ -79,17 +81,15 @@ describe("screenshot / API Bearer contract", () => {
   it("screenshot POST sends no Authorization when auth is off", () => {
     const { storage } = memoryStorage();
     const init = lanAuthRequestInit({ method: "POST" }, storage);
-    expect(init.headers).toMatchObject({ "content-type": "application/json" });
-    expect(init.headers).not.toHaveProperty("Authorization");
+    expect(headerValue(init.headers, "content-type")).toBe("application/json");
+    expect(headerValue(init.headers, "Authorization")).toBeNull();
   });
 
   it("caller headers cannot drop the Bearer token", () => {
     const { storage } = memoryStorage({ [LAN_AUTH_STORAGE_KEY]: "keep-me" });
     const init = lanAuthRequestInit({ headers: { "x-debug": "1" } }, storage);
-    expect(init.headers).toMatchObject({
-      Authorization: "Bearer keep-me",
-      "x-debug": "1",
-    });
+    expect(headerValue(init.headers, "Authorization")).toBe("Bearer keep-me");
+    expect(headerValue(init.headers, "x-debug")).toBe("1");
   });
 
   it("ComputerPanel screenshot polls go through lanAuthRequestInit, not raw fetch", () => {
