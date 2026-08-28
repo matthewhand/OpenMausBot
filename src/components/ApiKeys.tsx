@@ -1,6 +1,6 @@
-// Paste-a-key rows for PUT /api/config. The server persists to
-// ~/.openmausbot/config.json and hot-reloads the provider fleet; secrets
-// are write-only — GET /api/config returns configured flags, never values.
+// Paste-a-key rows. Packaged Electron saves secrets in the OS-backed store;
+// browser development falls back to PUT /api/config. Secrets are write-only
+// either way — GET /api/config returns configured flags, never values.
 import { useEffect, useId, useRef, useState } from "react";
 import { Check, CircleHelp, ExternalLink, Loader2, TriangleAlert } from "lucide-react";
 import { api, useStore, type ConfigStatus } from "@/state/store";
@@ -18,6 +18,12 @@ const SECTIONS: Record<
   },
   box: { body: (v) => ({ box: { token: v } }), flag: (c) => c.box.configured },
   opencodeGo: { body: (v) => ({ opencodeGo: { apiKey: v } }), flag: (c) => c.opencodeGo?.configured ?? false },
+};
+
+const ELECTRON_CREDENTIAL: Record<ConfigSection, "composioApiKey" | "boxToken" | "opencodeGoApiKey"> = {
+  composio: "composioApiKey",
+  box: "boxToken",
+  opencodeGo: "opencodeGoApiKey",
 };
 
 const CREDENTIALS: Record<
@@ -50,11 +56,11 @@ const CREDENTIALS: Record<
     warning: "Box is a paid service after its trial. Usage may incur charges.",
   },
   opencodeGo: {
-    label: "OpenCode Go API key",
-    placeholder: "Paste your OpenCode Go API key",
-    description: "Run OpenCode Go models through the maintained OpenCode CLI and ACP.",
-    href: "https://opencode.ai/docs/go/",
-    linkLabel: "Open OpenCode Go setup guide",
+    label: "OpenCode API key",
+    placeholder: "Paste an OpenCode API key",
+    description: "Optional. Existing OpenCode Zen, Go, and other provider connections are detected automatically.",
+    href: "https://opencode.ai/docs/providers/",
+    linkLabel: "Open the OpenCode provider guide",
     optional: true,
   },
 };
@@ -95,7 +101,7 @@ function CredentialHelp({ section }: { section: ConfigSection }) {
         aria-expanded={open}
         aria-controls={popoverId}
         onClick={() => setOpen((current) => !current)}
-        className="flex size-6 items-center justify-center rounded-md text-ink-secondary outline-none transition-colors hover:bg-raised hover:text-ink focus-visible:ring-2 focus-visible:ring-accent/70"
+        className="flex size-6 items-center justify-center rounded-md text-ink-secondary outline-none transition-colors hover:bg-control hover:text-ink focus-visible:ring-2 focus-visible:ring-accent/70"
       >
         <CircleHelp size={14} aria-hidden="true" />
       </button>
@@ -150,8 +156,8 @@ export function ApiKeyRow({
     if (saving || (!value.trim() && !configured)) return;
     setSaving(true);
     setError(null);
-    const request = section === "composio" && window.ogb?.setCredential
-      ? window.ogb.setCredential("composioApiKey", value.trim())
+    const request = window.ogb?.setCredential
+      ? window.ogb.setCredential(ELECTRON_CREDENTIAL[section], value.trim())
       : api("/api/config", {
           method: "PUT",
           body: JSON.stringify(SECTIONS[section].body(value.trim())),
@@ -172,7 +178,7 @@ export function ApiKeyRow({
         <span className={cn("size-1.5 rounded-full", configured ? "bg-success" : "bg-raised-hover")} />
         <span>{credential.label}</span>
         {credential.optional && (
-          <span className="rounded bg-raised px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-ink-secondary">
+          <span className="rounded bg-control px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-ink-secondary">
             Optional
           </span>
         )}
@@ -196,13 +202,93 @@ export function ApiKeyRow({
           className={cn(
             "flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg py-2 text-[13px]",
             clearing
-              ? "bg-raised text-danger hover:bg-raised-hover"
-              : "bg-raised text-ink hover:bg-raised-hover",
+              ? "bg-control text-danger hover:bg-raised-hover"
+              : "bg-control text-ink hover:bg-raised-hover",
             "disabled:cursor-not-allowed disabled:opacity-50",
           )}
           title={clearing ? "Remove the saved key" : "Save"}
         >
           {saving ? <Loader2 size={13} className="animate-spin" /> : clearing ? "Clear" : <><Check size={13} />Save</>}
+        </button>
+      </div>
+      {error && <div className="mt-1 text-[12px] text-danger">{error}</div>}
+    </div>
+  );
+}
+
+/** Non-secret Docker-over-SSH target. Keys and passwords stay with SSH. */
+export function VpsConnection() {
+  const { state, dispatch } = useStore();
+  const [alias, setAlias] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const configured = Boolean(state.config?.vps?.configured);
+
+  useEffect(() => {
+    setAlias(state.config?.vps?.sshAlias ?? "");
+  }, [state.config?.vps?.sshAlias]);
+
+  const save = () => {
+    if (saving || (!alias.trim() && !configured)) return;
+    setSaving(true);
+    setError(null);
+    api("/api/config", {
+      method: "PUT",
+      body: JSON.stringify({ vps: { sshAlias: alias.trim() } }),
+    })
+      .then((status: ConfigStatus) => {
+        dispatch({ type: "configStatus", config: status });
+        setAlias(status.vps?.sshAlias ?? "");
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <div>
+      <div className="mb-1.5 flex items-center gap-2 text-[13px] text-ink-secondary">
+        <span className={cn("size-1.5 rounded-full", configured ? "bg-success" : "bg-raised-hover")} />
+        <span>Self-hosted VPS</span>
+        <span className="rounded bg-control px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-ink-secondary">
+          Optional
+        </span>
+        {configured && <span className="text-[11px] text-success">Connected</span>}
+      </div>
+      <div className="mb-1.5 text-[12px] leading-relaxed text-ink-secondary">
+        SSH config alias for the Linux VPS. OpenMausBot uses your normal SSH config and agent; it does not store keys or passwords.{" "}
+        See the{" "}
+        <a
+          href="https://github.com/milind-soni/OpenMausBot/blob/main/docs/byo-vps.md"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-accent hover:underline"
+        >
+          setup guide
+        </a>{" "}
+        for the required SSH alias shape.
+      </div>
+      <div className="flex gap-2">
+        <input
+          type="text"
+          value={alias}
+          onChange={(e) => setAlias(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && save()}
+          placeholder="my-vps"
+          aria-label="Self-hosted VPS SSH config alias"
+          autoComplete="off"
+          className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+        />
+        <button
+          onClick={save}
+          disabled={saving || (!alias.trim() && !configured)}
+          className={cn(
+            "flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg py-2 text-[13px]",
+            !alias.trim() && configured ? "bg-control text-danger hover:bg-raised-hover" : "bg-control text-ink hover:bg-raised-hover",
+            "disabled:cursor-not-allowed disabled:opacity-50",
+          )}
+          title={!alias.trim() && configured ? "Remove the saved alias" : "Save"}
+        >
+          {saving ? <Loader2 size={13} className="animate-spin" /> : !alias.trim() && configured ? "Clear" : <><Check size={13} />Save</>}
         </button>
       </div>
       {error && <div className="mt-1 text-[12px] text-danger">{error}</div>}

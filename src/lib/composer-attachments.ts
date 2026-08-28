@@ -17,7 +17,16 @@ export type FileAttachment = {
   size: number;
 };
 
-export type Attachment = PasteAttachment | FileAttachment;
+export type ImageAttachment = {
+  kind: "image";
+  id: string;
+  path: string;
+  name: string;
+  size: number;
+  mime: string;
+};
+
+export type Attachment = PasteAttachment | FileAttachment | ImageAttachment;
 
 export function isAttachment(value: unknown): value is Attachment {
   if (!value || typeof value !== "object") return false;
@@ -36,6 +45,15 @@ export function isAttachment(value: unknown): value is Attachment {
       typeof attachment.path === "string" &&
       attachment.path.length > 0 &&
       typeof attachment.name === "string"
+    );
+  }
+  if (attachment.kind === "image") {
+    return (
+      typeof attachment.path === "string" &&
+      attachment.path.length > 0 &&
+      typeof attachment.name === "string" &&
+      typeof attachment.mime === "string" &&
+      attachment.mime.startsWith("image/")
     );
   }
   return false;
@@ -66,11 +84,49 @@ export function fileAttachment(name: string, path: string, size: number): FileAt
   return { kind: "file", id: newId(), path, name, size };
 }
 
+/** Matches the server's IMAGE_MAX_BYTES — checked client-side so an
+ * oversized paste is refused before the upload starts, not mid-stream. */
+export const IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+
+export function isImageFile(file: { type: string; size: number }): boolean {
+  return (
+    file.type.startsWith("image/") &&
+    ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.type.split(";")[0]!.trim().toLowerCase())
+  );
+}
+
+/** Persist a pasted image server-side and return the attachment chip data.
+ * The server writes ~/.openmausbot/attachments/<uuid>.<ext> and answers
+ * with the path; the prompt references that path so every CLI can open it. */
+export async function imageAttachmentFromFile(file: File): Promise<ImageAttachment | null> {
+  if (!isImageFile(file)) return null;
+  if (file.size > IMAGE_MAX_BYTES) throw Object.assign(new Error(`${file.name} exceeds 10 MB`), { status: 413 });
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const response = await fetch("/api/attachments", {
+    method: "POST",
+    headers: { "content-type": file.type },
+    body: bytes,
+  });
+  if (!response.ok) {
+    const detail = (await response.json().catch(() => ({ error: response.statusText }))) as { error?: string };
+    throw Object.assign(new Error(detail.error ?? "upload failed"), { status: response.status });
+  }
+  const saved = (await response.json()) as { path: string; mime: string; bytes: number };
+  return { kind: "image", id: newId(), path: saved.path, name: file.name || "pasted image", size: saved.bytes, mime: saved.mime };
+}
+
 export function pasteAttachment(text: string): PasteAttachment {
   const id = newId();
   // measured once, here: a chip re-renders on every keystroke in the
   // composer, and encoding half a megabyte each time would be felt
   return { kind: "paste", id, text, size: byteLength(text), lines: countLines(text) };
+}
+
+/** Move a pasted attachment into the editable composer draft without
+ * running the text back through the paste threshold. */
+export function appendPastedText(text: string, pasted: string): string {
+  if (!text) return pasted;
+  return `${text}${text.endsWith("\n") ? "" : "\n\n"}${pasted}`;
 }
 
 export const INLINE_DROP_LIMIT = 512 * 1024;
@@ -145,6 +201,8 @@ export function composeMessage(text: string, attachments: Attachment[]): string 
   attachments.forEach((a, i) => {
     if (a.kind === "paste") {
       parts.push(`<pasted-text index="${i + 1}">\n${a.text}\n</pasted-text>`);
+    } else if (a.kind === "image") {
+      parts.push(`<attached-image path="${escapeAttribute(a.path)}" />`);
     } else {
       parts.push(`<attached-file path="${escapeAttribute(a.path)}" />`);
     }
@@ -163,4 +221,80 @@ export function escapeAttribute(value: string): string {
     .replaceAll("\t", "&#9;")
     .replaceAll("\r", "&#13;")
     .replaceAll("\n", "&#10;");
+}
+
+/** Split a stored user message into its display text and the images it
+ * attached, for transcript rendering. The tag never shows in the bubble. */
+export function splitAttachedImages(text: string): { display: string; images: string[] } {
+  const images: string[] = [];
+  const display = text.replace(/<attached-image\s+path="([^"]*)"\s*\/?>(?:\s*\n)?/g, (_match, raw: string) => {
+    const path = raw
+      .replaceAll("&quot;", '"')
+      .replaceAll("&lt;", "<")
+      .replaceAll("&gt;", ">")
+      .replaceAll("&amp;", "&");
+    if (path) images.push(path);
+    return "";
+  });
+  return { display: display.trim(), images };
+}
+
+/** The bare filename a saved attachment path ends in — what the serving
+ * route expects. Works for POSIX and Windows separators. */
+export function attachmentBasename(path: string): string {
+  const parts = path.split(/[\\/]/);
+  return parts[parts.length - 1] ?? "";
+}
+
+/** The renderer never loads a transcript-provided URL directly. Only names
+ * the attachment server itself can have generated become same-origin image
+ * URLs; malformed and executable-image paths render nothing, while a string
+ * that looks remote can at most resolve to a local generated filename. */
+export function attachmentImageUrl(path: string): string | null {
+  const name = attachmentBasename(path);
+  if (!/^[A-Za-z0-9-]+\.(png|jpg|gif|webp)$/.test(name)) return null;
+  return `/api/attachments/${encodeURIComponent(name)}`;
+}
+
+/** One intake path for files arriving by drop OR by the composer's attach
+ * button, so a picked file and a dropped one can never behave differently.
+ * The image uploader is injected: the caller owns the network, this owns
+ * the ordering and the sentence the user reads when something is refused. */
+export async function intakeFiles<T extends DroppedFile & { type: string }>(
+  _files: readonly T[],
+  _opts: {
+    allowImages: boolean;
+    getPath: (file: T) => string;
+    uploadImage: (file: T) => Promise<Attachment | null>;
+  },
+): Promise<{ attachments: Attachment[]; notice: string | null }> {
+  const files = [..._files];
+  const { allowImages, getPath, uploadImage } = _opts;
+  const attachments: Attachment[] = [];
+  const rejectedNames: string[] = [];
+  const imageErrors: string[] = [];
+  // Finish each selected file in sequence so the chips retain the order in
+  // which the user chose or dropped them.
+  for (const file of files) {
+    if (allowImages && isImageFile(file)) {
+      try {
+        const attachment = await uploadImage(file);
+        if (attachment) attachments.push(attachment);
+      } catch (err) {
+        imageErrors.push(`${file.name}: ${err instanceof Error ? err.message : "upload failed"}`);
+      }
+      continue;
+    }
+    const result = await attachmentsFromDroppedFiles([file], getPath);
+    attachments.push(...result.attachments);
+    rejectedNames.push(...result.rejectedNames);
+  }
+  const pathless = rejectedNames.length
+    ? `${rejectedNames.join(", ")} — that file has no path on disk. Save it first, then attach it from Finder.`
+    : null;
+  const failed = imageErrors.length ? imageErrors.join("; ") : null;
+  return {
+    attachments,
+    notice: pathless && failed ? `${pathless} (${failed})` : (pathless ?? failed),
+  };
 }
