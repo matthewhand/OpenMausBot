@@ -2,8 +2,8 @@
 // carry the personality; avatars inside the room stay still so a busy group
 // does not become a wall of competing motion. Plain messages go to the room's
 // default responder; @mentions override that routing.
-import { memo, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, Check, ChevronDown, Folder, FolderOpen, Loader2, Pin, PinOff, Plus, X } from "lucide-react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ArrowDown, Check, ChevronDown, Folder, FolderOpen, Loader2, MessageSquareReply, Pin, PinOff, Plus, Search, X } from "lucide-react";
 import {
   api,
   useStore,
@@ -15,22 +15,33 @@ import {
   type Message,
 } from "@/state/store";
 import { MausAvatar } from "./Avatar";
+import { TurnPresence } from "./TurnPresence";
+import { showToolCallsEnabled } from "@/lib/feature-flags";
 import { normalizeState } from "@/lib/mascot";
 import { effectiveDefaultResponder, groupResponseHint } from "@/lib/group-routing";
 import { ChatMarkdown } from "./ChatMarkdown";
 import { Composer } from "./Composer";
+import { ChatFindBar } from "./ChatFindBar";
+import { GroupTaskPicker } from "./TaskPicker";
+import { ReplyQuote } from "./ReplyQuote";
 import { ConnectorCard } from "./ConnectorCard";
+import { SecretRequestCard } from "./SecretRequestCard";
+import { AttachedImageGallery } from "./AttachmentPreview";
 import { GroupCallButton, GroupCallOverlay } from "./GroupCallView";
 import { ReactionBar, ReactionChips } from "./Reactions";
 import { ApprovalCard } from "./ApprovalCard";
 import { CommChip } from "./CommPopup";
 import { ManageMembersPanel } from "./ManageMembersPanel";
+import { groupActivityRuns } from "@/lib/activity-runs";
+import { ActivityRun } from "./ActivityRun";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import { useFocusMessage } from "@/lib/focus-message";
 import { shortPath } from "@/lib/short-path";
 import { BOTTOM_FOLLOW_THRESHOLD, shouldResumeBottomFollow } from "@/lib/bottom-follow";
 import { showWorkingDots } from "@/lib/turn-tail";
+import { liveActivityLabel } from "@/lib/live-activity";
+import { splitAttachedImages } from "@/lib/composer-attachments";
 import {
   TRANSCRIPT_WINDOW_SIZE,
   expandWindowStart,
@@ -47,6 +58,25 @@ function dayLabel(at: number): string {
   if (diffDays === 0) return "Today";
   if (diffDays === 1) return "Yesterday";
   return d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+}
+
+/** One finished tool step in a room. Same pill the 1:1 chat uses, minus the
+ * status glyph — a room reads as a conversation, not a build log. */
+function RoomToolChip({ message }: { message: Message }) {
+  const tool = message.tool;
+  if (!tool) return null;
+  return (
+    <div className="flex justify-start">
+      <div
+        className={cn(
+          "flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px]",
+          tool.ok === false ? "text-danger" : "text-ink-secondary",
+        )}
+      >
+        <span className="max-w-[480px] truncate font-mono">{tool.name}</span>
+      </div>
+    </div>
+  );
 }
 
 /** 16px maus + name, shown once per sender cluster. */
@@ -92,20 +122,61 @@ const Transcript = memo(function Transcript({
   group,
   members,
   messages,
+  transcript,
+  emergingId,
+  onReply,
 }: {
   group: Group;
   members: Bot[];
   /** The windowed suffix of group.messages — the boundary lives in GroupView. */
   messages: Message[];
+  /** Full room transcript, used to resolve quoted messages outside the mounted window. */
+  transcript: Message[];
+  emergingId?: string | null;
+  onReply: (message: Message) => void;
 }) {
+  const { state, dispatch } = useStore();
+  const showToolCalls = showToolCallsEnabled(state.config);
   const memberOf = (id?: string) => members.find((b) => b.id === id);
-  const textMessages = messages;
+  // Several bots working at once turn a room into a wall of chips; fold the
+  // finished ones the same way a 1:1 chat does.
+  const items = useMemo(() => groupActivityRuns(messages), [messages]);
+  const focus = state.focusMessage;
+  const focusedId = focus && !focus.consumed && focus.threadId === group.threadId ? focus.messageId : null;
   return (
     <>
-      {textMessages.map((m, i) => {
-        const prev = textMessages[i - 1];
-        const newDay = !prev || new Date(prev.at).toDateString() !== new Date(m.at).toDateString();
+      {items.map((item, i) => {
+        const previous = items[i - 1];
+        const prev = previous && (previous.kind === "run" ? previous.messages.at(-1) : previous.message);
+        const first = item.kind === "run" ? item.messages[0] : item.message;
+        const newDay = !prev || new Date(prev.at).toDateString() !== new Date(first.at).toDateString();
+        if (item.kind === "run") {
+          if (!showToolCalls) return null;
+          const cluster = !prev || prev.role !== first.role || prev.from?.botId !== first.from?.botId || newDay;
+          return (
+            <div key={item.id} className="contents">
+              {newDay && (
+                <div className="py-3 text-center text-[13px] text-ink-secondary">
+                  {dayLabel(first.at)} {formatTime(first.at)}
+                </div>
+              )}
+              {first.from && cluster && (
+                <ClusterLabel bot={memberOf(first.from.botId)} name={first.from.name} color={first.from.color} />
+              )}
+              <ActivityRun messages={item.messages} forceOpen={item.messages.some((step) => step.id === focusedId)}>
+                {item.messages.map((step) => (
+                  <div key={step.id} className="contents" data-mid={step.id}>
+                    <RoomToolChip message={step} />
+                  </div>
+                ))}
+              </ActivityRun>
+            </div>
+          );
+        }
+        const m = item.message;
+        if (m.id === emergingId) return null;
         const user = m.role === "user";
+        const attachedImages = user && m.text ? splitAttachedImages(m.text) : null;
         const newCluster = !prev || prev.role !== m.role || prev.from?.botId !== m.from?.botId || newDay;
         const row =
           // a member can hit a permission ask mid-turn; without this the
@@ -113,7 +184,9 @@ const Transcript = memo(function Transcript({
           // `tool` distinguishes a permission from a QUESTION — a question
           // only accepts an "answer", so routing it here would offer an
           // Allow the broker rejects
-          m.kind === "connector" && m.connector && m.from?.botId ? (
+          m.kind === "secret" && m.secret && m.from?.botId ? (
+            <SecretRequestCard botId={m.from.botId} threadId={group.threadId} message={m} />
+          ) : m.kind === "connector" && m.connector && m.from?.botId ? (
             <ConnectorCard botId={m.from.botId} threadId={group.threadId} message={m} />
           ) : m.kind === "options" && m.card?.requestId && m.card.tool ? (
             <div className="flex justify-start">
@@ -122,31 +195,73 @@ const Transcript = memo(function Transcript({
           ) : m.kind === "activity" && m.comm ? (
             <CommChip message={m} />
           ) : m.kind === "activity" && m.tool ? (
-            <div className="flex justify-start">
-              <div
-                className={cn(
-                  "flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px]",
-                  m.tool.ok === false ? "text-danger" : "text-ink-secondary",
-                )}
-              >
-                <span className="max-w-[480px] truncate font-mono">{m.tool.name}</span>
-              </div>
-            </div>
+            m.tool.ok === false || m.tool.name.startsWith("error:") || showToolCalls ? (
+              <RoomToolChip message={m} />
+            ) : null
           ) : m.kind === "text" && m.text ? (
             <div className={cn("group flex w-full flex-col", user ? "items-end" : "items-start")}>
               <div className={cn("flex w-full items-end gap-1.5", user ? "justify-end" : "justify-start")}>
                 {user && <ReactionBar threadId={group.threadId} message={m} />}
-                <PinToggle group={group} message={m} />
+                {user && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => onReply(m)}
+                      aria-label="Reply to message"
+                      title="Reply"
+                      className="rounded-md p-1.5 text-ink-secondary opacity-0 transition-opacity hover:bg-raised hover:text-ink focus-visible:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100"
+                    >
+                      <MessageSquareReply size={14} />
+                    </button>
+                    <PinToggle group={group} message={m} />
+                  </>
+                )}
                 <div
                   className={cn(
-                    "max-w-[70%] rounded-2xl px-4 py-2.5 text-[15px] leading-relaxed",
+                    "w-fit max-w-[min(42rem,78%)] rounded-2xl px-4 py-2.5 text-[15px] leading-relaxed",
                     user ? "whitespace-pre-wrap bg-bubble-user text-ink" : "bg-card text-ink",
                   )}
                   title={new Date(m.at).toLocaleString()}
                 >
-                  {user ? m.text : <ChatMarkdown text={m.text} />}
+                  {m.replyToId && (() => {
+                    const target = transcript.find((candidate) => candidate.id === m.replyToId);
+                    return target ? (
+                      <div className="mb-2">
+                        <ReplyQuote
+                          message={target}
+                          fallbackName="Bot"
+                          compact
+                          onJump={() =>
+                            dispatch({ type: "focusMessage", threadId: group.threadId, messageId: target.id })
+                          }
+                        />
+                      </div>
+                    ) : null;
+                  })()}
+                  {user ? (
+                    <>
+                      {attachedImages && attachedImages.images.length > 0 && (
+                        <AttachedImageGallery paths={attachedImages.images} />
+                      )}
+                      {attachedImages?.display ?? m.text}
+                    </>
+                  ) : <ChatMarkdown text={m.text} />}
                 </div>
-                {!user && <ReactionBar threadId={group.threadId} message={m} />}
+                {!user && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => onReply(m)}
+                      aria-label="Reply to message"
+                      title="Reply"
+                      className="rounded-md p-1.5 text-ink-secondary opacity-0 transition-opacity hover:bg-raised hover:text-ink focus-visible:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100"
+                    >
+                      <MessageSquareReply size={14} />
+                    </button>
+                    <PinToggle group={group} message={m} />
+                    <ReactionBar threadId={group.threadId} message={m} />
+                  </>
+                )}
                 <span className="self-end pb-1 text-[11px] tabular-nums text-ink-secondary/70 opacity-0 transition-opacity group-hover:opacity-100">
                   {formatTime(m.at)}
                 </span>
@@ -172,18 +287,6 @@ const Transcript = memo(function Transcript({
     </>
   );
 });
-
-function StreamingBubble({ text }: { text: string }) {
-  const deferred = useDeferredValue(text);
-  return (
-    <div className="flex w-full justify-start">
-      <div className="max-w-[70%] rounded-2xl bg-card px-4 py-2.5 text-[15px] leading-relaxed text-ink">
-        <ChatMarkdown text={deferred} streaming />
-        <span className="animate-caret ml-0.5 inline-block h-[14px] w-[2px] bg-ink align-middle" />
-      </div>
-    </div>
-  );
-}
 
 function DefaultResponderSelect({ group, members }: { group: Group; members: Bot[] }) {
   const { dispatch } = useStore();
@@ -279,7 +382,7 @@ function RoomWorkingFolder({ group }: { group: Group }) {
             {shownCwd ? shortPath(shownCwd, home) : <span className="text-ink-secondary">Each bot's own folder</span>}
           </div>
           <div className="mt-2 text-[12px] text-ink-secondary">
-            Fixed after this channel's first turn. Create a new channel and choose its folder before sending the first message to work somewhere else.
+            Fixed for this task after its first turn. Start a new task to work somewhere else.
           </div>
         </div>
       ) : canPick ? (
@@ -712,8 +815,22 @@ export function GroupView({ group }: { group: Group }) {
   const [bulletinDraft, setBulletinDraft] = useState(group.bulletin);
   const [folderOpen, setFolderOpen] = useState(false);
   const [membersOpen, setMembersOpen] = useState(false);
+  const [findOpen, setFindOpen] = useState(false);
+  const [replyTo, setReplyTo] = useState<Message | null>(null);
   const membersTriggerRef = useRef<HTMLButtonElement>(null);
   const closeMembers = useCallback(() => setMembersOpen(false), []);
+  useEffect(() => setFindOpen(false), [group.threadId]);
+  useEffect(() => setReplyTo(null), [group.threadId]);
+  useEffect(() => {
+    const onFind = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        setFindOpen(true);
+      }
+    };
+    window.addEventListener("keydown", onFind);
+    return () => window.removeEventListener("keydown", onFind);
+  }, []);
 
   const members = useMemo(
     () => group.memberIds.map((id) => state.bots.find((b) => b.id === id)).filter((b): b is Bot => Boolean(b)),
@@ -721,6 +838,42 @@ export function GroupView({ group }: { group: Group }) {
   );
   const speaker = members.find((b) => b.id === group.busyBotId);
   const setupPending = roomNeedsSetup(group);
+
+  // Mascot stays while a member works; the finished reply pops in above it.
+  const lastGroupMessage = group.messages.at(-1);
+  const toolInFlight = lastGroupMessage?.kind === "activity" && lastGroupMessage.tool?.ok === undefined;
+  const activityLabel = liveActivityLabel(lastGroupMessage);
+  const waiting = Boolean(
+    speaker && showWorkingDots(true, undefined, group.messages.at(-1), speaker.id),
+  );
+  const wasWaiting = useRef(false);
+  const [popping, setPopping] = useState<{ id: string; text: string; botId?: string } | null>(null);
+  useEffect(() => {
+    wasWaiting.current = false;
+    setPopping(null);
+  }, [group.id, group.threadId]);
+  useEffect(() => {
+    if (waiting) wasWaiting.current = true;
+  }, [waiting]);
+  useEffect(() => {
+    if (lastGroupMessage?.role !== "bot" || lastGroupMessage.kind !== "text" || !wasWaiting.current) return;
+    wasWaiting.current = false;
+    setPopping({
+      id: lastGroupMessage.id,
+      text: lastGroupMessage.text ?? "",
+      botId: lastGroupMessage.from?.botId,
+    });
+    const timer = setTimeout(() => setPopping(null), 520);
+    return () => clearTimeout(timer);
+  }, [
+    lastGroupMessage?.id,
+    lastGroupMessage?.role,
+    lastGroupMessage?.kind,
+    lastGroupMessage?.text,
+    lastGroupMessage?.from?.botId,
+  ]);
+  const presenceVisible = waiting || popping !== null;
+  const presenceSpeaker = speaker ?? members.find((member) => member.id === popping?.botId) ?? members[0];
 
   // Windowed transcript, mirroring ChatView: only a tail of the room mounts;
   // the anchored boundary re-tails on a render-phase reset when the room (or
@@ -839,10 +992,6 @@ export function GroupView({ group }: { group: Group }) {
     </span>
   ));
 
-  const isWin = window.ogb?.platform === "win32";
-  const drag = isWin ? ({ WebkitAppRegion: "drag" } as React.CSSProperties) : undefined;
-  const noDrag = isWin ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined;
-
   return (
     <main className="relative flex h-full min-w-0 flex-1 flex-col bg-app">
       <GroupCallOverlay group={group} members={members} />
@@ -855,12 +1004,26 @@ export function GroupView({ group }: { group: Group }) {
           "flex items-center justify-between px-5 py-3",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
-          isWin && "pr-[148px]",
         )}
-        style={drag}
       >
-        <span className="text-[15px] font-semibold text-ink">{group.name}</span>
-        <div className="flex items-center gap-1.5" style={noDrag}>
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="truncate text-[15px] font-semibold text-ink">{group.name}</span>
+          {!setupPending && !group.dm && <GroupTaskPicker group={group} />}
+        </div>
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => setFindOpen((open) => !open)}
+            aria-label="Find in conversation"
+            aria-pressed={findOpen}
+            className={cn(
+              "rounded-md p-1.5 hover:bg-raised",
+              findOpen ? "text-accent" : "text-ink-secondary hover:text-ink",
+            )}
+            title="Find in conversation (⌘F)"
+          >
+            <Search size={18} />
+          </button>
           <GroupCallButton group={group} members={members} />
           {!setupPending && !group.dm && <RoomWorkingFolderChip group={group} onToggle={() => setFolderOpen((open) => !open)} />}
           {!setupPending && !group.dm && <DefaultResponderSelect group={group} members={members} />}
@@ -886,8 +1049,10 @@ export function GroupView({ group }: { group: Group }) {
         </div>
       </div>
 
+      {findOpen && <ChatFindBar threadId={group.threadId} onClose={() => setFindOpen(false)} />}
+
       {/* Bulletin: one pinned line; click to edit */}
-      {!setupPending && <div className="mx-auto w-full max-w-[900px] px-5">
+      {!setupPending && <div className="w-full px-5">
         {bulletinOpen ? (
           <div className="mb-1 rounded-lg border border-hairline/40 bg-panel p-2">
             <textarea
@@ -923,7 +1088,7 @@ export function GroupView({ group }: { group: Group }) {
 
       {/* Working folder card — the chip in the header toggles it */}
       {!setupPending && folderOpen && !group.dm && (
-        <div className="mx-auto w-full max-w-[900px] px-5">
+        <div className="w-full px-5">
           <div className="mb-1">
             <RoomWorkingFolder group={group} />
           </div>
@@ -937,7 +1102,7 @@ export function GroupView({ group }: { group: Group }) {
         if (!pinned || !text) return null;
         const sender = pinned.role === "user" ? "You" : (pinned.from?.name ?? "A bot");
         return (
-          <div className="mx-auto w-full max-w-[900px] px-5">
+          <div className="w-full px-5">
             <div className="mb-2 flex items-center gap-2 rounded-lg border border-accent/25 bg-accent/[0.07] px-3 py-1.5">
               <Pin size={12} className="shrink-0 text-accent" />
               <button
@@ -961,10 +1126,10 @@ export function GroupView({ group }: { group: Group }) {
         );
       })()}
 
-      {/* Transcript */}
+      <div className="relative min-h-0 flex-1">
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto px-5 [overflow-anchor:none]"
+        className="h-full overflow-x-hidden overflow-y-auto px-5 [overflow-anchor:none]"
         onWheel={(e) => {
           if (e.deltaY < 0) setBottomFollow(false);
           else if (atEnd()) setBottomFollow(true);
@@ -990,12 +1155,12 @@ export function GroupView({ group }: { group: Group }) {
         }}
       >
         {setupPending ? (
-          <div className="mx-auto flex min-h-full max-w-[900px] items-center py-8">
+          <div className="flex min-h-full w-full items-center py-8">
             <RoomSetup group={group} members={members} />
           </div>
         ) : (
         <div
-          className="mx-auto flex max-w-[900px] flex-col gap-3 pb-4"
+          className="flex w-full flex-col gap-3 pb-24"
           role="log"
           aria-live="polite"
           aria-label={`Room ${group.name}`}
@@ -1031,7 +1196,14 @@ export function GroupView({ group }: { group: Group }) {
               </button>
             </div>
           )}
-          <Transcript group={group} members={members} messages={windowedMessages} />
+          <Transcript
+            group={group}
+            members={members}
+            messages={windowedMessages}
+            transcript={group.messages}
+            emergingId={popping?.id}
+            onReply={setReplyTo}
+          />
           {laterCount > 0 && (
             <div className="flex justify-center">
               <button
@@ -1042,23 +1214,28 @@ export function GroupView({ group }: { group: Group }) {
               </button>
             </div>
           )}
-          {speaker && showWorkingDots(true, streaming, group.messages.at(-1), speaker.id) && (
-            <>
-              <ClusterLabel bot={speaker} name={speaker.name} color={speaker.color} />
-              <div className="flex justify-start">
-                <div className="flex items-center gap-1.5 rounded-2xl bg-raised px-4 py-3">
-                  <span className="size-1.5 animate-bounce rounded-full bg-ink-secondary [animation-delay:0ms]" />
-                  <span className="size-1.5 animate-bounce rounded-full bg-ink-secondary [animation-delay:150ms]" />
-                  <span className="size-1.5 animate-bounce rounded-full bg-ink-secondary [animation-delay:300ms]" />
+          {(speaker || presenceVisible) && (
+            <TurnPresence
+              avatar={
+                <MausAvatar
+                  color={presenceSpeaker?.color ?? "green"}
+                  state={toolInFlight ? "working" : "thinking"}
+                  size={36}
+                  forward={false}
+                  lookAround={1}
+                  trackPointer={false}
+                />
+              }
+              visible={presenceVisible}
+              label={activityLabel}
+              answering={popping !== null}
+            >
+              {popping ? (
+                <div className="w-fit max-w-[min(42rem,78%)] rounded-2xl bg-card px-4 py-2.5 text-[15px] leading-relaxed text-ink">
+                  <ChatMarkdown text={popping.text} />
                 </div>
-              </div>
-            </>
-          )}
-          {speaker && streaming && (
-            <>
-              <ClusterLabel bot={speaker} name={speaker.name} color={speaker.color} />
-              <StreamingBubble text={streaming} />
-            </>
+              ) : null}
+            </TurnPresence>
           )}
         </div>
         )}
@@ -1080,7 +1257,17 @@ export function GroupView({ group }: { group: Group }) {
         </button>
       )}
 
-      <Composer key={group.id} group={group} members={members} locked={setupPending} />
+      <div className="absolute inset-x-0 bottom-0 z-[2]">
+      <Composer
+        key={group.threadId}
+        group={group}
+        members={members}
+        locked={setupPending}
+        replyTo={replyTo}
+        onClearReply={() => setReplyTo(null)}
+      />
+      </div>
+      </div>
     </main>
   );
 }

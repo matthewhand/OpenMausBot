@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensureDirs } from "../config.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
-import { ClaudeDriver, permissionSocketPath } from "./claude.ts";
+import { ClaudeDriver, permissionSocketPath, type ClaudeConfig } from "./claude.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "testing", "fake-claude-cli.ts");
@@ -86,6 +86,27 @@ describe("ClaudeDriver.decodeConfig", () => {
     expect(() => ClaudeDriver.decodeConfig({ permissionMode: "yolo" })).toThrow(/permissionMode/);
   });
 
+  it("normalizes and deduplicates built-in tool lists", () => {
+    expect(
+      ClaudeDriver.decodeConfig({
+        tools: [" Read ", "WebFetch", "Read"],
+        disallowedTools: [" Bash(git *) ", "Bash(git *)"],
+      }),
+    ).toMatchObject({
+      tools: ["Read", "WebFetch"],
+      disallowedTools: ["Bash(git *)"],
+    });
+    expect(ClaudeDriver.decodeConfig({ tools: [] }).tools).toEqual([]);
+  });
+
+  it.each([
+    ["tools", "Read"],
+    ["tools", ["Read", " "]],
+    ["disallowedTools", [42]],
+  ])("rejects invalid %s configuration", (field, value) => {
+    expect(() => ClaudeDriver.decodeConfig({ [field]: value })).toThrow(new RegExp(field));
+  });
+
   it.skipIf(process.platform !== "win32")("names permission pipes per harness process", () => {
     expect(permissionSocketPath("thread-abc")).toMatch(
       new RegExp(`^\\\\\\\\\\.\\\\pipe\\\\openmausbot-perm-${process.pid}-thre[0-9a-f]{4}$`),
@@ -136,14 +157,22 @@ describe("ClaudeDriver turns (fake CLI)", () => {
   let recorder: EventRecorder;
   let scratch: string;
 
-  const create = async (mode?: string, environment: Record<string, string> = {}) => {
+  const create = async (
+    mode?: string,
+    environment: Record<string, string> = {},
+    config: Partial<ClaudeConfig> = {},
+  ) => {
     if (mode) process.env.FAKE_CLAUDE_MODE = mode;
     instance = await ClaudeDriver.create({
       instanceId: "claude-test",
       displayName: "Claude Test",
       environment,
       enabled: true,
-      config: { cli: FAKE_CLI, permissionMode: "acceptEdits" },
+      config: {
+        ...config,
+        cli: config.cli ?? FAKE_CLI,
+        permissionMode: config.permissionMode ?? "acceptEdits",
+      },
     });
     recorder = recordEvents(instance.adapter);
   };
@@ -193,11 +222,11 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(recorder.events.every((e) => e.turnId === turnId && e.provider === "claudeAgent")).toBe(true);
 
     const usage = recorder.events.find((e) => e.type === "thread.token-usage.updated")!;
-    expect(usage).toMatchObject({ input: 12, output: 5 }); // input + cache_read
+    expect(usage).toMatchObject({ input: 12, output: 5, cachedInput: 2 }); // input + cache_read, cache_read named
     const done = recorder.events.at(-1)!;
     // usage on the settle is the turn total from the result message, so
     // the harness has one figure to bank per turn
-    expect(done).toMatchObject({ type: "turn.completed", ok: true, cost: 0.01, usage: { input: 12, output: 5 } });
+    expect(done).toMatchObject({ type: "turn.completed", ok: true, cost: 0.01, usage: { input: 12, output: 5, cachedInput: 2 } });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
   });
 
@@ -374,6 +403,35 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(allowed).toContain("mcp__notion");
     expect(allowed).toContain("mcp__deepwiki");
     expect(allowed).not.toContain("mcp__disabled-server");
+  });
+
+  it("passes normalized available and denied built-in tool sets to Claude", async () => {
+    await create(undefined, {}, {
+      tools: ["Read", "WebFetch"],
+      disallowedTools: ["Bash(git *)", "Edit"],
+    });
+    const dump = join(scratch, "tool-scope.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-tool-scope", text: "inspect" });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv[seen.argv.indexOf("--tools") + 1]).toBe("Read,WebFetch");
+    expect(seen.argv[seen.argv.indexOf("--disallowedTools") + 1]).toBe("Bash(git *),Edit");
+  });
+
+  it("passes an explicit empty available set to disable every Claude built-in", async () => {
+    await create(undefined, {}, { tools: [], disallowedTools: [] });
+    const dump = join(scratch, "no-builtins.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-no-builtins", text: "reply only" });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv[seen.argv.indexOf("--tools") + 1]).toBe("");
+    expect(seen.argv).not.toContain("--disallowedTools");
   });
 
   it("mounts the dweb proxy from the drivers directory and pre-allows its tools", async () => {
@@ -775,18 +833,38 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       tool: "Bash",
       summary: "rm -rf scratch",
       requestId: "ask-1",
-      approvalScope: "local-computer",
     });
+    // a plain CLI tool never carries the desktop-control approval scope,
+    // so the UI can offer a remembered grant for it
+    expect(opened).toHaveProperty("approvalScope", undefined);
 
     // the outcome names exactly what was granted: this action, once
     await expect(instance.adapter.respondToRequest("t-perm-abc", "ask-1", { behavior: "allow" })).resolves.toBe("allowed-once");
     expect(await answered).toMatchObject({ behavior: "allow" });
     const resolved = await recorder.until((e) => e.type === "request.resolved");
-    expect(resolved).toMatchObject({
-      behavior: "allow",
-      source: "user",
-      approvalScope: "local-computer",
+    expect(resolved).toMatchObject({ behavior: "allow", source: "user" });
+    expect(resolved).toHaveProperty("approvalScope", undefined);
+
+    // a real desktop-control tool keeps the local-computer scope, which
+    // suppresses remembered grants — desktop actions must be approved
+    // one at a time
+    const answered2 = new Promise<{ behavior: string }>((resolve) => {
+      let buf = "";
+      conn.on("data", (c) => {
+        buf += c;
+        const nl = buf.indexOf("\n");
+        if (nl !== -1) resolve(JSON.parse(buf.slice(0, nl)));
+      });
     });
+    conn.write(
+      JSON.stringify({ t: "ask", id: "ask-2", tool: "mcp__computer__screenshot", input: {} }) + "\n",
+    );
+    const opened2 = await recorder.until((e) => e.requestId === "ask-2" && e.type === "request.opened");
+    expect(opened2).toHaveProperty("approvalScope", "local-computer");
+    await expect(instance.adapter.respondToRequest("t-perm-abc", "ask-2", { behavior: "allow" })).resolves.toBe("allowed-once");
+    expect(await answered2).toMatchObject({ behavior: "allow" });
+    const resolved2 = await recorder.until((e) => e.requestId === "ask-2" && e.type === "request.resolved");
+    expect(resolved2).toHaveProperty("approvalScope", "local-computer");
 
     conn.end();
     await instance.adapter.interruptTurn("t-perm-abc");
@@ -1058,7 +1136,8 @@ describe("ClaudeDriver turns (fake CLI)", () => {
   });
 
   it("strips workspace credentials from generateText helper children", async () => {
-    await create();
+    const instanceConfigDir = join(scratch, "instance-claude-config");
+    await create(undefined, { CLAUDE_CONFIG_DIR: instanceConfigDir });
     const dump = join(scratch, "generate-text-env.json");
     process.env.FAKE_CLAUDE_DUMP = dump;
     const names = ["XAI_API_KEY", "COMPOSIO_API_KEY", "BOX_TOKEN", "OPENCODE_API_KEY", "OMB_TTS_KEY"] as const;
@@ -1067,7 +1146,22 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await instance.generateText?.("summarize safely");
 
     const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.prompt).toBe("summarize safely");
+    expect(seen.argv).not.toContain("summarize safely");
+    expect(seen.env.CLAUDE_CONFIG_DIR).toBe(instanceConfigDir);
     for (const name of names) expect(seen.env[name]).toBeUndefined();
+  });
+
+  it("declares safe same-provider permission review", async () => {
+    await create();
+    await expect(instance.reviewPermission?.("review this request")).resolves.toBe("fake generated text");
+  });
+
+  it("stops permission review when its caller gives up", async () => {
+    await create();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(instance.reviewPermission?.("review this request", controller.signal)).rejects.toThrow(/aborted/);
   });
 
   it("declares the effort levels the CLI accepts", async () => {

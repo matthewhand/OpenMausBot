@@ -1,79 +1,58 @@
 // Per-agent voice profile. The key is shared; the voice and autoplay choice
 // belong to the selected bot.
 //
-// TTS itself is ElevenLabs or any OpenAI-compatible speech server — pick the
-// provider below; base URL and model are app-wide settings next to the key.
-//
-// The voice list comes from the harness, which holds the key — the
-// renderer never talks to ElevenLabs itself.
+// Three engines: ElevenLabs, an OpenAI-compatible URL (Kokoro / LiteLLM /
+// OpenAI), and the Mac's built-in voices. Provider switch must not reuse
+// the other engine's key or voice id.
 import { useEffect, useState } from "react";
 import { Check, Loader2, Volume2 } from "lucide-react";
 
 import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
-import { speaker, SAMPLE } from "@/lib/tts";
+import { useDesktopCapabilities } from "@/components/DesktopCapabilities";
+import { speaker } from "@/lib/tts";
+import {
+  ttsOpenaiCredentialsPatch,
+  ttsOpenaiModelPatch,
+  ttsProviderPatch,
+  ttsVoicePatch,
+  type TtsProvider,
+} from "@/lib/tts-provider";
 import { cn } from "@/lib/cn";
+
+const SAMPLE = "Morning. Overnight the tests went green, and I left two notes for you in the thread.";
+
+type Engine = TtsProvider | "system";
 
 export function VoiceSettings({
   bot,
   onPatch,
 }: {
-  bot: Bot;
-  onPatch: (patch: Partial<Pick<Bot, "voice" | "speakReplies">>) => void;
+  bot?: Bot;
+  onPatch?: (patch: Partial<Pick<Bot, "voice" | "openaiVoice" | "speakReplies">>) => void;
 }) {
   const { state, dispatch } = useStore();
   const tts = state.config?.tts;
 
-  const [provider, setProvider] = useState<"elevenlabs" | "openai-compatible">(
-    (tts?.provider as "elevenlabs" | "openai-compatible") ?? "elevenlabs",
-  );
   const [key, setKey] = useState("");
   const [baseUrl, setBaseUrl] = useState(tts?.baseUrl ?? "");
-  const [model, setModel] = useState(tts?.model ?? "");
+  const [model, setModel] = useState(tts?.openaiModel ?? "");
+  const [customVoice, setCustomVoice] = useState(tts?.voice ?? "");
   const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const [switching, setSwitching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [voices, setVoices] = useState<Array<{ id: string; label: string; description?: string }>>([]);
   const [loadingVoices, setLoadingVoices] = useState(false);
-  const [auditioningVoiceId, setAuditioningVoiceId] = useState<string | null>(null);
 
+  const { capabilities } = useDesktopCapabilities();
+  const systemVoicesAvailable = capabilities.host.platform === "darwin";
+  const provider = (tts?.provider ?? "elevenlabs") as Engine;
   const configured = Boolean(tts?.configured);
 
   useEffect(() => {
-    return speaker.subscribe((s) => {
-      if (s.status === "idle") {
-        setAuditioningVoiceId(null);
-      }
-      if (s.error) {
-        setError(s.error);
-      }
-    });
-  }, []);
-
-  const handleAudition = async (voiceId?: string) => {
-    const target = voiceId || tts?.voice;
-    if (!target) return;
-    setAuditioningVoiceId(target);
-    setError(null);
-    try {
-      await speaker.speak(SAMPLE, { voiceId: target, botId: bot.id });
-      if (speaker.state.error) {
-        setError(speaker.state.error);
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setAuditioningVoiceId(null);
-    }
-  };
-
-  // Update local provider state when config changes
-  useEffect(() => {
-    if (tts?.provider) {
-      setProvider(tts.provider as "elevenlabs" | "openai-compatible");
-    }
     if (tts?.baseUrl !== undefined) setBaseUrl(tts.baseUrl);
-    if (tts?.model !== undefined) setModel(tts.model);
-  }, [tts?.provider, tts?.baseUrl, tts?.model]);
+    if (tts?.openaiModel !== undefined) setModel(tts.openaiModel);
+    if (tts?.voice !== undefined) setCustomVoice(tts.voice);
+  }, [tts?.baseUrl, tts?.openaiModel, tts?.voice]);
 
   useEffect(() => {
     if (!configured) {
@@ -93,95 +72,102 @@ export function VoiceSettings({
     return () => {
       alive = false;
     };
-  }, [configured, tts?.baseUrl, tts?.model, tts?.provider]);
+  }, [configured, provider]);
+
+  const setEngine = (next: Engine) => {
+    if (next === provider || switching || (next === "system" && !systemVoicesAvailable)) return;
+    setSwitching(true);
+    setError(null);
+    api("/api/config", { method: "PUT", body: JSON.stringify({ tts: ttsProviderPatch(next) }) })
+      .then((status: ConfigStatus) => dispatch({ type: "configStatus", config: status }))
+      .catch((e: Error) => setError(e.message))
+      .finally(() => setSwitching(false));
+  };
 
   const save = (patch: Record<string, unknown>) => {
     setSaving(true);
     setError(null);
-    setSaved(false);
     return api("/api/config", { method: "PUT", body: JSON.stringify({ tts: patch }) })
       .then((status: ConfigStatus) => {
         dispatch({ type: "configStatus", config: status });
         setKey("");
-        setSaved(true);
-        window.setTimeout(() => setSaved(false), 2500);
       })
       .catch((e: Error) => setError(e.message))
       .finally(() => setSaving(false));
   };
 
-  if (!tts) return null;
-
-  const saveProvider = (newProvider: "elevenlabs" | "openai-compatible") => {
-    setProvider(newProvider);
-    setError(null);
-    void save(newProvider === "openai-compatible" ? { provider: newProvider, key: "" } : { provider: newProvider });
-  };
-
-  // Desktop builds keep credentials in OS storage; the config API is the
-  // fallback everywhere else.
-  const saveElevenLabsKey = () => {
+  const saveKey = () => {
     const nextKey = key.trim();
     if (!nextKey) return Promise.resolve();
-    if (window.ogb?.setCredential) {
-      setSaving(true);
-      setError(null);
-      setSaved(false);
-      return window.ogb
-        .setCredential("ttsKey", nextKey)
-        .then((status: ConfigStatus) => {
-          dispatch({ type: "configStatus", config: status });
-          setKey("");
-          setSaved(true);
-          window.setTimeout(() => setSaved(false), 2500);
-        })
-        .catch((e: Error) => setError(e.message))
-        .finally(() => setSaving(false));
-    }
-    return save({ key: nextKey });
+    setSaving(true);
+    setError(null);
+    const request = window.ogb?.setCredential
+      ? window.ogb.setCredential("ttsKey", nextKey)
+      : api("/api/config", { method: "PUT", body: JSON.stringify({ tts: { key: nextKey } }) });
+    return request
+      .then((status: ConfigStatus) => {
+        dispatch({ type: "configStatus", config: status });
+        setKey("");
+      })
+      .catch((e: Error) => setError(e.message))
+      .finally(() => setSaving(false));
   };
 
-  const saveCredentials = () => {
-    if (provider === "openai-compatible") {
-      const trimmedUrl = (baseUrl || tts.baseUrl || "").trim();
-      if (!trimmedUrl) {
-        setError("Base URL is required for OpenAI-compatible servers.");
-        return;
-      }
-      const patch: Record<string, unknown> = {
-        baseUrl: trimmedUrl,
-        model: model.trim() || undefined,
-      };
-      if (key.trim()) {
-        patch.key = key.trim();
-      }
-      void save(patch);
+  const saveOpenai = () => {
+    const trimmedUrl = (baseUrl || tts?.baseUrl || "").trim();
+    if (!trimmedUrl) {
+      setError("Base URL is required for OpenAI-compatible servers.");
       return;
     }
-    void saveElevenLabsKey();
+    void save(ttsOpenaiCredentialsPatch(trimmedUrl, key));
   };
 
-  const selectedVoice = bot.voice ?? "";
+  if (!tts) return null;
+
+  const selectedVoice = provider === "openai-compatible" ? (bot?.openaiVoice ?? "") : (bot?.voice ?? "");
   const ready = configured && Boolean(selectedVoice || tts.voice);
+
+  const engines: Array<{ value: Engine; label: string; available: boolean }> = [
+    { value: "elevenlabs", label: "ElevenLabs", available: true },
+    { value: "openai-compatible", label: "OpenAI-compatible", available: true },
+    { value: "system", label: "Built-in Mac voices", available: systemVoicesAvailable },
+  ];
 
   return (
     <div className="rounded-xl bg-card p-4">
       <div className="text-[15px] font-medium text-ink">Voice</div>
       <div className="mt-0.5 text-[13px] text-ink-secondary">
-        Read replies aloud and talk to your bots. Choose your TTS provider below.
+        Give this agent a voice for calls and spoken replies. The voice choice belongs to this agent;
+        {provider === "system"
+          ? systemVoicesAvailable
+            ? " the voices are the ones already installed on this Mac."
+            : " built-in Mac voices are unavailable here. Switch to ElevenLabs or an OpenAI-compatible URL."
+          : provider === "openai-compatible"
+            ? " the OpenAI-compatible URL is shared by the workspace."
+            : " the ElevenLabs key is shared by the workspace."}
       </div>
 
       <div className="mt-4">
-        <div className="mb-1.5 text-[13px] text-ink-secondary">Provider</div>
-        <select
-          value={provider}
-          onChange={(e) => saveProvider(e.target.value as "elevenlabs" | "openai-compatible")}
-          aria-label="TTS Provider"
-          className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none"
-        >
-          <option value="elevenlabs">ElevenLabs</option>
-          <option value="openai-compatible">OpenAI-compatible</option>
-        </select>
+        <div className="mb-2 text-[13px] text-ink-secondary">Voice engine</div>
+        <div className="inline-flex flex-wrap rounded-xl bg-inset p-1" role="radiogroup" aria-label="Voice engine">
+          {engines.filter((option) => option.available || option.value === provider).map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              role="radio"
+              aria-checked={provider === option.value}
+              disabled={switching || !option.available}
+              title={!option.available ? "Built-in voices are available only on macOS" : undefined}
+              onClick={() => setEngine(option.value)}
+              className={cn(
+                "rounded-lg px-3.5 py-1.5 text-[12.5px] transition-colors disabled:opacity-50",
+                provider === option.value ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink",
+              )}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {provider === "elevenlabs" && (
@@ -196,16 +182,16 @@ export function VoiceSettings({
               type="password"
               value={key}
               onChange={(e) => setKey(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && key.trim() && saveCredentials()}
+              onKeyDown={(e) => e.key === "Enter" && key.trim() && void saveKey()}
               placeholder={configured ? "••••••••  (paste to replace)" : "Paste your ElevenLabs API key"}
               aria-label="ElevenLabs key"
               autoComplete="off"
               className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
             />
             <button
-              onClick={saveCredentials}
+              onClick={() => void saveKey()}
               disabled={saving || !key.trim()}
-              className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+              className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-control py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
             >
               {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
             </button>
@@ -224,78 +210,106 @@ export function VoiceSettings({
       )}
 
       {provider === "openai-compatible" && (
-        <div className="space-y-4">
+        <>
           <div className="mt-4">
             <div className="mb-1.5 flex items-center gap-2 text-[13px] text-ink-secondary">
               <span className={cn("size-1.5 rounded-full", configured ? "bg-success" : "bg-raised-hover")} />
               <span>Base URL</span>
               {configured && <span className="text-[11px] text-success">Connected</span>}
             </div>
-            <input
-              type="text"
-              value={baseUrl || tts.baseUrl || ""}
-              onChange={(e) => setBaseUrl(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && saveCredentials()}
-              placeholder="http://127.0.0.1:8000/v1"
-              aria-label="Base URL"
-              autoComplete="off"
-              className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
-            />
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={baseUrl || tts.baseUrl || ""}
+                onChange={(e) => setBaseUrl(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && baseUrl.trim() && saveOpenai()}
+                placeholder="http://127.0.0.1:9093/v1"
+                aria-label="Base URL"
+                autoComplete="off"
+                className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+              />
+              <button
+                onClick={saveOpenai}
+                disabled={saving || !baseUrl.trim()}
+                className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
+              </button>
+            </div>
             <div className="mt-1.5 text-[12px] text-ink-secondary">
-              OpenAI-compatible speech API endpoint URL.
+              For local Kokoro or any OpenAI-compatible TTS server. Example: http://127.0.0.1:9093/v1
             </div>
           </div>
-
-          <div>
-            <div className="mb-1.5 text-[13px] text-ink-secondary">Model (optional)</div>
-            <input
-              type="text"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && saveCredentials()}
-              placeholder="tts-1"
-              aria-label="Model"
-              autoComplete="off"
-              className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
-            />
+          <div className="mt-4">
+            <div className="mb-1.5 text-[13px] text-ink-secondary">Model</div>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && void save(ttsOpenaiModelPatch(model))}
+                placeholder="tts-1 or kokoro"
+                aria-label="Model"
+                autoComplete="off"
+                className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+              />
+              <button
+                onClick={() => void save(ttsOpenaiModelPatch(model))}
+                disabled={saving}
+                className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
+              </button>
+            </div>
           </div>
-
-          <div>
-            <div className="mb-1.5 text-[13px] text-ink-secondary">API Key (optional)</div>
-            <input
-              type="password"
-              value={key}
-              onChange={(e) => setKey(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && saveCredentials()}
-              placeholder={configured ? "••••••••  (optional for local servers)" : "Optional for local servers"}
-              aria-label="API Key"
-              autoComplete="off"
-              className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
-            />
+          <div className="mt-4">
+            <div className="mb-1.5 flex items-center gap-2 text-[13px] text-ink-secondary">
+              <span className={cn("size-1.5 rounded-full", tts.openaiKeyConfigured ? "bg-success" : "bg-raised-hover")} />
+              <span>API Key (optional)</span>
+              {tts.openaiKeyConfigured && <span className="text-[11px] text-success">Connected</span>}
+            </div>
+            <div className="flex gap-2">
+              <input
+                type="password"
+                value={key}
+                onChange={(e) => setKey(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && saveOpenai()}
+                placeholder={tts.openaiKeyConfigured ? "••••••••  (paste to replace)" : "Optional for local servers"}
+                aria-label="API Key"
+                autoComplete="off"
+                className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+              />
+              <button
+                onClick={saveOpenai}
+                disabled={saving}
+                className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
+              </button>
+              {tts.openaiKeyConfigured && (
+                <button
+                  onClick={() =>
+                    void save(ttsOpenaiCredentialsPatch(baseUrl || tts.baseUrl || "", "", { clearKey: true }))
+                  }
+                  disabled={saving}
+                  aria-label="Clear API key"
+                  className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
           </div>
-
-          <div className="flex items-center justify-between pt-1">
-            <span className="text-[12px] text-success">
-              {saved ? "Voice settings saved" : ""}
-            </span>
-            <button
-              onClick={saveCredentials}
-              disabled={saving || !baseUrl.trim()}
-              className="flex items-center justify-center gap-1.5 rounded-lg bg-raised px-4 py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save server settings</>}
-            </button>
-          </div>
-        </div>
+        </>
       )}
 
-      {configured && (
+      {configured && bot && onPatch && (
         <div className="mt-4">
           <div className="mb-1.5 text-[13px] text-ink-secondary">Voice</div>
           <div className="flex gap-2">
             <select
               value={selectedVoice}
-              onChange={(e) => onPatch({ voice: e.target.value })}
+              onChange={(e) => onPatch(ttsVoicePatch(provider === "system" ? "elevenlabs" : provider, e.target.value))}
               aria-label={`${bot.name}'s voice`}
               className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none"
             >
@@ -315,21 +329,45 @@ export function VoiceSettings({
                   {v.description ? ` — ${v.description}` : ""}
                 </option>
               ))}
+              {tts.voice && !voices.some((v) => v.id === tts.voice) && (
+                <option value={tts.voice}>Custom — {tts.voice}</option>
+              )}
             </select>
             <button
-              onClick={() => void handleAudition(selectedVoice || undefined)}
-              disabled={!ready || auditioningVoiceId !== null}
+              onClick={() => void speaker.speak(SAMPLE, { voiceId: selectedVoice || bot.voice, botId: bot.id })}
+              disabled={!ready}
               title={ready ? "Hear this voice" : "Pick a voice first"}
               aria-label="Hear this voice"
               className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-control py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {auditioningVoiceId ? <Loader2 size={14} className="animate-spin" /> : <Volume2 size={14} />} Try
+              <Volume2 size={14} /> Try
             </button>
           </div>
+          {provider !== "system" && (
+            <div className="mt-2 flex gap-2">
+              <input
+                type="text"
+                value={customVoice}
+                onChange={(e) => setCustomVoice(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && customVoice.trim() && void save(ttsVoicePatch(provider, customVoice))}
+                placeholder="Or type a custom voice id"
+                aria-label="Custom voice id"
+                autoComplete="off"
+                className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+              />
+              <button
+                onClick={() => void save(ttsVoicePatch(provider, customVoice))}
+                disabled={saving || !customVoice.trim()}
+                className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
+              </button>
+            </div>
+          )}
         </div>
       )}
 
-      <div className="mt-4 flex items-center justify-between gap-4 border-t border-hairline/40 pt-4">
+      {bot && onPatch && <div className="mt-4 flex items-center justify-between gap-4 border-t border-hairline/40 pt-4">
         <div>
           <div className="text-[13px] font-medium text-ink">Read replies aloud</div>
           <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-secondary">
@@ -353,7 +391,7 @@ export function VoiceSettings({
             )}
           />
         </button>
-      </div>
+      </div>}
 
       {error && <div role="alert" className="mt-2 text-[12px] text-danger">{error}</div>}
     </div>

@@ -3,11 +3,12 @@ import { Loader2, Menu } from "lucide-react";
 import { StoreProvider, useStore } from "@/state/store";
 import { Onboarding } from "@/components/Onboarding";
 import { emailGateDone, initAnalytics } from "@/lib/analytics";
+import { unreadConversationCount } from "@/lib/unread";
 import { Sidebar } from "@/components/Sidebar";
 import { ChatView } from "@/components/ChatView";
 import { GroupView } from "@/components/GroupView";
 import { SettingsPanel } from "@/components/SettingsPanel";
-import { PluginsPanel } from "@/components/PluginsPanel";
+import { PluginsPanel, preloadConnectedApps } from "@/components/PluginsPanel";
 import { ComputerPanel } from "@/components/ComputerPanel";
 import { InspectorPanel } from "@/components/InspectorPanel";
 import { SettingsModal } from "@/components/SettingsModal";
@@ -17,16 +18,21 @@ import { RoutinesPage } from "@/components/RoutinesPage";
 import { NoEngines } from "@/components/NoEngines";
 import { CommandPalette } from "@/components/CommandPalette";
 import { LanAuthModal } from "@/components/LanAuthModal";
+import { LocalVmWorkspace } from "@/components/LocalVmWorkspace";
 import { SkillRecorderPage } from "@/components/SkillRecorderPage";
+import { TeamMapPage } from "@/components/TeamMapPage";
 
 function Shell() {
   const { state, dispatch } = useStore();
+  const unreadCount = unreadConversationCount(state.bots, state.groups);
   // Mobile-only drawer state. Above md, none of these properties are emitted
   // at all — Sidebar scopes every mobile class with max-md: rather than
   // cancelling them with md:, which would still emit a translate value and
   // turn the aside into a containing block for its fixed descendants (see
   // Sidebar.tsx's className comment).
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [localVmWorkspaceBotId, setLocalVmWorkspaceBotId] = useState<string | null>(null);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const group = state.groups.find((g) => g.id === state.selectedId);
   const bot = group ? undefined : (state.bots.find((b) => b.id === state.selectedId) ?? state.bots[0]);
@@ -69,6 +75,18 @@ function Shell() {
     return () => window.removeEventListener("keydown", onKey);
   }, [state.bots, state.selectedId, dispatch]);
 
+  useEffect(() => {
+    window.ogb?.setUnreadCount?.(unreadCount);
+  }, [unreadCount]);
+
+  // Warm connected-account state as soon as the local server is available.
+  // The modal then opens with the correct Connect/Add account buttons and
+  // quietly revalidates instead of rediscovering every account from scratch.
+  useEffect(() => {
+    if (!state.connected) return;
+    void preloadConnectedApps().catch(() => {});
+  }, [state.connected]);
+
   // Picking a conversation closes the drawer: on a phone the chat is what you
   // asked for, and leaving the list up would hide it. Watching activeView too
   // catches re-selecting the bot that is already current from another view —
@@ -78,6 +96,59 @@ function Shell() {
   useEffect(() => {
     setDrawerOpen(false);
   }, [state.selectedId, state.activeView, state.pluginsOpen, state.settingsOpen]);
+
+  useEffect(() => {
+    if (
+      localVmWorkspaceBotId &&
+      (state.activeView !== "chat" || state.selectedId !== localVmWorkspaceBotId)
+    ) {
+      setLocalVmWorkspaceBotId(null);
+    }
+  }, [localVmWorkspaceBotId, state.activeView, state.selectedId]);
+
+  const openLocalVmWorkspace = (botId: string) => {
+    dispatch({ type: "toggleComputer", open: false });
+    setLocalVmWorkspaceBotId(botId);
+  };
+
+  const openComputerFromWorkspace = (botId: string) => {
+    setLocalVmWorkspaceBotId(null);
+    dispatch({ type: "select", id: botId });
+    dispatch({ type: "toggleComputer", open: true });
+  };
+
+  const nativeViewOverlayOpen =
+    drawerOpen ||
+    paletteOpen ||
+    state.settingsOpen ||
+    state.computerOpen ||
+    state.inspectorOpen ||
+    state.appSettingsOpen ||
+    state.pluginsOpen;
+
+  // The viewer outlives ComputerPanel and can target any bot, so release control
+  // here (always mounted) when a bot's viewer closes. release() is idempotent.
+  useEffect(() => {
+    return window.ogb?.desktopViewer?.onState((viewer) => {
+      if (viewer.open || !viewer.contextId) return;
+      const botId = viewer.contextId;
+      void fetch(`/api/bots/${botId}/computer/control`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "release" }),
+      })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((snap) => {
+          if (snap) dispatch({ type: "computerControl", botId, held: snap.held === true, helpReason: snap.helpReason ?? null });
+        })
+        .catch(() => {});
+      void fetch(`/api/bots/${botId}/computer/viewer-close`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      }).catch(() => {});
+    });
+  }, [dispatch]);
 
   return (
     <div className="flex h-full flex-col">
@@ -108,10 +179,19 @@ function Shell() {
           menuButtonRef.current?.focus();
         }}
       />
-      {state.activeView === "routines" ? (
+      {state.activeView === "team-map" ? (
+        <TeamMapPage />
+      ) : state.activeView === "routines" ? (
         <RoutinesPage />
       ) : state.activeView === "skill-recorder" ? (
         <SkillRecorderPage />
+      ) : localVmWorkspaceBotId ? (
+        <LocalVmWorkspace
+          primaryBotId={localVmWorkspaceBotId}
+          overlayOpen={nativeViewOverlayOpen}
+          onClose={() => setLocalVmWorkspaceBotId(null)}
+          onOpenComputer={openComputerFromWorkspace}
+        />
       ) : noEngines ? (
         <NoEngines />
       ) : group ? (
@@ -132,14 +212,16 @@ function Shell() {
         </main>
       )}
       {state.settingsOpen && bot && <SettingsPanel bot={bot} />}
-      {state.computerOpen && bot && <ComputerPanel bot={bot} />}
+      {state.computerOpen && bot && (
+        <ComputerPanel bot={bot} onOpenVmWorkspace={openLocalVmWorkspace} />
+      )}
       {state.inspectorOpen && bot && <InspectorPanel bot={bot} />}
       {state.appSettingsOpen && <SettingsModal />}
       {state.pluginsOpen && <PluginsPanel />}
       {state.authRequired && <LanAuthModal />}
       {/* mounted after the modals: same z-50 tier, so DOM order keeps the
           palette on top when one of them is open underneath */}
-      <CommandPalette />
+      <CommandPalette onOpenChange={setPaletteOpen} />
       </div>
     </div>
   );

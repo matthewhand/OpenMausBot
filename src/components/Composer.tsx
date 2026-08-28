@@ -1,23 +1,28 @@
 import { track } from "@/lib/analytics";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, Clock, Mic, Square, Users, X } from "lucide-react";
-import { useStore, visibleMessages, type Bot, type Group } from "@/state/store";
+import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, X } from "lucide-react";
+import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
 import { useComposerDraft } from "@/lib/drafts";
 import { MausAvatar } from "./Avatar";
-import { ComposerAttachments } from "./ComposerAttachments";
+import { ComposerAttachments, pathForFile } from "./ComposerAttachments";
+import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import {
+  appendPastedText,
   composeMessage,
   imageAttachmentFromFile,
+  intakeFiles,
   isImageFile,
   isLongPaste,
   pasteAttachment,
   type Attachment,
+  type PasteAttachment,
 } from "@/lib/composer-attachments";
 import { normalizeState } from "@/lib/mascot";
 import { groupComposerHint, roomRespondersForComposer } from "@/lib/group-routing";
 import { PendingApprovalActions, PendingApprovalPanel, pendingApprovals } from "./PendingApproval";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
+import { ReplyQuote } from "./ReplyQuote";
 
 /** The active @mention query at the caret: the text between an `@` that
  * starts a word and the caret. null = no mention being typed. */
@@ -33,17 +38,117 @@ function mentionQueryAt(text: string, caret: number): { start: number; query: st
 
 type MentionChoice = { id: string; name: string; bot?: Bot };
 
+function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto: boolean) => void }) {
+  const [open, setOpen] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [open]);
+
+  const mode = bot.autoApprove ? "auto" : "ask";
+  const Icon = mode === "auto" ? ShieldCheck : Hand;
+  const label = mode === "auto" ? "Approve for me" : "Ask for approval";
+
+  return (
+    <div className="relative flex items-center" ref={wrapperRef}>
+      <button
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+        className="flex h-8 items-center gap-1.5 whitespace-nowrap rounded-full border border-hairline/20 bg-transparent px-3 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink"
+      >
+        <Icon size={14} className="opacity-70" />
+        {label}
+      </button>
+
+      {open && (
+        <div
+          role="menu"
+          aria-label={`Permission mode for ${bot.name}`}
+          className="absolute bottom-full left-0 z-30 mb-2 w-80 overflow-hidden rounded-xl border border-hairline/40 bg-raised shadow-lg"
+        >
+          <div className="border-b border-hairline/20 px-4 py-3 text-[13px] font-medium text-ink-secondary">
+            How should {bot.name} actions be approved?
+          </div>
+          <div className="flex flex-col py-1">
+            <button
+              type="button"
+              role="menuitemradio"
+              aria-checked={mode === "ask"}
+              onClick={() => {
+                onSetAuto(false);
+                setOpen(false);
+              }}
+              className="flex items-start gap-3 px-4 py-3 text-left hover:bg-raised-hover"
+            >
+              <Hand size={16} className="mt-0.5 shrink-0 opacity-70" />
+              <div className="flex w-full flex-col gap-0.5">
+                <div className="flex items-center justify-between text-[14px] text-ink">
+                  Ask for approval
+                  {mode === "ask" && <Check size={14} />}
+                </div>
+                <div className="text-[13px] text-ink-secondary">Ask before actions that need your permission</div>
+              </div>
+            </button>
+            <button
+              type="button"
+              role="menuitemradio"
+              aria-checked={mode === "auto"}
+              onClick={() => {
+                onSetAuto(true);
+                setOpen(false);
+              }}
+              className="flex items-start gap-3 px-4 py-3 text-left hover:bg-raised-hover"
+            >
+              <ShieldCheck size={16} className="mt-0.5 shrink-0 opacity-70" />
+              <div className="flex w-full flex-col gap-0.5">
+                <div className="flex items-center justify-between text-[14px] text-ink">
+                  Approve for me
+                  {mode === "auto" && <Check size={14} />}
+                </div>
+                <div className="text-[13px] text-ink-secondary">
+                  Keep going automatically; destructive and sensitive actions still ask
+                </div>
+              </div>
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Renders the editable message composer and its pending attachments. */
 export function Composer({
   bot,
   group,
   members,
   onEditLast,
+  replyTo,
+  onClearReply,
   locked = false,
 }: {
   bot?: Bot;
   group?: Group;
   members?: Bot[];
   onEditLast?: () => void;
+  replyTo?: Message | null;
+  onClearReply?: () => void;
   /** New rooms keep the composer inert until their setup is saved or skipped. */
   locked?: boolean;
 }) {
@@ -64,8 +169,8 @@ export function Composer({
   const approvals = pendingApprovals(group ? group.messages : bot ? visibleMessages(bot) : []);
   const approval = approvals[0];
   const approvalBot = group
-    ? members?.find((b) => b.id === approval?.message.from?.botId) ??
-      members?.find((b) => b.id === group.busyBotId)
+    ? members?.find((member) => member.id === approval?.message.from?.botId) ??
+      members?.find((member) => member.id === group.busyBotId)
     : bot;
   const busyName = group
     ? (members?.find((b) => b.id === group.busyBotId)?.name ?? "A bot")
@@ -73,7 +178,7 @@ export function Composer({
   // Per-thread draft: switching bots unmounts this component, so both the
   // text and its attachment chips have to outlive it (see lib/drafts).
   const [text, setText, attachments, setAttachments] = useComposerDraft(
-    group ? `group:${group.id}` : `bot:${bot?.id ?? ""}`,
+    group ? `group:${group.id}:${group.threadId}` : `bot:${bot?.id ?? ""}`,
   );
   const addAttachments = useCallback(
     (next: Attachment[]) => setAttachments((prev) => [...prev, ...next]),
@@ -82,6 +187,23 @@ export function Composer({
   const removeAttachment = useCallback(
     (id: string) => setAttachments((prev) => prev.filter((a) => a.id !== id)),
     [setAttachments],
+  );
+  const displayPasteInChatBox = useCallback(
+    /** Moves one pasted attachment into the editable draft and restores focus. */
+    function displayPasteInChatBox(attachment: PasteAttachment) {
+      const nextText = appendPastedText(text, attachment.text);
+      setText(nextText);
+      setAttachments((prev) => prev.filter((a) => a.id !== attachment.id));
+      setCaret(nextText.length);
+      setDismissedAt(null);
+      requestAnimationFrame(() => {
+        const input = inputRef.current;
+        if (!input) return;
+        input.focus();
+        input.setSelectionRange(nextText.length, nextText.length);
+      });
+    },
+    [text, setText, setAttachments],
   );
   const [recording, setRecording] = useState(false);
   const [speechError, setSpeechError] = useState<string | null>(null);
@@ -129,12 +251,14 @@ export function Composer({
 
   useEffect(() => setHighlight(0), [mention?.start, mention?.query]);
 
-  // grow the textarea with its content (capped by max-h in the className)
+  // one line at rest, then grow with the draft — hard cap at six lines
   useEffect(() => {
     const el = inputRef.current;
     if (!el) return;
+    const line = parseFloat(getComputedStyle(el).lineHeight) || 24;
+    const cap = line * 6;
     el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
+    el.style.height = `${Math.min(el.scrollHeight, cap)}px`;
   }, [text]);
 
   const pickMention = (peer: MentionChoice) => {
@@ -156,13 +280,43 @@ export function Composer({
   // the moment the room settles. 1:1 mid-turn sends still POST (the harness
   // queue), but stay off the transcript until drain — the chip here is the
   // pending row so they cannot become the active leaf mid-turn.
-  const [queued, setQueued] = useState<string | null>(null);
+  const [queued, setQueued] = useState<{ text: string; replyToId?: string } | null>(null);
   const pendingChip = group
-    ? queued
+    ? queued?.text
     : bot
       ? state.pendingQueued?.[bot.threadId]?.map((entry) => entry.text).join("\n")
       : undefined;
   // a chip on its own is a message: the send control has to appear for it
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [autoWarn, setAutoWarn] = useState(false);
+  const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
+  // Auto mode belongs to one bot; a room has several, each with its own.
+  const autoBot = group ? undefined : bot;
+  const pickFiles = async (picked: FileList | null) => {
+    if (!picked?.length) return;
+    const { attachments: added, notice } = await intakeFiles(Array.from(picked), {
+      allowImages: engineSupportsImages,
+      getPath: pathForFile,
+      uploadImage: imageAttachmentFromFile,
+    });
+    if (added.length) addAttachments(added);
+    // Keep file-specific failures beside the attachments. A successful
+    // overlapping intake must not erase an earlier failure before it is read.
+    if (notice) setAttachmentNotice(notice);
+  };
+  const setAuto = (auto: boolean) => {
+    if (!autoBot) return;
+    // Turning it on for a bot that drives THIS computer is the one case that
+    // has to be acknowledged first. The flag the dialog sends is stripped by
+    // the reducer rather than stored, so — exactly like the settings panel —
+    // the warning is shown on every switch-on, not just the first.
+    if (auto && !autoBot.autoApprove && autoBot.computer === "local") {
+      setAutoWarn(true);
+      return;
+    }
+    dispatch({ type: "updateBot", botId: autoBot.id, patch: { autoApprove: auto } });
+  };
+
   const hasContent = Boolean(text.trim()) || attachments.length > 0;
   const send = () => {
     if (locked) return;
@@ -173,30 +327,32 @@ export function Composer({
     const t = composeMessage(text, attachments);
     if (!t) return;
     if (busy && group) {
-      setQueued(t);
+      setQueued({ text: t, replyToId: replyTo?.id });
       setText("");
       setAttachments([]);
+      onClearReply?.();
       return;
     }
     if (group) {
-      dispatch({ type: "sendGroup", groupId: group.id, text: t });
+      dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id });
       track("message_sent", { room: true });
     } else if (bot) {
-      dispatch({ type: "send", botId: bot.id, text: t });
+      dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id });
       track("message_sent", { driver: bot.modelSelection?.instanceId, queued: busy && !canSteer });
     }
     setText("");
     setAttachments([]);
+    onClearReply?.();
   };
   useEffect(() => {
     if (busy || !queued) return;
     if (group) {
-      if (queued.includes("<attached-image ") && !imageTargetsSupport(queued)) {
+      if (queued.text.includes("<attached-image ") && !imageTargetsSupport(queued.text)) {
         dispatch({ type: "error", message: "The selected responder does not support image attachments." });
         setQueued(null);
         return;
       }
-      dispatch({ type: "sendGroup", groupId: group.id, text: queued });
+      dispatch({ type: "sendGroup", groupId: group.id, text: queued.text, replyToId: queued.replyToId });
       track("message_sent", { room: true, queued: true });
     }
     setQueued(null);
@@ -246,28 +402,39 @@ export function Composer({
   };
 
   return (
-    <div className="px-5 pb-5 pt-2">
+    <div className="pointer-events-none relative px-5 pb-3">
+      {/* No fill or hairline on this wrapper — those were the black frame
+          in the pill's top corners. The dock overlays the transcript. */}
       {speechError && (
-        <div className="mx-auto mb-2 max-w-[900px] rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[12px] text-warning">
+        <div className="pointer-events-auto mb-2 w-full rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[12px] text-warning">
           {speechError}
         </div>
       )}
-      <div className="relative mx-auto max-w-[900px]">
+      <div className="pointer-events-auto relative w-full">
         {pendingChip && (
           <div className="mb-2 flex items-center gap-2 rounded-lg border border-hairline/40 bg-panel px-3 py-2 text-[12.5px] text-ink-secondary">
             <Clock size={13} className="shrink-0" />
             <span className="min-w-0 flex-1 truncate">
               Queued — sends when {busyName} finishes: “{pendingChip}”
             </span>
-            {group && (
-              <button
-                onClick={() => setQueued(null)}
-                aria-label="Discard queued message"
-                className="rounded p-0.5 hover:bg-raised hover:text-ink"
-              >
-                <X size={13} />
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => {
+                if (group) {
+                  setQueued(null);
+                  return;
+                }
+                if (!bot) return;
+                for (const entry of state.pendingQueued?.[bot.threadId] ?? []) {
+                  dispatch({ type: "cancelQueued", botId: bot.id, queueId: entry.queueId });
+                }
+              }}
+              aria-label="Cancel queued message"
+              title="Cancel queued message"
+              className="ml-auto flex size-5 shrink-0 items-center justify-center rounded text-ink-secondary hover:bg-raised hover:text-ink"
+            >
+              <X size={13} strokeWidth={2.5} />
+            </button>
           </div>
         )}
         {pickerOpen && (
@@ -321,14 +488,58 @@ export function Composer({
             />
           </div>
         )}
+        {replyTo && (
+          <div className="mb-2 px-1">
+            <ReplyQuote
+              message={replyTo}
+              fallbackName={bot?.name}
+              onClear={onClearReply}
+            />
+          </div>
+        )}
         <ComposerAttachments
           items={attachments}
           onAdd={addAttachments}
           onRemove={removeAttachment}
+          onDisplayInChatBox={displayPasteInChatBox}
           allowImages={engineSupportsImages}
+          notice={attachmentNotice}
+          onNotice={setAttachmentNotice}
         />
-        <div className="flex items-end gap-2 rounded-3xl border border-hairline/40 bg-raised/60 py-2 pl-3 pr-2">
-        <textarea
+        <div className="relative">
+          {/* App-ground from the pill's bottom radius down, full-bleed.
+              Bubbles may tuck into the pill; they must not paint under it. */}
+          <div
+            aria-hidden
+            className="absolute -left-5 -right-5 top-[calc(100%-1.5rem)] h-[50vh] bg-app"
+          />
+        <div className="relative grid grid-cols-[auto_1fr_auto] items-center gap-x-2 rounded-3xl bg-raised px-3 pb-2 pt-1">
+          <input
+            ref={fileInput}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              void pickFiles(e.target.files);
+              // same file twice in a row still fires onChange
+              e.target.value = "";
+            }}
+          />
+          {!locked && (
+            <div className="col-start-1 row-start-2 mt-1 flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => fileInput.current?.click()}
+                aria-label="Attach a file"
+                title="Attach a file"
+                className="flex size-8 shrink-0 items-center justify-center rounded-full text-ink-secondary hover:bg-control hover:text-ink"
+              >
+                <Paperclip size={17} />
+              </button>
+              {autoBot && <PermissionModeSelector bot={autoBot} onSetAuto={setAuto} />}
+            </div>
+          )}
+          <textarea
           ref={inputRef}
           rows={1}
           value={text}
@@ -426,9 +637,10 @@ export function Composer({
                   : `Message ${bot?.name ?? ""}`
           }
           aria-label={`Message ${group ? group.name : (bot?.name ?? "")}`}
-          className="max-h-40 w-full resize-none self-center bg-transparent py-1 text-[15px] leading-6 text-ink placeholder:text-ink-secondary focus:outline-none"
-        />
-        {busy && !locked && (
+            className="col-span-full row-start-1 max-h-[9rem] min-h-6 w-full resize-none overflow-y-auto self-center bg-transparent px-1 py-1 text-[15px] leading-6 text-ink placeholder:text-ink-secondary focus:outline-none"
+          />
+          <div className="col-start-3 row-start-2 mt-1 flex items-center gap-1">
+          {busy && !locked && (
           <button
             onClick={() => {
               if (group) dispatch({ type: "interruptGroup", groupId: group.id });
@@ -468,8 +680,26 @@ export function Composer({
           >
             {busy && !canSteer ? <Clock size={15} /> : <ArrowUp size={17} />}
           </button>
-        )}
+          )}
+          </div>
         </div>
+        </div>
+      </div>
+      <div className="pointer-events-auto">
+      <LocalComputerAutoWarning
+        open={autoWarn}
+        onCancel={() => setAutoWarn(false)}
+        onConfirm={() => {
+          if (autoBot) {
+            dispatch({
+              type: "updateBot",
+              botId: autoBot.id,
+              patch: { autoApprove: true, acknowledgeLocalAuto: true },
+            });
+          }
+          setAutoWarn(false);
+        }}
+      />
       </div>
     </div>
   );

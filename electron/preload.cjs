@@ -2,6 +2,14 @@
 // this narrow surface (window.ogb), never Node or ipcRenderer itself.
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
+let pendingPackageInstallUrl = null;
+const packageInstallListeners = new Set();
+ipcRenderer.on("package:install", (_event, url) => {
+  if (typeof url !== "string") return;
+  pendingPackageInstallUrl = url;
+  for (const listener of packageInstallListeners) listener(url);
+});
+
 contextBridge.exposeInMainWorld("ogb", {
   /** Host platform ("darwin" | "win32" | "linux") — for platform-aware UI. */
   platform: process.platform,
@@ -19,9 +27,19 @@ contextBridge.exposeInMainWorld("ogb", {
     state: () => ipcRenderer.invoke("companion:state"),
     start: () => ipcRenderer.invoke("companion:start"),
     stop: () => ipcRenderer.invoke("companion:stop"),
-    pairing: (open) => ipcRenderer.invoke("companion:pairing", open),
+    keepAwake: (enabled) => ipcRenderer.invoke("companion:keep-awake", enabled),
+    pairing: (open, expectedToken) => ipcRenderer.invoke("companion:pairing", open, expectedToken),
     cloudDesktop: (deviceId, allowed) => ipcRenderer.invoke("companion:cloud-desktop", deviceId, allowed),
     revoke: (deviceId) => ipcRenderer.invoke("companion:revoke", deviceId),
+  },
+  /** Optional account-backed HTTPS access for Companion. Secrets stay in the
+   * main process; the renderer sees only status and narrow user actions. */
+  companionAccount: {
+    state: () => ipcRenderer.invoke("companion-account:state"),
+    requestCode: (email) => ipcRenderer.invoke("companion-account:request-code", email),
+    verifyCode: (email, code) => ipcRenderer.invoke("companion-account:verify-code", email, code),
+    retry: () => ipcRenderer.invoke("companion-account:retry"),
+    signOut: () => ipcRenderer.invoke("companion-account:sign-out"),
   },
   localControl: {
     status: () => ipcRenderer.invoke("cua:linux-status"),
@@ -100,13 +118,38 @@ contextBridge.exposeInMainWorld("ogb", {
   /** Open a web link in the default browser. Unlike renderer window.open,
    * this remains reliable after an asynchronous API request. */
   openExternal: (url) => ipcRenderer.invoke("desktop:open-external", url),
-  /** Live VNC/noVNC in a sandboxed modal owned by the app window. */
+  /** Tell the window which skin the page wears, so the native chrome the
+   * renderer cannot paint (the Windows caption-button overlay) matches. */
+  applySkin: (skin) => ipcRenderer.invoke("desktop:skin", skin),
+  /** A reviewed BotMRR package opened through openmausbot://install. */
+  onPackageInstall: (cb) => {
+    packageInstallListeners.add(cb);
+    if (pendingPackageInstallUrl) cb(pendingPackageInstallUrl);
+    return () => packageInstallListeners.delete(cb);
+  },
+  /** Mirrors durable unread state into the native Dock/taskbar badge. */
+  setUnreadCount: (count) => ipcRenderer.send("desktop:unread-count", count),
+  /** Live VNC/noVNC in a sandboxed window owned by the app window. */
   desktopViewer: {
     open: (url, title, contextId) => ipcRenderer.invoke("desktop-viewer:open", url, title, contextId),
+    close: (contextId) => ipcRenderer.invoke("desktop-viewer:close", contextId),
+    currentState: () => ipcRenderer.invoke("desktop-viewer:state-now"),
     onState: (cb) => {
       const handler = (_event, state) => cb(state);
       ipcRenderer.on("desktop-viewer:state", handler);
       return () => ipcRenderer.removeListener("desktop-viewer:state", handler);
+    },
+  },
+  /** Two sandboxed Local VM viewers embedded in the owning app window. */
+  desktopWorkspace: {
+    open: (input) => ipcRenderer.invoke("desktop-workspace:open", input),
+    layout: (items) => ipcRenderer.invoke("desktop-workspace:layout", items),
+    setInteractive: (contextId) => ipcRenderer.invoke("desktop-workspace:set-interactive", contextId),
+    close: (contextId) => ipcRenderer.invoke("desktop-workspace:close", contextId),
+    onState: (cb) => {
+      const handler = (_event, state) => cb(state);
+      ipcRenderer.on("desktop-workspace:state", handler);
+      return () => ipcRenderer.removeListener("desktop-workspace:state", handler);
     },
   },
   /** Native folder picker for a bot's working folder; null when cancelled. */
@@ -114,6 +157,16 @@ contextBridge.exposeInMainWorld("ogb", {
   /** Writes the redacted diagnostics report to a user-chosen file; resolves
    * the path, or null when the save dialog was cancelled. */
   exportDiagnostics: () => ipcRenderer.invoke("desktop:export-diagnostics"),
+  /** Ask where to save a bot-created file (inside ~/.openmausbot), copy it
+   * there and reveal it. Returns the chosen path, or null if the user
+   * cancelled the dialog. The chat bubble shows the
+   * rejection text verbatim, so strip the "Error invoking remote method"
+   * wrapper ipcRenderer adds around a main-process throw. */
+  saveFile: (filePath) =>
+    ipcRenderer.invoke("desktop:save-file", filePath).catch((error) => {
+      const message = String(error?.message ?? error);
+      throw new Error(message.replace(/^Error invoking remote method '[^']*':\s*(?:Error:\s*)?/, ""));
+    }),
   /** Store a provider credential with OS-backed encryption. */
   setCredential: (name, value) => ipcRenderer.invoke("credential:set", name, value),
 

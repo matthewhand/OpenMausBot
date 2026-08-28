@@ -94,6 +94,10 @@ const DRIVER_KIND = "claudeAgent";
 export interface ClaudeConfig {
   cli: string;
   permissionMode: "acceptEdits" | "auto" | "bypassPermissions";
+  /** Available Claude built-ins. An empty list passes `--tools ""`. */
+  tools?: string[];
+  /** Claude tool patterns to deny after the available set is selected. */
+  disallowedTools?: string[];
 }
 
 // model catalog ported from upstream packages/contracts/src/model.ts
@@ -376,15 +380,36 @@ function createPermissionBroker(opts: {
   };
 }
 
+function decodeToolList(value: unknown, field: "tools" | "disallowedTools"): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new Error(`claude: ${field} must be an array of non-empty strings`);
+  const decoded: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (typeof entry !== "string" || !entry.trim()) {
+      throw new Error(`claude: ${field} must be an array of non-empty strings`);
+    }
+    const normalized = entry.trim();
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    decoded.push(normalized);
+  }
+  return decoded;
+}
+
 function decodeConfig(raw: unknown): ClaudeConfig {
   const o = (raw ?? {}) as Record<string, unknown>;
   const mode = o.permissionMode;
   if (mode !== undefined && mode !== "acceptEdits" && mode !== "auto" && mode !== "bypassPermissions") {
     throw new Error(`claude: invalid permissionMode ${JSON.stringify(mode)}`);
   }
+  const tools = decodeToolList(o.tools, "tools");
+  const disallowedTools = decodeToolList(o.disallowedTools, "disallowedTools");
   return {
     cli: typeof o.cli === "string" ? o.cli : "claude",
     permissionMode: (mode as ClaudeConfig["permissionMode"]) ?? "acceptEdits",
+    ...(tools !== undefined ? { tools } : {}),
+    ...(disallowedTools !== undefined ? { disallowedTools } : {}),
   };
 }
 
@@ -550,6 +575,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         "--include-partial-messages",
         "--permission-mode", config.permissionMode === "auto" ? "acceptEdits" : config.permissionMode,
       ];
+      if (config.tools !== undefined) args.push("--tools", config.tools.join(","));
+      if (config.disallowedTools?.length) {
+        args.push("--disallowedTools", config.disallowedTools.join(","));
+      }
       const turnEnvironment: NodeJS.ProcessEnv = { ...process.env, ...input.environment };
       const turnModel = await resolveClaudeTurnModel(turn.model, turnEnvironment);
       const injected = applyClaudeInject({ ...turnEnvironment }, turnModel);
@@ -686,11 +715,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // Only create a broker for a new process. A compatible retained process
       // keeps its existing proxy connection and broker across turns.
       if (socketPath) {
+        // remembers which tool each pending ask came from, so the resolved
+        // event can scope approvals to real desktop-control tools only
+        const askTools = new Map<string, string | undefined>();
         broker = createPermissionBroker({
           socketPath,
           isActive: () => Boolean(sessions.get(threadId)?.turn),
           onAsk: (ask) => {
             const eventTurnId = sessions.get(threadId)?.turn?.turnId ?? turnId;
+            askTools.set(ask.id, typeof ask.tool === "string" ? ask.tool : undefined);
             emit({
               ...base(threadId, eventTurnId),
               type: "request.opened",
@@ -698,7 +731,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               requestType: ask.kind,
               tool: ask.tool,
               summary: askSummary(ask),
-              approvalScope: controlsHost ? "local-computer" : undefined,
+              approvalScope:
+                typeof ask.tool === "string" && controlsHost && ask.tool.startsWith("mcp__computer")
+                  ? "local-computer"
+                  : undefined,
               choices: Array.isArray(ask.input?.choices) ? (ask.input.choices as string[]).slice(0, 5) : undefined,
             });
           },
@@ -710,8 +746,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               requestId: resolved.id,
               behavior: resolved.behavior,
               source: resolved.source,
-              approvalScope: controlsHost ? "local-computer" : undefined,
+              approvalScope:
+                controlsHost && typeof askTools.get(resolved.id) === "string" && askTools.get(resolved.id)!.startsWith("mcp__computer") ? "local-computer" : undefined,
             });
+            askTools.delete(resolved.id);
           },
         });
       }
@@ -742,7 +780,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         ok: boolean,
         stopReason: string | null,
         cost: number | null = null,
-        usage?: { input: number; output: number },
+        usage?: { input: number; output: number; cachedInput?: number },
       ) => {
         const t = session.turn;
         if (!t || t.settled) return;
@@ -823,6 +861,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                 type: "thread.token-usage.updated",
                 input: (msg.usage.input_tokens || 0) + (msg.usage.cache_read_input_tokens || 0),
                 output: msg.usage.output_tokens || 0,
+                ...(typeof msg.usage.cache_read_input_tokens === "number"
+                  ? { cachedInput: msg.usage.cache_read_input_tokens }
+                  : {}),
               });
             }
             break;
@@ -837,7 +878,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           case "result":
             // result.usage is this invocation's total — one process per turn,
             // so it is the turn's figure. cache reads count as input: they
-            // are billed (at the cache rate) and they fill the window.
+            // are billed (at the cache rate) and they fill the window — but
+            // they are reported separately too, so the UI can show how much
+            // of the figure was context re-read rather than new text.
             settle(
               o.is_error !== true,
               o.stop_reason ?? o.terminal_reason ?? null,
@@ -846,6 +889,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                 ? {
                     input: (o.usage.input_tokens || 0) + (o.usage.cache_read_input_tokens || 0) + (o.usage.cache_creation_input_tokens || 0),
                     output: o.usage.output_tokens || 0,
+                    ...(typeof o.usage.cache_read_input_tokens === "number"
+                      ? { cachedInput: o.usage.cache_read_input_tokens }
+                      : {}),
                   }
                 : undefined,
             );
@@ -1017,6 +1063,64 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       return { state: "available", version, authenticated, billing: "subscription" };
     };
 
+    /** One-shot Claude call with the prompt on stdin, never argv. Approval
+     * summaries can contain paths, commands, or secrets, so the generic
+     * `claude -p "prompt"` shape is not safe for review. No tools or MCP
+     * servers are mounted in this isolated process. */
+    const generateReview = (prompt: string, signal?: AbortSignal): Promise<string> =>
+      new Promise((resolve, reject) => {
+        const child = spawnCli(
+          config.cli,
+          ["-p", "--model", "claude-haiku-4-5", "--output-format", "text"],
+          {
+            stdio: ["pipe", "pipe", "pipe"],
+            env: claudeEnvironment("claude-haiku-4-5", { ...process.env, ...input.environment }),
+          },
+        );
+        let stdout = "";
+        let stderr = "";
+        let settled = false;
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", onAbort);
+          if (error) reject(error);
+          else resolve(stdout.trim());
+        };
+        const onAbort = () => {
+          killCliTree(child);
+          finish(new Error("Claude review aborted"));
+        };
+        const timer = setTimeout(() => {
+          killCliTree(child);
+          finish(new Error("Claude review timed out"));
+        }, 60_000);
+        timer.unref?.();
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+        child.stdout.on("data", (chunk: string) => {
+          stdout += chunk;
+          if (stdout.length > 1_000_000) {
+            killCliTree(child);
+            finish(new Error("Claude review output exceeded 1 MB"));
+          }
+        });
+        child.stderr.on("data", (chunk: string) => {
+          stderr = (stderr + chunk).slice(-8_192);
+        });
+        child.on("error", (error) => finish(error));
+        child.on("close", (code) => {
+          if (code === 0) finish();
+          else finish(new Error(stderr.trim() || `Claude review exited ${code}`));
+        });
+        if (signal?.aborted) onAbort();
+        else {
+          signal?.addEventListener("abort", onAbort, { once: true });
+          child.stdin.end(prompt);
+        }
+      });
+
     return {
       instanceId,
       driverKind: DRIVER_KIND,
@@ -1062,15 +1166,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           return () => listeners.delete(listener);
         },
       },
-      generateText: (prompt: string) =>
-        new Promise((resolve, reject) => {
-          execCli(
-            config.cli,
-            ["-p", prompt, "--model", "claude-haiku-4-5", "--output-format", "text"],
-            { timeout: 60_000, env: claudeEnvironment("claude-haiku-4-5") },
-            (err, stdout) => (err ? reject(err) : resolve(stdout.trim())),
-          );
-        }),
+      generateText: (prompt) => generateReview(prompt),
+      reviewPermission: generateReview,
       dispose: async () => {
         for (const { stop } of active.values()) stop();
         for (const threadId of [...sessions.keys()]) closeSession(threadId, "dispose");

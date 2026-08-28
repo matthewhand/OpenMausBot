@@ -16,6 +16,7 @@ import {
 import type { CloudBackend, EffortLevel } from "../../server/contracts.ts";
 import type { MausColor, MausMotion } from "@/lib/mascot";
 import type { BotAvatarCrop } from "../../shared/bot-avatar";
+import type { RoutineRequestCardData } from "../../shared/routine-request";
 import type { Routine, RoutineInput, RoutineRun } from "@/lib/routines";
 import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib/webhooks";
 import { currentCall } from "@/lib/call";
@@ -42,6 +43,8 @@ export interface OptionCardData {
   /** the narrow grant "always allow" remembers, e.g. "Bash:git" */
   allowKey?: string;
   approvalScope?: "local-computer";
+  /** Persisted proposal used by the server when the user confirms it. */
+  routineRequest?: RoutineRequestCardData;
 }
 
 export interface ConnectorCardData {
@@ -55,13 +58,27 @@ export interface ConnectorCardData {
   resumed?: boolean;
 }
 
+export interface SecretRequestCardData {
+  target: import("../../shared/credential-request").CredentialTargetId;
+  label: string;
+  description: string;
+  placeholder: string;
+  helpUrl: string;
+  requestKey: string;
+  provided?: boolean;
+  dismissed?: boolean;
+  resumed?: boolean;
+  error?: string;
+}
+
 export interface Message {
   id: string;
   role: "bot" | "user";
-  kind: "text" | "options" | "activity" | "screen" | "connector";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
   card?: OptionCardData;
   connector?: ConnectorCardData;
+  secret?: SecretRequestCardData;
   /** activity messages: tool name + outcome. `spoken` is the server's
    * narration of the same chip ("reading a file"), used by call mode. */
   /** `setup` marks an error fixed by installing something, not by retrying. */
@@ -75,6 +92,8 @@ export interface Message {
   /** the message this one follows; null = thread root. Edited messages
    * share a parentId with the version they replace — that's a fork. */
   parentId?: string | null;
+  /** Flat reply reference for an inline quote; unrelated to branch ancestry. */
+  replyToId?: string;
   /** rooms: which member said this (sender attribution). */
   from?: { botId: string; name: string; color: MausColor };
   /** emoji reactions; by = "user" or a member botId. */
@@ -121,7 +140,20 @@ export interface Group {
   /** New user-created rooms remain in setup until Save or Skip. */
   setupCompletedAt?: number | null;
   setupSkippedAt?: number | null;
+  /** Separate conversations in this channel. DMs deliberately stay on one
+   * thread and omit this collection. */
+  tasks?: GroupTask[];
   messages: Message[];
+}
+
+/** One of a channel's independent conversations. The channel's threadId
+ * points at the active one; folder and pin state belong to the task. */
+export interface GroupTask {
+  threadId: string;
+  title: string;
+  createdAt: number;
+  pinnedCwd?: string | null;
+  pinnedMessageId?: string;
 }
 
 export interface ModelSelection {
@@ -146,6 +178,9 @@ export interface Task {
 export interface TaskUsage {
   input: number;
   output: number;
+  /** cached share of `input` (context the model re-read); absent on records
+   * from builds before it was tracked */
+  cachedInput?: number;
   /** null until any turn reported a cost — most engines never do; records
    * from builds before cost existed lack the field entirely */
   costUsd: number | null;
@@ -176,10 +211,14 @@ export interface Bot {
   computer?: "cloud" | "vm" | "local" | "off";
   /** Which cloud computer backs `computer: "cloud"`; absent means Box. */
   cloudBackend?: CloudBackend;
+  /** Allow Auto to prepare/start the managed VPS container. Off by default. */
+  autoStartVps?: boolean;
   /** where new tasks run their shell tools; absent = the private bot workspace */
   cwd?: string;
   /** auto mode: the bot approves its own tool permissions */
   autoApprove?: boolean;
+  /** optional model review for otherwise undecided, attended approvals */
+  autoReview?: "off" | "shadow" | "enforce";
   /** tools this bot may always use without asking */
   alwaysAllow?: string[];
   /** speak this bot's replies aloud as they settle */
@@ -241,18 +280,20 @@ export interface ConfigStatus {
   rooms: { turnTimeoutMinutes: number };
   localVm: { mode: "shared" | "per-bot"; maxInstances: number };
   opencodeGo?: { configured: boolean };
-  /** Voice. Supports ElevenLabs and OpenAI-compatible providers.
-   * `provider` = which provider is selected; `configured` = credentials are
-   * saved; `ready` = credentials AND a voice. Secrets are never echoed back.
-   * `baseUrl` is echoed for OpenAI-compatible (not a secret). */
-  tts?: { provider: "elevenlabs" | "openai-compatible"; configured: boolean; ready: boolean; voice: string; baseUrl: string; model?: string };
+  tts?: {
+    configured: boolean;
+    ready: boolean;
+    voice: string;
+    provider?: "elevenlabs" | "openai-compatible" | "system";
+    baseUrl?: string;
+    openaiKeyConfigured?: boolean;
+    openaiModel?: string;
+    model?: string;
+  };
   /** Shared write-only credential for on-demand GPT Image avatars. */
   imageGen?: { configured: boolean };
   /** who's using the app — collected in onboarding, shown in the sidebar */
   profile?: { name: string; email: string };
-  /** Experimental features are opt-in and default off when absent. */
-  features?: { skillRecorder: boolean };
-  /** Custom remote MCP servers: names, urls, and enabled state. Headers are write-only. */
   mcpServers?: Array<{
     name: string;
     transport: "http" | "sse";
@@ -260,6 +301,8 @@ export interface ConfigStatus {
     enabled: boolean;
     hasHeaders: boolean;
   }>;
+  /** Opt-in flags. Absent means off. */
+  features?: { skillRecorder: boolean; showToolCalls?: boolean };
 }
 
 export type ConfigStatusFrame = Pick<
@@ -317,6 +360,9 @@ export interface InstanceInfo {
     /** the engine keeps a live session and takes a message mid-turn */
     queueing?: boolean;
     localComputerMcp?: boolean;
+    /** This engine can answer a bounded review prompt without changing the
+     * bot's active conversation. */
+    approvalReview?: boolean;
   };
   /** `custom` agents sit below the rail divider — no subscription catalog. */
   access?: "subscription" | "custom";
@@ -347,7 +393,7 @@ export interface AppState {
   config: ConfigStatus | null;
   /** selected chat — a bot id OR a group id */
   selectedId: string;
-  activeView: "chat" | "routines" | "skill-recorder";
+  activeView: "chat" | "team-map" | "routines" | "skill-recorder";
   routines: Routine[];
   routineRuns: RoutineRun[];
   webhooks: WebhookTrigger[];
@@ -411,6 +457,7 @@ export type Action =
       computerControl: Record<string, { held: boolean; helpReason: string | null }>;
     }
   | { type: "showRoutines" }
+  | { type: "showTeamMap" }
   | { type: "showSkillRecorder" }
   | { type: "routinesHydrated"; routines: Routine[]; runs: RoutineRun[] }
   | { type: "routinePatched"; routine: Routine }
@@ -429,21 +476,26 @@ export type Action =
   | { type: "groupPatched"; group: Partial<Group> & { id: string } }
   | { type: "groupDeleted"; groupId: string }
   | { type: "createGroup"; memberIds: string[]; name?: string; section?: string }
-  | { type: "sendGroup"; groupId: string; text: string }
+  | { type: "sendGroup"; groupId: string; text: string; replyToId?: string }
   | {
       type: "patchGroup";
       groupId: string;
       patch: Partial<Pick<Group, "name" | "bulletin" | "memberIds" | "defaultResponder" | "pinnedMessageId" | "section">>;
     }
   | { type: "deleteGroup"; groupId: string }
+  | { type: "newGroupTask"; groupId: string }
+  | { type: "switchGroupTask"; groupId: string; threadId: string }
+  | { type: "renameGroupTask"; groupId: string; threadId: string; title: string }
+  | { type: "deleteGroupTask"; groupId: string; threadId: string }
   | { type: "toggleReaction"; threadId: string; messageId: string; emoji: string }
   | { type: "interruptGroup"; groupId: string }
   | { type: "instances"; instances: InstanceInfo[] }
   | { type: "configStatus"; config: ConfigStatus }
   | { type: "select"; id: string }
-  | { type: "send"; botId: string; text: string }
+  | { type: "send"; botId: string; text: string; replyToId?: string }
   | { type: "pendingQueued"; threadId: string; queueId: string; text: string }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
+  | { type: "cancelQueued"; botId: string; queueId: string }
   | { type: "editMessage"; botId: string; messageId: string; text: string }
   | { type: "switchBranch"; botId: string; messageId: string }
   | { type: "threadActive"; threadId: string; activeLeafId: string }
@@ -459,6 +511,8 @@ export type Action =
       message?: string;
       /** remember this exact grant (the server's allowKey) for the bot */
       alwaysAllow?: { botId: string; key: string };
+      /** Local UI recovery hook for voice flows. Never sent to the server. */
+      onError?: (message: string) => void;
     }
   | { type: "newTask"; botId: string }
   | { type: "switchTask"; botId: string; threadId: string }
@@ -506,9 +560,16 @@ export function openNotificationTarget(
   // GROUP's thread id; asking the bot to switch to that thread would 404.
   // Open the room itself. A thread that is neither a room nor one of the
   // bot's own lands on a plain bot select instead of an error banner.
-  const group = state.groups.find((candidate) => candidate.threadId === target.threadId);
+  const group = state.groups.find(
+    (candidate) =>
+      candidate.threadId === target.threadId ||
+      (candidate.tasks ?? []).some((task) => task.threadId === target.threadId),
+  );
   if (group) {
     dispatch({ type: "select", id: group.id });
+    if (group.threadId !== target.threadId) {
+      dispatch({ type: "switchGroupTask", groupId: group.id, threadId: target.threadId });
+    }
     return;
   }
   dispatch({ type: "select", id: target.botId });
@@ -548,6 +609,19 @@ function patchCard(state: AppState, botId: string, messageId: string, patch: Par
   }));
 }
 
+/** First-run quiz still sitting on this bot's thread. */
+function openOnboardingCard(bot: Bot): Message | undefined {
+  return bot.messages.find(
+    (message) => message.kind === "options" && message.card && !message.card.requestId && !message.card.dismissed,
+  );
+}
+
+function dismissOnboardingCard(state: AppState, botId: string): AppState {
+  const bot = state.bots.find((candidate) => candidate.id === botId);
+  const quiz = bot ? openOnboardingCard(bot) : undefined;
+  return quiz ? patchCard(state, botId, quiz.id, { dismissed: true }) : state;
+}
+
 export function reducer(state: AppState, action: Action): AppState {
   switch (action.type) {
     case "hydrate": {
@@ -566,6 +640,16 @@ export function reducer(state: AppState, action: Action): AppState {
       return {
         ...state,
         activeView: "routines",
+        settingsOpen: false,
+        computerOpen: false,
+        inspectorOpen: false,
+        appSettingsOpen: false,
+        pluginsOpen: false,
+      };
+    case "showTeamMap":
+      return {
+        ...state,
+        activeView: "team-map",
         settingsOpen: false,
         computerOpen: false,
         inspectorOpen: false,
@@ -665,12 +749,19 @@ export function reducer(state: AppState, action: Action): AppState {
       );
     }
     // optimistic card settle; the server's message.patch confirms it later
-    case "answerCard":
+    case "answerCard": {
+      const bot = state.bots.find((candidate) => candidate.id === action.botId);
+      const card = bot?.messages.find((message) => message.id === action.messageId)?.card;
       return withMascotMotion(
-        patchCard(state, action.botId, action.messageId, { answered: action.answer }),
+        patchCard(state, action.botId, action.messageId, {
+          answered: action.answer,
+          // talking past the first-run quiz hides it; live asks stay until resolved
+          ...(card?.requestId ? {} : { dismissed: true }),
+        }),
         action.botId,
         "working",
       );
+    }
     case "dismissCard":
       return patchCard(state, action.botId, action.messageId, { dismissed: true });
     case "decideRequest":
@@ -1010,14 +1101,49 @@ export function reducer(state: AppState, action: Action): AppState {
       else delete pendingQueued[action.threadId];
       return { ...state, pendingQueued };
     }
+    case "cancelQueued": {
+      const bot = state.bots.find((candidate) => candidate.id === action.botId);
+      if (!bot) return state;
+      const prev = state.pendingQueued[bot.threadId] ?? [];
+      const rest = prev.filter((entry) => entry.queueId !== action.queueId);
+      if (rest.length === prev.length) return state;
+      const pendingQueued = { ...state.pendingQueued };
+      if (rest.length) pendingQueued[bot.threadId] = rest;
+      else delete pendingQueued[bot.threadId];
+      return { ...state, pendingQueued };
+    }
     case "send":
+      return withMascotMotion(dismissOnboardingCard(state, action.botId), action.botId, "working");
     case "editMessage":
       return withMascotMotion(state, action.botId, "working");
     case "newTask":
     case "switchTask":
-    case "renameTask":
     case "deleteTask":
+    case "newGroupTask":
+    case "switchGroupTask":
+    case "deleteGroupTask":
       return state;
+    case "renameTask":
+      return updateBot(state, action.botId, (bot) => ({
+        ...bot,
+        tasks: (bot.tasks ?? []).map((task) =>
+          task.threadId === action.threadId ? { ...task, title: action.title } : task,
+        ),
+      }));
+    case "renameGroupTask":
+      return {
+        ...state,
+        groups: state.groups.map((group) =>
+          group.id === action.groupId
+            ? {
+                ...group,
+                tasks: (group.tasks ?? []).map((task) =>
+                  task.threadId === action.threadId ? { ...task, title: action.title } : task,
+                ),
+              }
+            : group,
+        ),
+      };
     case "taskSwitched":
       return updateBot(state, action.bot.id, (bot) => ({ ...bot, ...action.bot, messages: action.bot.messages ?? [] }));
     case "deleteGroup": {
@@ -1231,8 +1357,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         action.type === "updateBot"
           ? stateRef.current.bots.find((candidate) => candidate.id === action.botId)
           : undefined;
+      const quizBeforeSend = (() => {
+        if (action.type !== "send") return undefined;
+        const bot = stateRef.current.bots.find((candidate) => candidate.id === action.botId);
+        return bot ? openOnboardingCard(bot) : undefined;
+      })();
       if (action.type === "deleteBot") botPatchQueue.cancel(action.botId);
-      rawDispatch(action);
+      // A queued message is still real until the server confirms deletion.
+      // All other actions keep their existing optimistic behavior.
+      if (action.type !== "cancelQueued") rawDispatch(action);
       switch (action.type) {
         case "createRoutine":
           api("/api/routines", { method: "POST", body: JSON.stringify(action.input) }).catch(showError);
@@ -1255,10 +1388,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "markRoutineRunSeen":
           api(`/api/routine-runs/${action.runId}/seen`, { method: "POST" }).catch(showError);
           break;
-        case "send":
+        case "cancelQueued":
+          void api(`/api/bots/${action.botId}/queue/${action.queueId}`, { method: "DELETE" })
+            .then(() => rawDispatch(action))
+            .catch(showError);
+          break;
+        case "send": {
+          // persist through the existing card route so an older server that
+          // does not auto-dismiss still hides the quiz on this client
+          if (quizBeforeSend) persistCard(action.botId, quizBeforeSend.id, { dismissed: true });
           void api(`/api/bots/${action.botId}/messages`, {
             method: "POST",
-            body: JSON.stringify({ text: action.text }),
+            body: JSON.stringify({ text: action.text, replyToId: action.replyToId }),
           })
             .then((body) => {
               if (
@@ -1276,6 +1417,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             })
             .catch(showError);
           break;
+        }
         case "editMessage":
           api(`/api/bots/${action.botId}/messages/${action.messageId}/edit`, {
             method: "POST",
@@ -1297,7 +1439,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 behavior: action.behavior,
                 message: action.message,
               }),
-            }).catch(showError);
+            }).catch((error) => {
+              showError(error);
+              action.onError?.(error instanceof Error ? error.message : String(error));
+            });
           if (action.alwaysAllow) {
             const bot = stateRef.current.bots.find((b) => b.id === action.alwaysAllow!.botId);
             const next = [...new Set([...(bot?.alwaysAllow ?? []), action.alwaysAllow.key])];
@@ -1332,7 +1477,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               }),
             }).catch(showError);
           } else {
-            persistCard(action.botId, action.messageId, { answered: action.answer });
+            persistCard(action.botId, action.messageId, { answered: action.answer, dismissed: true });
             api(`/api/bots/${action.botId}/messages`, {
               method: "POST",
               body: JSON.stringify({ text: action.answer }),
@@ -1369,6 +1514,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             modelSelection: source.modelSelection,
             computer: source.computer,
             cloudBackend: source.cloudBackend,
+            autoStartVps: source.autoStartVps,
             avatarUrl: source.avatarUrl,
             avatarCrop: source.avatarCrop,
           };
@@ -1424,7 +1570,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "sendGroup":
           api(`/api/groups/${action.groupId}/messages`, {
             method: "POST",
-            body: JSON.stringify({ text: action.text }),
+            body: JSON.stringify({ text: action.text, replyToId: action.replyToId }),
           }).catch(showError);
           break;
         case "patchGroup":
@@ -1472,6 +1618,29 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "deleteTask":
           api(`/api/bots/${action.botId}/tasks/${action.threadId}`, { method: "DELETE" })
             .then((r: any) => r?.bot && dispatch({ type: "taskSwitched", bot: r.bot }))
+            .catch(showError);
+          break;
+        // Channel tasks mirror bot tasks, but hydrate the whole channel so
+        // switching atomically replaces its transcript, folder and pin.
+        case "newGroupTask":
+          api(`/api/groups/${action.groupId}/tasks`, { method: "POST", body: "{}" })
+            .then((r: any) => r?.group && dispatch({ type: "groupPatched", group: r.group }))
+            .catch(showError);
+          break;
+        case "switchGroupTask":
+          api(`/api/groups/${action.groupId}/tasks/${action.threadId}`, { method: "POST" })
+            .then((r: any) => r?.group && dispatch({ type: "groupPatched", group: r.group }))
+            .catch(showError);
+          break;
+        case "renameGroupTask":
+          api(`/api/groups/${action.groupId}/tasks/${action.threadId}`, {
+            method: "PATCH",
+            body: JSON.stringify({ title: action.title }),
+          }).catch(showError);
+          break;
+        case "deleteGroupTask":
+          api(`/api/groups/${action.groupId}/tasks/${action.threadId}`, { method: "DELETE" })
+            .then((r: any) => r?.group && dispatch({ type: "groupPatched", group: r.group }))
             .catch(showError);
           break;
         case "interruptGroup":

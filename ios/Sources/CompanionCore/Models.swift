@@ -234,6 +234,9 @@ public struct Room: Codable, Hashable, Identifiable, Sendable {
     public var createdAt: Double
     public var dm: Bool?
     public var busyBotId: String?
+    /// Independent user conversations in this channel. Bot-to-bot rooms
+    /// omit tasks because their transcript is the canonical private chat.
+    public var tasks: [BotTask]?
     public var messages: [Message]?
     public var hasMore: Bool?
 }
@@ -318,6 +321,80 @@ public struct PairResponse: Codable, Sendable {
     /// connection so the app can walk to the next one when the address it
     /// paired on stops resolving. Absent from older sidecars.
     public var hosts: [String]?
+    /// Full HTTPS/HTTP routes from newer sidecars. Absent during a staggered
+    /// rollout; `hosts` remains the compatibility path for older builds.
+    public var endpoints: [CompanionEndpoint]?
+
+    private enum CodingKeys: String, CodingKey {
+        case token, device, serverName, hosts, endpoints
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        token = try container.decode(String.self, forKey: .token)
+        device = try container.decode(PairedDevice.self, forKey: .device)
+        serverName = try container.decode(String.self, forKey: .serverName)
+        hosts = try container.decodeIfPresent([String].self, forKey: .hosts)
+        if container.contains(.endpoints) {
+            // These routes are advisory and the credential may already have
+            // been redeemed. One malformed or future-kind entry must not
+            // discard the valid token and legacy host fallback with it.
+            endpoints = (try? container.decode([Lossy<CompanionEndpoint>].self, forKey: .endpoints))?
+                .compactMap(\.value) ?? []
+        } else {
+            endpoints = nil
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(token, forKey: .token)
+        try container.encode(device, forKey: .device)
+        try container.encode(serverName, forKey: .serverName)
+        try container.encodeIfPresent(hosts, forKey: .hosts)
+        try container.encodeIfPresent(endpoints, forKey: .endpoints)
+    }
+}
+
+/// The authenticated, refreshable connection identity advertised by the
+/// companion sidecar at `GET /api/companion/endpoints`.
+///
+/// This intentionally mirrors only the non-secret routing subset of a pair
+/// response. Existing paired phones can learn that hosted access was enabled
+/// later without minting another device token or scanning another QR code.
+public struct CompanionConnectionMetadata: Decodable, Sendable {
+    public var serverName: String
+    public var hosts: [String]?
+    public var endpoints: [CompanionEndpoint]
+
+    private enum CodingKeys: String, CodingKey { case serverName, hosts, endpoints }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        serverName = try container.decode(String.self, forKey: .serverName)
+        hosts = try container.decodeIfPresent([String].self, forKey: .hosts)
+
+        // Endpoint metadata is a replacement snapshot, not an optional hint.
+        // Keep a future malformed kind from discarding valid routes beside it,
+        // but reject a response with no usable route so the caller retains its
+        // last known-good snapshot.
+        let decoded = try container.decode([Lossy<CompanionEndpoint>].self, forKey: .endpoints)
+            .compactMap(\.value)
+        let stable = decoded.enumerated().sorted {
+            $0.element.priority == $1.element.priority
+                ? $0.offset < $1.offset
+                : $0.element.priority < $1.element.priority
+        }.map(\.element)
+        var seen = Set<String>()
+        endpoints = stable.filter { seen.insert($0.url).inserted }.prefix(8).map { $0 }
+        guard !endpoints.isEmpty else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .endpoints,
+                in: container,
+                debugDescription: "Companion endpoint metadata must contain at least one valid route."
+            )
+        }
+    }
 }
 
 /// A freshly minted provider viewer. It is deliberately not Codable for
@@ -378,11 +455,22 @@ public struct InstanceList: Codable, Sendable {
     public var instances: [Instance]
 }
 
+/// Which engine actually speaks — `VoiceProvider` in `server/tts/index.ts`.
+/// Derived from `ConfigFlag.provider`, never decoded straight off the wire.
+public enum VoiceProvider: Hashable, Sendable {
+    case elevenlabs
+    case system
+}
+
 public struct ConfigFlag: Codable, Hashable, Sendable {
     public var configured: Bool
     public var apiKeyConfigured: Bool?
     public var ready: Bool?
     public var voice: String?
+    /// The voice engine, absent on a computer that predates the choice. Read
+    /// it through `ConfigStatus.voiceProvider`, which applies the server's own
+    /// fallback; nothing should compare this string directly.
+    public var provider: String?
 }
 
 public struct Profile: Codable, Hashable, Sendable {
@@ -397,8 +485,13 @@ public struct ConfigStatus: Codable, Sendable {
     public var imageGen: ConfigFlag?
     public var profile: Profile?
 
-    /// Whether the shared synthesis credential exists on the paired
-    /// computer. The credential itself never appears in this response.
+    /// Whether synthesis is available on the paired computer. Deliberately
+    /// provider-neutral: under ElevenLabs this is a key on file, while under
+    /// the built-in engine `providerConfigured` in `server/tts/index.ts`
+    /// reports whether the computer has voices it can use and no credential
+    /// exists at all. Only the reason behind the flag changes — so anything
+    /// that *explains* a false here has to ask `voiceProvider` first.
+    /// Either way the credential itself never appears in this response.
     public var isTTSConfigured: Bool {
         tts?.configured == true || tts?.apiKeyConfigured == true
     }
@@ -412,6 +505,16 @@ public struct ConfigStatus: Codable, Sendable {
     public func canSpeak(agentVoice: String?) -> Bool {
         let hasAgentVoice = !(agentVoice?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         return isTTSConfigured && (hasAgentVoice || hasWorkspaceDefaultVoice)
+    }
+
+    /// `voiceProvider(cfg)` in `server/tts/index.ts`: only the exact string
+    /// `"system"` selects the built-in engine. A missing field — a computer
+    /// older than the choice — and an engine this build has never heard of
+    /// both fall back to ElevenLabs, which is the server's own rule and what
+    /// keeps an unrecognised engine from being explained to the user with
+    /// copy written for a different one.
+    public var voiceProvider: VoiceProvider {
+        tts?.provider == "system" ? .system : .elevenlabs
     }
 }
 
@@ -683,6 +786,26 @@ public struct ConnectorCatalog: Codable, Sendable {
 public struct ConnectorStatuses: Codable, Sendable {
     public var configured: Bool
     public var services: [String: ConnectorStatus]
+    /// `"ok"`, `"unavailable"`, or absent on a computer that predates the
+    /// field. Read it through `isAuthoritative`; nothing should compare it
+    /// directly.
+    public var credentialStore: String?
+
+    /// Whether `services` is an inventory or an admission of ignorance.
+    ///
+    /// `server/index.ts` answers an unreadable Composio credential store with
+    /// an empty map *and* `credentialStore: "unavailable"`, because failing to
+    /// read the store means we do not know what is connected — which is not
+    /// the same as knowing nothing is. An empty map arriving that way must
+    /// never be shown as "nothing is connected": every account may still be
+    /// live on the computer.
+    ///
+    /// Only that exact string withdraws the claim. `"ok"` is authoritative,
+    /// and so is a missing field — a computer old enough not to send it would
+    /// otherwise have every answer treated as unknowable.
+    public var isAuthoritative: Bool {
+        credentialStore != "unavailable"
+    }
 }
 
 /// The harness's error body. Every non-2xx response carries one.
@@ -729,6 +852,9 @@ struct ActiveBranchResponse: Codable, Sendable {
 
 struct BotResponse: Codable, Sendable {
     var bot: Bot
+}
+struct RoomResponse: Codable, Sendable {
+    var group: Room
 }
 struct VoiceListResponse: Codable, Sendable {
     var voices: [Voice]

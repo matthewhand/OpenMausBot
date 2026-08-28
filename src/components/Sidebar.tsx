@@ -15,6 +15,7 @@ import {
   FolderPlus,
   Library,
   Loader2,
+  Network,
   Pencil,
   PanelLeftClose,
   PanelLeftOpen,
@@ -49,6 +50,7 @@ import {
   saveSidebarDensity,
   type SidebarDensity,
 } from "@/lib/sidebar-preferences";
+import { phoneSettingsAction, SidebarPhoneButton } from "./SidebarPhoneButton";
 
 /** "Milind Soni" → "MS", "milind" → "M", "you@x.dev" → "Y", unset → "?" */
 function profileInitials(profile?: { name?: string; email?: string }): string {
@@ -179,7 +181,7 @@ function StackedMauses({ members, density }: { members: Bot[]; density: SidebarD
     const b = members[0];
     return (
       <div className={cn("flex shrink-0 items-center justify-center", slotSize)}>
-        {b ? <BotAvatar bot={b} state="happy" size={singleSize} /> : <Users size={24} className="text-ink-secondary" />}
+        {b ? <BotAvatar bot={b} state="happy" size={singleSize} animated={false} /> : <Users size={24} className="text-ink-secondary" />}
       </div>
     );
   }
@@ -189,7 +191,7 @@ function StackedMauses({ members, density }: { members: Bot[]; density: SidebarD
     <div className={cn("flex shrink-0 items-center justify-center", slotSize)}>
       <div className="flex items-center -space-x-3">
         {shown.map((b) => (
-          <BotAvatar key={b.id} bot={b} state="happy" size={30} />
+          <BotAvatar key={b.id} bot={b} state="happy" size={30} animated={false} />
         ))}
         {extra > 0 && (
           <span className="z-10 flex size-[22px] items-center justify-center rounded-full border border-hairline/40 bg-raised text-[10px] font-medium text-ink-secondary">
@@ -773,6 +775,11 @@ function BotListItem({
         size={avatarSize}
         motion={mascotMotion?.kind ?? "none"}
         motionKey={mascotMotion?.nonce ?? 0}
+        // Motion means something is happening. A resting bot holds a resting
+        // pose — N idle rows bobbing at display rate was most of the app's
+        // visible-idle CPU (states are keyword-derived, so "working" can be
+        // decorative; busy/unread/motion are the real signals).
+        animated={Boolean(bot.busy) || Boolean(bot.unread) || (mascotMotion?.kind ?? "none") !== "none"}
       />
       <div className={cn("min-w-0 flex-1", iconOnly && "hidden")}>
         <div className="flex items-baseline justify-between gap-2">
@@ -977,7 +984,7 @@ function ArchivedBotsPanel({
           <div className="grid grid-cols-1 gap-x-8 md:grid-cols-2">
             {bots.map((bot) => (
               <div key={bot.id} className="flex min-h-[82px] items-center gap-3 border-b border-hairline/35 px-1 py-3">
-                <BotAvatar bot={bot} state="happy" size={42} />
+                <BotAvatar bot={bot} state="happy" size={42} animated={false} />
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-[14px] font-medium text-ink">{bot.name}</div>
                   <div className="mt-0.5 truncate text-[12.5px] text-ink-secondary">{bot.title || "Bot"}</div>
@@ -1012,6 +1019,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const [plusOpen, setPlusOpen] = useState(false);
   const [newRoom, setNewRoom] = useState(false);
   const [teamLibraryOpen, setTeamLibraryOpen] = useState(false);
+  const [teamInstallUrl, setTeamInstallUrl] = useState<string | null>(null);
   const [archivedBotsOpen, setArchivedBotsOpen] = useState(false);
   const [exportingTeam, setExportingTeam] = useState(false);
   const [teamFeedback, setTeamFeedback] = useState<{
@@ -1069,6 +1077,13 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   }, [densityOpen]);
 
   useEffect(() => {
+    return window.ogb?.onPackageInstall?.((url) => {
+      setTeamInstallUrl(url);
+      setTeamLibraryOpen(true);
+    });
+  }, []);
+
+  useEffect(() => {
     if (!teamFeedback) return;
     const timer = window.setTimeout(() => setTeamFeedback(null), 5000);
     return () => window.clearTimeout(timer);
@@ -1094,6 +1109,18 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const undoTeamLoad = async (result: TeamImportResult) => {
     setTeamFeedback(null);
     try {
+      await Promise.all([
+        ...result.importedRoutineIds.map((routineId) =>
+          api(`/api/routines/${routineId}`, { method: "DELETE" }).then(() =>
+            dispatch({ type: "routineDeleted", routineId }),
+          ),
+        ),
+        ...result.importedGroupIds.map((groupId) =>
+          api(`/api/groups/${groupId}`, { method: "DELETE" }).then(() =>
+            dispatch({ type: "groupDeleted", groupId }),
+          ),
+        ),
+      ]);
       const archiveNew = await Promise.all(
         result.importedBotIds.map((botId) =>
           api(`/api/bots/${botId}`, {
@@ -1480,6 +1507,19 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
 
       {/* Footer */}
       <div className={cn("pb-3 pt-2", density === "icons" ? "px-2" : "px-3")}>
+        <button
+          onClick={() => dispatch({ type: "showTeamMap" })}
+          aria-label={density === "icons" ? "Team map" : undefined}
+          title={density === "icons" ? "Team map" : undefined}
+          className={cn(
+            "flex min-h-10 w-full items-center rounded-xl py-2 text-left transition-colors",
+            density === "icons" ? "justify-center px-2" : "gap-3 px-3",
+            state.activeView === "team-map" ? "bg-raised text-ink" : "text-ink hover:bg-raised/50",
+          )}
+        >
+          <Network size={20} className={state.activeView === "team-map" ? "text-accent" : "text-ink-secondary"} />
+          <span className={cn("flex-1 text-[14px]", density === "icons" && "hidden")}>Team map</span>
+        </button>
         {skillRecorderEnabled(state.config) && (
           <button
             onClick={() => dispatch({ type: "showSkillRecorder" })}
@@ -1520,6 +1560,12 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
           <Puzzle size={20} className="text-ink-secondary" />
           <span className={cn("text-[14px] text-ink", density === "icons" && "hidden")}>Connected apps</span>
         </button>
+        {density === "icons" && (
+          <SidebarPhoneButton
+            density={density}
+            onOpen={() => dispatch(phoneSettingsAction())}
+          />
+        )}
         <div className={cn("flex items-center", density === "icons" && "justify-center")}>
           <button
             onClick={() => dispatch({ type: "toggleAppSettings" })}
@@ -1532,6 +1578,12 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
               {state.config?.profile?.name?.trim() || state.config?.profile?.email?.trim() || "You"}
             </span>
           </button>
+          {density !== "icons" && (
+            <SidebarPhoneButton
+              density={density}
+              onOpen={() => dispatch(phoneSettingsAction())}
+            />
+          )}
           {density !== "icons" && <UpdateButton />}
           {density !== "icons" && <button
             onClick={() => dispatch({ type: "toggleAppSettings" })}
@@ -1588,9 +1640,14 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
       {teamLibraryOpen && (
         <TeamLibraryPanel
           returnFocusRef={importReturnRef}
-          onClose={() => setTeamLibraryOpen(false)}
+          initialUrl={teamInstallUrl ?? undefined}
+          onClose={() => {
+            setTeamLibraryOpen(false);
+            setTeamInstallUrl(null);
+          }}
           onImported={(result) => {
             setTeamLibraryOpen(false);
+            setTeamInstallUrl(null);
             setTeamFeedback(
               result.archived.length > 0
                 ? {

@@ -56,6 +56,9 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "GET", path: /^\/api\/config$/ },
   { method: "GET", path: /^\/api\/events$/ },
   { method: "GET", path: /^\/api\/instances$/ },
+  // Sidecar-owned, authenticated endpoint metadata. The proxy terminates it
+  // locally; it never becomes a newly exposed harness route.
+  { method: "GET", path: /^\/api\/companion\/endpoints$/ },
 
   // the fleet, and making a bot
   { method: "GET", path: /^\/api\/bots$/ },
@@ -82,6 +85,10 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "POST", path: /^\/api\/groups$/ },
   { method: "POST", path: /^\/api\/groups\/[\w-]+\/messages$/ },
   { method: "POST", path: /^\/api\/groups\/[\w-]+\/read$/ },
+  { method: "POST", path: /^\/api\/groups\/[\w-]+\/tasks$/ },
+  { method: "POST", path: /^\/api\/groups\/[\w-]+\/tasks\/[\w-]+$/ },
+  { method: "PATCH", path: /^\/api\/groups\/[\w-]+\/tasks\/[\w-]+$/ },
+  { method: "DELETE", path: /^\/api\/groups\/[\w-]+\/tasks\/[\w-]+$/ },
 
   // a transcript, its images, and answering an approval
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/messages$/ },
@@ -129,7 +136,7 @@ const EXPLAINED: ReadonlyArray<{ path: RegExp; error: string }> = [
   {
     path: /^\/api\/(companion|devices)(\/|$)/,
     // Losing the phone must not mean losing the ability to lock it out.
-    error: "companion settings are managed on your computer",
+    error: "Phone settings are managed on your computer",
   },
   { path: /^\/api\/config$/, error: "API keys can only be changed on your computer" },
   { path: /^\/api\/local-computer(\/|$)/, error: "the Local VM is set up on your computer" },
@@ -164,7 +171,7 @@ export function denyReason({ path, method, authenticated }: RouteRequest): Denia
   if (method === "GET" && path === "/api/health") return null;
 
   if (!authenticated) {
-    return { status: 401, error: "pair this device from the OpenMausBot companion on your computer" };
+    return { status: 401, error: "pair this device from Phone settings in OpenMausBot on your computer" };
   }
 
   if (ALLOWED.some((route) => route.method === method && route.path.test(path))) return null;

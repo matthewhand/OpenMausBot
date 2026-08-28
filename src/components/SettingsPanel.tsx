@@ -331,11 +331,13 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "notifications"
         | "computer"
         | "cloudBackend"
+        | "autoStartVps"
         | "color"
         | "mascotExpression"
         | "avatarUrl"
         | "avatarCrop"
         | "autoApprove"
+        | "autoReview"
         | "speakReplies"
         | "voice"
         | "chiefOfStaff"
@@ -348,6 +350,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   const activeState = stateForBot(bot);
   const mascotMotion = state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
   const engine = state.instances.find((instance) => instance.instanceId === bot.modelSelection.instanceId);
+  const canAutoReview = engine?.capabilities?.approvalReview === true;
   const canCoordinate = engine?.capabilities?.agentsMcp === true;
   const canUseConnectedApps = engine?.capabilities?.composioMcp === true;
   const canUseVps = engine?.capabilities?.computerMcp === true && engine.driverKind !== "boxAgent";
@@ -362,7 +365,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
 
   return (
     <>
-    <aside className="animate-panel-in flex h-full w-[400px] shrink-0 flex-col border-l border-hairline/40 bg-panel">
+    <aside className="animate-panel-in relative z-20 flex h-full w-[400px] shrink-0 flex-col border-l border-hairline/40 bg-panel">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3">
         <button
@@ -542,14 +545,19 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             </button>
           </div>
 
-          <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">
-            <div>
-              <div className="text-[15px] font-medium text-ink">Model</div>
-              <div className="mt-0.5 text-[13px] text-ink-secondary">
-                Which provider and model this bot runs on
-              </div>
-            </div>
-            <ModelPicker bot={bot} />
+          <div className="rounded-xl bg-card p-4">
+            <ModelPicker
+              bot={bot}
+              contained
+              label={
+                <div>
+                  <div className="text-[15px] font-medium text-ink">Model</div>
+                  <div className="mt-0.5 text-[13px] text-ink-secondary">
+                    Which provider and model this bot runs on
+                  </div>
+                </div>
+              }
+            />
           </div>
 
           {!!engine?.capabilities?.effortLevels?.length && (
@@ -620,11 +628,40 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               ))}
             </div>
             {(!bot.computer || bot.computer === "cloud") && (
-              <CloudBackendPicker
-                value={bot.cloudBackend ?? "box"}
-                vpsSupported={canUseVps}
-                onChange={(backend) => patch({ cloudBackend: backend })}
-              />
+              <>
+                <CloudBackendPicker
+                  value={bot.cloudBackend ?? "box"}
+                  vpsSupported={canUseVps}
+                  onChange={(backend) => patch({ cloudBackend: backend })}
+                />
+                {!bot.computer && bot.cloudBackend === "vps" && (
+                  <div className="mt-3 flex items-center justify-between gap-4 rounded-lg bg-inset px-3 py-2.5">
+                    <div className="min-w-0">
+                      <div className="text-[13px] text-ink">Start VPS automatically</div>
+                      <div className="mt-0.5 text-[11.5px] text-ink-secondary">
+                        Allow Auto to create or wake this bot's managed container when needed.
+                      </div>
+                    </div>
+                    <button
+                      role="switch"
+                      aria-checked={Boolean(bot.autoStartVps)}
+                      aria-label="Start VPS automatically"
+                      onClick={() => patch({ autoStartVps: !bot.autoStartVps })}
+                      className={cn(
+                        "relative h-6 w-11 shrink-0 rounded-full transition-colors",
+                        bot.autoStartVps ? "bg-accent" : "bg-control",
+                      )}
+                    >
+                      <span
+                        className={cn(
+                          "absolute top-[3px] size-[18px] rounded-full bg-white transition-all",
+                          bot.autoStartVps ? "left-[22px]" : "left-[4px]",
+                        )}
+                      />
+                    </button>
+                  </div>
+                )}
+              </>
             )}
           </div>
 
@@ -667,6 +704,41 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                 )}
               />
             </button>
+          </div>
+
+          <div className="rounded-xl bg-card p-4">
+            <div className="text-[15px] font-medium text-ink">Review routine approvals</div>
+            <div className="mt-0.5 text-[13px] text-ink-secondary">
+              {canAutoReview
+                ? "The same engine reviews ordinary approval cards. Existing safety rules, unattended turns, local-computer access, and questions still wait for you."
+                : "This engine cannot run an isolated review safely, so approval cards continue to wait for you."}
+            </div>
+            <div className="mt-3 flex gap-1 rounded-lg bg-inset p-0.5">
+              {(
+                [
+                  ["off", "Off", "Every undecided approval waits for you."],
+                  ["shadow", "Watch", "Record the review without answering the card."],
+                  ["enforce", "On", "Answer only reviews that return a strict approval."],
+                ] as const
+              ).map(([value, label, hint]) => {
+                const current = bot.autoReview === "shadow" || bot.autoReview === "enforce" ? bot.autoReview : "off";
+                const disabled = value !== "off" && !canAutoReview;
+                return (
+                  <button
+                    key={value}
+                    title={disabled ? "Not supported by this engine" : hint}
+                    disabled={disabled}
+                    onClick={() => patch({ autoReview: value })}
+                    className={cn(
+                      "flex-1 rounded-md px-2.5 py-1.5 text-[13px] font-medium disabled:cursor-not-allowed disabled:opacity-40",
+                      current === value ? "bg-raised text-ink" : "text-ink-secondary hover:text-ink",
+                    )}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
           </div>
 
           <VoiceSettings bot={bot} onPatch={patch} />

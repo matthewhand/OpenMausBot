@@ -14,6 +14,7 @@ import {
   parseConfigPatch,
   parseStoredConfig,
   roomTurnTimeoutMinutes,
+  showToolCallsEnabled,
   skillRecorderEnabled,
   stripWorkspaceCredentialEnv,
   syncCredentialEnv,
@@ -108,6 +109,14 @@ describe("configuration boundaries", () => {
     );
   });
 
+  it("keeps tool-call chips off by default and accepts an explicit opt-in", () => {
+    expect(showToolCallsEnabled({})).toBe(false);
+    expect(parseConfigPatch({ features: { showToolCalls: true } })).toEqual({
+      features: { showToolCalls: true },
+    });
+    expect(showToolCallsEnabled({ features: { showToolCalls: true } })).toBe(true);
+  });
+
   it.each([0, 1.5, 5, "2", null])("rejects an invalid per-bot VM limit: %j", (maxInstances) => {
     expect(() => parseConfigPatch({ localVm: { maxInstances } })).toThrow("localVm.maxInstances");
   });
@@ -127,6 +136,51 @@ describe("default fleet", () => {
   it("ships Cursor as a default-fleet subscription engine", () => {
     const map = instanceConfigs({});
     expect(map.cursor).toEqual({ driver: "cursorAgent", environment: {} });
+  });
+
+  it("carries the saved OpenAI-compatible URL into the live default instance", () => {
+    const map = instanceConfigs({
+      openaiCompat: { key: "secret", url: "https://models.example.test/v1" },
+    });
+    expect(map.openaiCompat.config).toEqual({ url: "https://models.example.test/v1" });
+    expect(map.openaiCompat.environment).toEqual({
+      OPENAI_COMPAT_API_KEY: "secret",
+      OPENAI_COMPAT_URL: "https://models.example.test/v1",
+    });
+  });
+
+  it("preserves a per-instance OpenAI-compatible URL override", () => {
+    const map = instanceConfigs({
+      openaiCompat: { url: "https://workspace.example.test/v1" },
+      instances: {
+        custom: {
+          driver: "openai-compat",
+          config: { url: "https://instance.example.test/v1", apiKeyEnv: "CUSTOM_KEY" },
+        },
+      },
+    });
+    expect(map.custom.config).toEqual({
+      url: "https://instance.example.test/v1",
+      apiKeyEnv: "CUSTOM_KEY",
+    });
+  });
+
+  it("does not retain an injected OpenAI-compatible URL across config refreshes", () => {
+    const config: AppConfig = {
+      openaiCompat: { url: "https://first.example.test/v1" },
+      instances: {
+        custom: { driver: "openai-compat" },
+      },
+    };
+
+    expect(instanceConfigs(config).custom.config).toEqual({
+      url: "https://first.example.test/v1",
+    });
+    config.openaiCompat = { url: "https://second.example.test/v1" };
+    expect(instanceConfigs(config).custom.config).toEqual({
+      url: "https://second.example.test/v1",
+    });
+    expect(config.instances?.custom.config).toBeUndefined();
   });
 
   it("adds missing custom-only engines onto an existing product fleet", () => {
@@ -302,7 +356,16 @@ describe("credential env narrowing", () => {
 });
 
 describe("credential env preference", () => {
-  const VARS = ["XAI_API_KEY", "BOX_TOKEN", "OPENCODE_API_KEY", "OMB_TTS_KEY", "OMB_OPENAI_IMAGE_KEY", "COMPOSIO_API_KEY"] as const;
+  const VARS = [
+    "XAI_API_KEY",
+    "OPENAI_COMPAT_API_KEY",
+    "OPENAI_COMPAT_URL",
+    "BOX_TOKEN",
+    "OPENCODE_API_KEY",
+    "OMB_TTS_KEY",
+    "OMB_OPENAI_IMAGE_KEY",
+    "COMPOSIO_API_KEY",
+  ] as const;
   let saved: Record<string, string | undefined>;
 
   beforeEach(() => {
