@@ -4,9 +4,9 @@ This document lists the key differences and additional features in this fork com
 
 ## Fork Status
 
-- **Fork main** (this sync): 4 commits ahead of `milind-soni/OpenMausBot` `main`, 0 behind
-- **Last synced**: 2026-08-28 — merged upstream `677538e` (`docs(contributing): MCP tool schemas must stay flat`) into the fork. The merge was conflict-free because fork `main` only carried `OUR-DELTA.md` plus prior upstream-merge commits.
-- **Feature work** lives on open draft PRs, not on `main`. After this 557-commit upstream jump, those PR branches need a fresh mergeability check (see the sync PR). Historical PRs #1–#4 were closed and superseded by #14–#17.
+- **Fork main** (this sync): 5 commits ahead of `milind-soni/OpenMausBot` `main`, 0 behind
+- **Last synced**: 2026-08-28 — merged upstream `677538e` (`docs(contributing): MCP tool schemas must stay flat`) into the fork. The merge on this branch was conflict-free because fork `main` only carried `OUR-DELTA.md` plus prior upstream-merge commits.
+- **Feature work** lives on open draft PRs, not on `main`. Those PR branches were merge-updated onto this sync (no force-push, no branch deletions). Historical PRs #1–#4 remain closed; use #14–#17. Closed original branches `cursor/tts-provider-selection-6ce3` (#3) and `cursor/custom-mcp-servers-5978` (#4) still conflict with current upstream and should not be revived.
 
 ## Open Draft Pull Requests
 
