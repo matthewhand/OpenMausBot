@@ -20,6 +20,7 @@ import {
   type CursorAvatarHandle,
   type CursorSilhouette,
 } from "./CursorAvatar";
+import { botAvatarProfile, type BotAvatarCrop } from "../../shared/bot-avatar";
 
 /**
  * The pack's baked-in silhouette was exported with the body fill hardcoded
@@ -124,6 +125,8 @@ export type MausAvatarProps = {
    * direction. Off restores the engine's own drawn-in directions.
    */
   forward?: boolean;
+  /** How much each expression glances around. Overrides `forward`'s 0-or-1. */
+  lookAround?: number;
   /** Let the eyes follow the pointer across this avatar. */
   trackPointer?: boolean;
   /** Run the animation. Off renders the state's resting face. */
@@ -151,6 +154,7 @@ function MausAvatarComponent(
     showMouth,
     mouthStroke,
     forward = true,
+    lookAround,
     trackPointer = true,
     animated = true,
   }: MausAvatarProps,
@@ -204,7 +208,7 @@ function MausAvatarComponent(
         silhouette={GRADIENT_SILHOUETTE}
         gradient={gradientFor(color)}
         title={label ?? null}
-        lookAround={forward ? 0 : 1}
+        lookAround={lookAround ?? (forward ? 0 : 1)}
         gaze={{ x: (gaze?.x ?? 0) + pointer.x, y: (gaze?.y ?? 0) + pointer.y }}
         turn={turn}
         spring={spring}
@@ -218,6 +222,57 @@ function MausAvatarComponent(
 }
 
 export const MausAvatar = memo(forwardRef(MausAvatarComponent));
+
+export type BotAvatarProps = Omit<MausAvatarProps, "color"> & {
+  bot: {
+    name?: string;
+    color: MausColor;
+    avatarUrl?: string | null;
+    avatarCrop?: BotAvatarCrop;
+  };
+};
+
+/**
+ * The one renderer for a bot's chosen profile image. Malformed persisted
+ * values and images that fail to load both fall back to the animated mascot,
+ * so an old/corrupt profile can never leave a broken-image icon in the app.
+ */
+export function BotAvatar({ bot, size = 44, label, ...mascotProps }: BotAvatarProps) {
+  const profile = botAvatarProfile(bot);
+  const [imageFailed, setImageFailed] = useState(false);
+
+  useEffect(() => setImageFailed(false), [profile.avatarUrl]);
+
+  if (profile.avatarCrop === "mascot" || !profile.avatarUrl || imageFailed) {
+    return (
+      <MausAvatar
+        {...mascotProps}
+        color={bot.color}
+        size={size}
+        label={label ?? bot.name}
+      />
+    );
+  }
+
+  const radius =
+    profile.avatarCrop === "circle"
+      ? "50%"
+      : profile.avatarCrop === "rounded"
+        ? "22%"
+        : "0";
+  return (
+    <img
+      src={profile.avatarUrl}
+      alt={label ?? (bot.name ? `${bot.name} avatar` : "Bot avatar")}
+      width={size}
+      height={size}
+      draggable={false}
+      onError={() => setImageFailed(true)}
+      className="block shrink-0 bg-raised object-cover"
+      style={{ width: size, height: size, borderRadius: radius }}
+    />
+  );
+}
 
 export function InitialsAvatar({
   initials,

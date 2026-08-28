@@ -7,10 +7,10 @@
 // bot does while it works is not.
 //
 // Delivery is a separate concern. The harness emits a frame; whoever is
-// listening decides what to do with it — a desktop notification today, an
-// APNs push to a paired phone once that exists.
+// listening decides what to do with it — desktop and paired-phone local
+// notifications today, and closed-app APNs delivery once a relay exists.
 
-export type NotifyKind = "approval" | "question" | "done" | "routine-failed";
+export type NotifyKind = "approval" | "question" | "done" | "routine-failed" | "takeover";
 
 export interface Notification {
   kind: NotifyKind;
@@ -19,6 +19,9 @@ export interface Notification {
   threadId: string;
   title: string;
   body: string;
+  /** The bot's stored profile image, when it has one; clients show it as
+   * the OS notification's icon so every banner carries its bot's face. */
+  avatarUrl?: string;
 }
 
 /** One line, short enough for a lock screen, with the newlines and code
@@ -44,6 +47,7 @@ export function buildNotification(
   bot: NotifyBot,
   threadId: string,
   detail: string,
+  extra?: { avatarUrl?: string },
 ): Notification | null {
   // The toggle means what it says: off is off, including for approvals.
   // A bot whose notifications you turned off can still block waiting for
@@ -56,13 +60,15 @@ export function buildNotification(
       ? `${bot.name} needs approval`
       : kind === "question"
         ? `${bot.name} has a question`
-        : kind === "routine-failed"
-          ? `${bot.name}'s routine failed`
-          : `${bot.name} finished`;
+        : kind === "takeover"
+          ? `${bot.name} needs your hands`
+          : kind === "routine-failed"
+            ? `${bot.name}'s routine failed`
+            : `${bot.name} finished`;
 
   // A "finished" with nothing to say is not worth a notification — the
   // badge in the sidebar already carries that much.
   if (kind === "done" && !body) return null;
 
-  return { kind, botId: bot.id, botName: bot.name, threadId, title, body };
+  return { kind, botId: bot.id, botName: bot.name, threadId, title, body, ...extra };
 }

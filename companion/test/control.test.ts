@@ -7,18 +7,22 @@
 import { type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { createControlServer, originIsLoopback } from "../src/control.ts";
+import { createControlServer, hostCandidates, originIsLoopback } from "../src/control.ts";
 import { DeviceRegistry } from "../src/devices.ts";
 
 let control: Server;
 let port = 0;
+let devices: DeviceRegistry;
+let connectedDeviceIds: string[] = [];
+let disconnectedDeviceIds: string[] = [];
 
 const ask = async (
   method: string,
   path: string,
   headers: Record<string, string> = {},
+  body?: string,
 ): Promise<{ status: number; body: any }> => {
-  const res = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers });
+  const res = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body });
   const text = await res.text();
   try {
     return { status: res.status, body: JSON.parse(text) };
@@ -28,10 +32,21 @@ const ask = async (
 };
 
 beforeAll(async () => {
+  devices = new DeviceRegistry();
+  let hostedUrl: string | null = null;
   control = createControlServer({
-    devices: new DeviceRegistry(),
+    devices,
     companionPort: 8810,
+    hostedUrl: () => hostedUrl,
+    setHostedUrl: (next) => {
+      hostedUrl = next;
+    },
     discovery: () => ({ advertising: false, name: "Test computer" }),
+    connectedDeviceIds: () => connectedDeviceIds,
+    disconnectDevice: (deviceId) => {
+      disconnectedDeviceIds.push(deviceId);
+      connectedDeviceIds = connectedDeviceIds.filter((connectedId) => connectedId !== deviceId);
+    },
   });
   port = await new Promise<number>((resolve) =>
     control.listen(0, "127.0.0.1", () => resolve((control.address() as { port: number }).port)),
@@ -43,6 +58,39 @@ afterAll(async () => {
 });
 
 describe("origins the control server will change state for", () => {
+  it("controls cloud desktop access per paired device", async () => {
+    const { code } = devices.openPairing();
+    const paired = devices.redeem(code, "iPhone");
+    if ("error" in paired) throw new Error(paired.error);
+
+    expect(paired.device.cloudDesktopAccess).toBe(false);
+    expect((await ask("POST", `/devices/${paired.device.id}/cloud-desktop`)).status).toBe(200);
+    expect(devices.authenticate(paired.token)?.cloudDesktopAccess).toBe(true);
+    expect((await ask("DELETE", `/devices/${paired.device.id}/cloud-desktop`)).status).toBe(200);
+    expect(devices.authenticate(paired.token)?.cloudDesktopAccess).toBe(false);
+    expect((await ask("POST", "/devices/missing/cloud-desktop")).status).toBe(404);
+  });
+
+  it("reports a permission write failure without dropping the control server", async () => {
+    const [device] = devices.list();
+    const writable = devices as unknown as { persist: () => void };
+    const persist = writable.persist;
+    writable.persist = () => {
+      throw new Error("ENOSPC: no space left on device");
+    };
+    try {
+      const failed = await ask("POST", `/devices/${device.id}/cloud-desktop`);
+      expect(failed).toEqual({
+        status: 500,
+        body: { error: "could not save cloud desktop access" },
+      });
+      expect(devices.list().find((candidate) => candidate.id === device.id)?.cloudDesktopAccess).toBe(false);
+      expect((await ask("GET", "/state")).status).toBe(200);
+    } finally {
+      writable.persist = persist;
+    }
+  });
+
   it("refuses a state change from a foreign page", async () => {
     // The attack this exists for: a form POST needs no preflight, and the
     // Host header on it is the loopback one this server already approves.
@@ -89,6 +137,16 @@ describe("origins the control server will change state for", () => {
     await ask("DELETE", "/pairing");
   });
 
+  it("does not let a stale conditional close cancel a replacement code", async () => {
+    const first = await ask("POST", "/pairing");
+    const second = await ask("POST", "/pairing");
+
+    await ask("DELETE", `/pairing?expectedToken=${encodeURIComponent(first.body.pairing.token)}`);
+    expect((await ask("GET", "/state")).body.pairing.token).toBe(second.body.pairing.token);
+    await ask("DELETE", `/pairing?expectedToken=${encodeURIComponent(second.body.pairing.token)}`);
+    expect((await ask("GET", "/state")).body.pairing).toBeNull();
+  });
+
   it("refuses a foreign origin on a safe method too", async () => {
     // This line used to expect 200, on the argument that a GET changes
     // nothing and the same-origin policy already hides the reply. The
@@ -103,6 +161,130 @@ describe("origins the control server will change state for", () => {
     const { status, body } = await ask("GET", "/state", { origin: "https://evil.example" });
     expect(status).toBe(403);
     expect(body.error).toContain("cross-origin");
+  });
+});
+
+describe("hostCandidates", () => {
+  it("orders by reachability: tailnet name, then LAN, then the mDNS name last", () => {
+    // 100.121.5.6 is the bare tailnet address: excluded outright, because iOS
+    // refuses plain HTTP to 100.64/10 and a candidate that can never succeed
+    // only slows the walk down. The synthetic mDNS name is last — it resolves
+    // only while the sidecar runs.
+    const hosts = hostCandidates(["100.121.5.6", "192.168.1.42", "10.0.0.7"], "macbook.tail1234.ts.net");
+    expect(hosts.slice(0, 3)).toEqual(["macbook.tail1234.ts.net", "192.168.1.42", "10.0.0.7"]);
+    expect(hosts.at(-1)).toMatch(/^openmausbot-[0-9a-f]{8}\.local$/);
+    expect(hosts).not.toContain("100.121.5.6");
+  });
+
+  it("skips the tailnet name when Tailscale is not part of the picture", () => {
+    // A MagicDNS name left over from a cached read is only dialable while a
+    // tailnet address exists; without one it would be a dead first candidate.
+    expect(hostCandidates(["192.168.1.42"], "stale.tail1234.ts.net")[0]).toBe("192.168.1.42");
+    expect(hostCandidates(["100.121.5.6", "192.168.1.42"], null)[0]).toBe("192.168.1.42");
+  });
+
+  it("is what /state hands the pairing panel", async () => {
+    const { status, body } = await ask("GET", "/state");
+    expect(status).toBe(200);
+    expect(Array.isArray(body.hosts)).toBe(true);
+    expect(Array.isArray(body.endpoints)).toBe(true);
+    // Whatever this machine's interfaces are, the mDNS fallback is always
+    // present and always last.
+    expect(body.hosts.at(-1)).toMatch(/^openmausbot-[0-9a-f]{8}\.local$/);
+    expect(body.endpoints.at(-1)).toMatchObject({ kind: "bonjour", priority: 300 });
+    expect(body.endpoints.at(-1).url).toMatch(/^http:\/\/openmausbot-[0-9a-f]{8}\.local:8810$/);
+  });
+
+  it("reports only the device ids backed by live authenticated streams", async () => {
+    connectedDeviceIds = ["phone-live"];
+    try {
+      expect((await ask("GET", "/state")).body.connectedDeviceIds).toEqual(["phone-live"]);
+    } finally {
+      connectedDeviceIds = [];
+    }
+  });
+
+  it("disconnects streams only after a device is successfully revoked", async () => {
+    const { code } = devices.openPairing();
+    const paired = devices.redeem(code, "Revoked phone");
+    if ("error" in paired) throw new Error(paired.error);
+    disconnectedDeviceIds = [];
+    connectedDeviceIds = [paired.device.id];
+
+    expect((await ask("DELETE", "/devices/missing-device")).status).toBe(404);
+    expect(disconnectedDeviceIds).toEqual([]);
+    expect(connectedDeviceIds).toEqual([paired.device.id]);
+
+    const revoked = await ask("DELETE", `/devices/${paired.device.id}`);
+    expect(revoked.status).toBe(200);
+    expect(disconnectedDeviceIds).toEqual([paired.device.id]);
+    expect(revoked.body.connectedDeviceIds).toEqual([]);
+  });
+});
+
+describe("hosted endpoint advertisement", () => {
+  it("publishes and withdraws only a complete HTTPS origin", async () => {
+    const headers = { "content-type": "application/json" };
+    const published = await ask(
+      "PUT",
+      "/hosted-endpoint",
+      headers,
+      JSON.stringify({ url: "https://C-Opaque.OpenMausBot.Test/" }),
+    );
+    expect(published.status).toBe(200);
+    expect(published.body.endpoints[0]).toEqual({
+      kind: "hosted",
+      priority: 0,
+      url: "https://c-opaque.openmausbot.test",
+    });
+
+    expect(
+      (await ask("PUT", "/hosted-endpoint", headers, JSON.stringify({ url: "http://unsafe.test" }))).status,
+    ).toBe(400);
+    expect((await ask("GET", "/state")).body.endpoints[0]).toMatchObject({ kind: "hosted" });
+
+    const withdrawn = await ask(
+      "PUT",
+      "/hosted-endpoint",
+      headers,
+      JSON.stringify({ url: null }),
+    );
+    expect(withdrawn.status).toBe(200);
+    expect(withdrawn.body.endpoints.some((endpoint: { kind: string }) => endpoint.kind === "hosted")).toBe(false);
+  });
+
+  it("accepts exactly one string-or-null url field", async () => {
+    const headers = { "content-type": "application/json" };
+    for (const body of [
+      {},
+      { url: null, extra: true },
+      { url: 42 },
+      { url: false },
+      [],
+      null,
+      "https://c-opaque.openmausbot.test",
+    ]) {
+      const result = await ask("PUT", "/hosted-endpoint", headers, JSON.stringify(body));
+      expect(result).toEqual({ status: 400, body: { error: "invalid JSON body" } });
+    }
+
+    expect((await ask("PUT", "/hosted-endpoint", headers, JSON.stringify({ url: null }))).status).toBe(200);
+  });
+
+  it("refuses a hosted-endpoint body larger than 4096 bytes", async () => {
+    const request = ask(
+      "PUT",
+      "/hosted-endpoint",
+      { "content-type": "application/json" },
+      JSON.stringify({ url: `https://${"a".repeat(4096)}.example` }),
+    );
+    // The server deliberately tears down an oversized upload as soon as the
+    // byte limit is crossed, so native fetch reports a transport failure
+    // rather than waiting for (or parsing) the remainder of the body.
+    await expect(request).rejects.toThrow();
+    expect((await ask("GET", "/state")).body.endpoints.some(
+      (endpoint: { kind: string }) => endpoint.kind === "hosted",
+    )).toBe(false);
   });
 });
 

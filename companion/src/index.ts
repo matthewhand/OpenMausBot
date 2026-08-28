@@ -3,11 +3,13 @@
 //
 //   node companion/src/index.ts
 //
-// Three sockets, and the split between them is the whole security model:
+// Three public/runtime sockets, and one optional private managed origin. The
+// split between them is the whole security model:
 //
 //   :8810  0.0.0.0    devices     token required, allowlisted, scrubbed
 //   :8811  127.0.0.1  you         pairing and revocation — never off-machine
 //   :8799  127.0.0.1  the harness spoken to as this machine, unmodified
+//   UDS/pipe            one Electron-owned sidecar generation, never TCP
 //
 // 8810 rather than 8800, which is where these started: the harness opens a
 // webhook receiver one port above its own, so 8800 is already taken by the
@@ -19,8 +21,11 @@
 // off switch, and it is a more honest one than a flag in a file.
 import { createServer } from "node:http";
 
-import { createControlServer } from "./control.ts";
+import { createAddressWatcher } from "./advertise-watch.ts";
+import { createControlServer, hostCandidates } from "./control.ts";
+import { createConnectedDeviceTracker } from "./connected-devices.ts";
 import { DeviceRegistry } from "./devices.ts";
+import { companionEndpointCandidates, hostedCompanionUrl } from "./endpoints.ts";
 import { lanAddresses, refreshTailnetName, tailnetName, tailscaleAddress } from "./listener.ts";
 import {
   advertisableAddresses,
@@ -31,6 +36,7 @@ import {
   type ServiceInfo,
 } from "./mdns.ts";
 import { createProxyHandler } from "./proxy.ts";
+import { companionOriginSocket, listenCompanionOrigin } from "./origin.ts";
 
 /** A port from the environment, or the default. Anything that is not a whole
  * number in range is the default — a typo'd port must not become port 0. */
@@ -44,6 +50,8 @@ const WEBHOOK_PORT = num(process.env.OMB_WEBHOOK_PORT, HARNESS_PORT + 1);
 const COMPANION_PORT = num(process.env.OMB_COMPANION_PORT, 8810);
 const CONTROL_PORT = num(process.env.OMB_CONTROL_PORT, 8811);
 const SERVICE_TYPE = "_openmausbot._tcp";
+let hostedUrl = hostedCompanionUrl(process.env.OMB_COMPANION_HOSTED_URL);
+const PRIVATE_ORIGIN = companionOriginSocket(process.env.OMB_COMPANION_INTERNAL_ORIGIN);
 
 /** Ports the harness takes for itself, and what it uses each for.
  *
@@ -98,6 +106,17 @@ async function refreshMachineName(): Promise<void> {
 const devices = new DeviceRegistry();
 const mdns = new MdnsResponder();
 
+/** Keeps the Bonjour record matching the interface table: advertise when a
+ * network appears, re-advertise when DHCP moves us, withdraw when it goes —
+ * so `mdns.advertising` stays a true statement rather than a boot-time one. */
+const watcher = createAddressWatcher({
+  addresses: advertisableAddresses,
+  // service() reads the current addresses, so a re-advertise carries them
+  advertise: () => mdns.advertise(service()),
+  withdraw: () => mdns.stop(),
+  log: (line) => console.log(`bonjour: ${line}`),
+});
+
 /** This machine as a Bonjour record: one DNS label, the device port, and the
  * addresses a phone could reach it on. */
 const service = (): ServiceInfo => ({
@@ -113,21 +132,34 @@ const service = (): ServiceInfo => ({
   txt: ["v=1", `name=${clampBytes(machineName(), 200)}`],
 });
 
-const companion = createServer(
-  createProxyHandler({
+const connectedDevices = createConnectedDeviceTracker();
+const proxy = createProxyHandler({
     harnessPort: HARNESS_PORT,
     // `authenticate` also stamps lastSeenAt, which is what makes the control
     // page able to say when a phone was last heard from.
-    authenticate: (token) => Boolean(devices.authenticate(token)),
-    redeem: (code, deviceName) => devices.redeem(code, deviceName),
+    authenticate: (token) => devices.authenticate(token),
+    redeem: (code, deviceName, pairRequestId) => devices.redeem(code, deviceName, pairRequestId),
     serverName: machineName,
-  }),
-);
+    // Recomputed per pairing rather than cached: addresses change when the
+    // machine joins another network, and a pairing is exactly the moment the
+    // list has to be right.
+    hosts: () => hostCandidates(),
+    endpoints: () => companionEndpointCandidates(COMPANION_PORT, undefined, undefined, hostedUrl),
+    connected: connectedDevices.open,
+  });
+const companion = createServer(proxy);
+const managedOrigin = PRIVATE_ORIGIN ? createServer(proxy) : null;
 
 const control = createControlServer({
   devices,
   companionPort: COMPANION_PORT,
+  hostedUrl: () => hostedUrl,
+  setHostedUrl: (next) => {
+    hostedUrl = next;
+  },
   discovery: () => ({ advertising: mdns.advertising, name: service().name }),
+  connectedDeviceIds: connectedDevices.ids,
+  disconnectDevice: connectedDevices.disconnect,
 });
 
 /** Bind a server, turning a bind failure into a sentence rather than a stack
@@ -192,6 +224,9 @@ async function main(): Promise<void> {
 
   await listen(control, CONTROL_PORT, "127.0.0.1");
   await listen(companion, COMPANION_PORT, "0.0.0.0");
+  if (managedOrigin && PRIVATE_ORIGIN) {
+    await listenCompanionOrigin(managedOrigin, PRIVATE_ORIGIN);
+  }
 
   // Before advertising: the service name goes into the Bonjour record, and
   // re-advertising under a new name later would show the phone two computers.
@@ -207,9 +242,13 @@ async function main(): Promise<void> {
   // another responder, multicast off, a guest network that isolates its
   // clients. Pairing by typed address still works, and the control page says
   // so rather than pretending the list will fill in.
-  await mdns.advertise(service()).catch((error: unknown) => {
-    console.warn(`bonjour unavailable: ${error instanceof Error ? error.message : String(error)}`);
-  });
+  //
+  // Through the watcher rather than a single advertise: a laptop opened
+  // before wifi associates has no addresses yet, and addresses change under
+  // a running sidecar. The first check advertises (or says why not), and the
+  // interval re-advertises on every change after that.
+  await watcher.check();
+  watcher.start();
 
   const addresses = lanAddresses();
   const tailscale = tailscaleAddress(addresses);
@@ -230,14 +269,19 @@ async function main(): Promise<void> {
  * is the off switch, so it has to actually stop. */
 const shutdown = async (signal: string): Promise<void> => {
   console.log(`\n${signal} — stopping`);
+  // the watcher first, or a tick could re-advertise the record the next
+  // line just withdrew
+  watcher.stop();
   await mdns.stop().catch(() => {});
   // close() waits for open connections, and an SSE stream never ends on its
   // own — drop the sockets so "stop" means stopped, now.
   companion.closeAllConnections?.();
   control.closeAllConnections?.();
+  managedOrigin?.closeAllConnections?.();
   await Promise.all([
     new Promise<void>((r) => companion.close(() => r())),
     new Promise<void>((r) => control.close(() => r())),
+    ...(managedOrigin ? [new Promise<void>((r) => managedOrigin.close(() => r()))] : []),
   ]);
   process.exit(0);
 };

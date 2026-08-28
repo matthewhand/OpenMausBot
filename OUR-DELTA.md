@@ -4,9 +4,9 @@ This document lists the key differences and additional features in this fork com
 
 ## Fork Status
 
-- **Fork main**: 464 commits ahead, 2 commits behind upstream/main
-- **Last synced**: All open draft PRs have been rebased/merged onto current fork main
-- **All PRs**: Now showing MERGEABLE status on GitHub
+- **Fork main** (this sync): 4 commits ahead of `milind-soni/OpenMausBot` `main`, 0 behind
+- **Last synced**: 2026-08-28 — merged upstream `677538e` (`docs(contributing): MCP tool schemas must stay flat`) into the fork. The merge was conflict-free because fork `main` only carried `OUR-DELTA.md` plus prior upstream-merge commits.
+- **Feature work** lives on open draft PRs, not on `main`. After this 557-commit upstream jump, those PR branches need a fresh mergeability check (see the sync PR). Historical PRs #1–#4 were closed and superseded by #14–#17.
 
 ## Open Draft Pull Requests
 

@@ -1,6 +1,6 @@
 // Companion device registry contract. The three properties that matter:
-// a token is never recoverable from disk, a pairing code cannot be ground
-// down by guessing, and revoking a device actually revokes it.
+// a token is never recoverable from disk, pairing credentials are one-time,
+// a manual code cannot be ground down by guessing, and revocation works.
 import { readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -43,6 +43,17 @@ describe("DeviceRegistry", () => {
     expect(registry.list()[0]).not.toHaveProperty("tokenHash");
   });
 
+  it("closes only the pairing window named by an expected token", () => {
+    const registry = new DeviceRegistry();
+    const first = registry.openPairing();
+    const second = registry.openPairing();
+
+    expect(registry.closePairing(first.token)).toBe(false);
+    expect(registry.pairing()?.token).toBe(second.token);
+    expect(registry.closePairing(second.token)).toBe(true);
+    expect(registry.pairing()).toBeNull();
+  });
+
   it("survives a restart", () => {
     const { token } = pair(new DeviceRegistry());
     expect(new DeviceRegistry().authenticate(token)).not.toBeNull();
@@ -60,6 +71,7 @@ describe("DeviceRegistry", () => {
     delete stored.devices[0].name;
     delete stored.devices[0].lastSeenAt;
     delete stored.devices[0].createdAt;
+    delete stored.devices[0].cloudDesktopAccess;
     writeFileSync(file, JSON.stringify(stored));
 
     const reloaded = new DeviceRegistry();
@@ -68,6 +80,7 @@ describe("DeviceRegistry", () => {
     expect(listed.name).toBe("Companion");
     expect(Number.isFinite(listed.lastSeenAt)).toBe(true);
     expect(Number.isFinite(listed.createdAt)).toBe(true);
+    expect(listed.cloudDesktopAccess).toBe(false);
     // and the token it was paired with still works
     expect(reloaded.authenticate(token)?.id).toBe(device.id);
   });
@@ -106,7 +119,7 @@ describe("DeviceRegistry", () => {
     const wrong = code === "000000" ? "111111" : "000000";
 
     for (let i = 1; i < MAX_PAIRING_ATTEMPTS; i++) {
-      expect(registry.redeem(wrong, "iPhone")).toEqual({ error: "that code is not right" });
+      expect(registry.redeem(wrong, "iPhone")).toEqual({ error: "that pairing credential is not right" });
       expect(registry.pairing()).not.toBeNull();
     }
     // the last one closes the window rather than counting down forever
@@ -123,6 +136,107 @@ describe("DeviceRegistry", () => {
     const { code } = registry.openPairing();
     expect(registry.redeem(code, "iPhone")).toHaveProperty("token");
     expect(registry.redeem(code, "iPad")).toMatchObject({ error: expect.stringContaining("no pairing") });
+    expect(registry.count()).toBe(1);
+  });
+
+  it("points an out-of-window pairing attempt to Phone settings", () => {
+    expect(new DeviceRegistry().redeem("000000", "iPhone")).toEqual({
+      error: "no pairing is in progress — open Phone settings on your computer",
+    });
+  });
+
+  it("replays one logical redemption without creating an orphan device", () => {
+    const registry = new DeviceRegistry();
+    const { token: credential } = registry.openPairing();
+    const requestId = "4c825d5b-cf40-4db7-aac5-2455f805a8ec";
+
+    const first = registry.redeem(credential, "iPhone", requestId);
+    const replay = registry.redeem(credential, "iPhone", requestId);
+
+    expect(first).toHaveProperty("token");
+    expect(replay).toEqual(first);
+    expect(registry.count()).toBe(1);
+    // Possessing only one half of the replay key is not enough.
+    expect(registry.redeem(credential, "iPhone", "different-request-id")).toMatchObject({
+      error: expect.stringContaining("no pairing"),
+    });
+    expect(registry.redeem("omb_pair_wrong", "iPhone", requestId)).toMatchObject({
+      error: expect.stringContaining("no pairing"),
+    });
+  });
+
+  it("forgets a redemption replay when a fresh pairing window opens", () => {
+    const registry = new DeviceRegistry();
+    const { token: firstCredential } = registry.openPairing();
+    const requestId = "4c825d5b-cf40-4db7-aac5-2455f805a8ec";
+    expect(registry.redeem(firstCredential, "iPhone", requestId)).toHaveProperty("token");
+
+    registry.openPairing();
+    expect(registry.redeem(firstCredential, "iPhone", requestId)).toMatchObject({
+      error: expect.stringContaining("not right"),
+    });
+  });
+
+  it("actively erases a redemption replay at the original window expiry", () => {
+    vi.useFakeTimers();
+    try {
+      const registry = new DeviceRegistry();
+      const { token: credential } = registry.openPairing();
+      const requestId = "4c825d5b-cf40-4db7-aac5-2455f805a8ec";
+      expect(registry.redeem(credential, "iPhone", requestId)).toHaveProperty("token");
+      const memory = registry as unknown as {
+        replay: unknown;
+        replayExpiryTimer: unknown;
+      };
+      expect(memory.replay).not.toBeNull();
+      expect(memory.replayExpiryTimer).not.toBeNull();
+
+      vi.advanceTimersByTime(PAIRING_TTL_MS + 1);
+      expect(memory.replay).toBeNull();
+      expect(memory.replayExpiryTimer).toBeNull();
+      expect(registry.redeem(credential, "iPhone", requestId)).toMatchObject({
+        error: expect.stringContaining("no pairing"),
+      });
+      expect(registry.count()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps cloud desktop access off until enabled for that device", () => {
+    const registry = new DeviceRegistry();
+    const { token, device } = pair(registry);
+
+    expect(device.cloudDesktopAccess).toBe(false);
+    expect(registry.authenticate(token)?.cloudDesktopAccess).toBe(false);
+    expect(registry.setCloudDesktopAccess(device.id, true)).toBe(true);
+    expect(registry.authenticate(token)?.cloudDesktopAccess).toBe(true);
+    expect(new DeviceRegistry().authenticate(token)?.cloudDesktopAccess).toBe(true);
+    expect(registry.setCloudDesktopAccess(device.id, false)).toBe(true);
+    expect(registry.authenticate(token)?.cloudDesktopAccess).toBe(false);
+    expect(registry.setCloudDesktopAccess("missing", true)).toBe(false);
+  });
+
+  it("rolls cloud desktop access back when it cannot be saved", () => {
+    const registry = new DeviceRegistry();
+    const { token, device } = pair(registry);
+    (registry as unknown as { persist: () => void }).persist = () => {
+      throw new Error("ENOSPC: no space left on device");
+    };
+
+    expect(() => registry.setCloudDesktopAccess(device.id, true)).toThrow("ENOSPC");
+    expect(registry.authenticate(token)?.cloudDesktopAccess).toBe(false);
+  });
+
+  it("uses a high-entropy QR credential and burns the manual fallback with it", () => {
+    const registry = new DeviceRegistry();
+    const { code, token } = registry.openPairing();
+
+    expect(token).toMatch(/^omb_pair_[A-Za-z0-9_-]{43}$/);
+    expect(registry.redeem(token, "iPhone")).toHaveProperty("token");
+    expect(registry.redeem(code, "iPad")).toMatchObject({
+      error: expect.stringContaining("no pairing"),
+    });
     expect(registry.count()).toBe(1);
   });
 

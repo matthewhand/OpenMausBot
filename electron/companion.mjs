@@ -13,6 +13,12 @@
 import { app, utilityProcess } from "electron";
 import fs from "node:fs";
 import path from "node:path";
+import { resolveCompanionEntry } from "./companion-entry.mjs";
+import {
+  cleanupCompanionOriginEndpoint,
+  companionOriginHealth,
+  createCompanionOriginEndpoint,
+} from "./companion-origin-gateway.mjs";
 
 // Passed to the fork rather than left to the sidecar's own defaults, so the
 // port this file fetches the control API on cannot drift from the port the
@@ -24,29 +30,100 @@ const COMPANION_PORT = 8810;
 
 let proc = null;
 let lastError = null;
+let advertisedHostedUrl = null;
+let originTarget = null;
+let lifecycleListener = () => {};
+const expectedStops = new WeakSet();
 
-/** Where the sidecar's compiled entry lives.
+/** Where the sidecar's entry lives, and the Node flags it needs.
  *
- * Packaged, it is staged into resources alongside the harness. In dev there
- * is no such directory, so it comes from dist-companion — which means
- * `pnpm build:companion` has to have been run at least once. Returning null
- * rather than a path that does not exist is what lets the toggle say so
- * instead of failing with a spawn error nobody can read. */
-const entryPoint = (resourcesPath) => {
-  const packaged = path.join(resourcesPath, "companion", "index.js");
-  if (app.isPackaged) return fs.existsSync(packaged) ? packaged : null;
-  const built = path.join(app.getAppPath(), "dist-companion", "index.js");
-  return fs.existsSync(built) ? built : null;
-};
+ * Packaged, it is staged into resources alongside the harness. In dev the
+ * compiled dist-companion output is preferred when it exists, and the
+ * TypeScript source is the fallback — run with type stripping, exactly as
+ * the `companion` script runs it — so the toggle works without a build step
+ * nobody remembers. Returning null rather than a path that does not exist is
+ * what lets the toggle say so instead of failing with a spawn error nobody
+ * can read. */
+const entryPoint = (resourcesPath) =>
+  resolveCompanionEntry({
+    isPackaged: app.isPackaged,
+    resourcesPath,
+    appPath: app.getAppPath(),
+    exists: fs.existsSync,
+  });
+
+// ── the remembered toggle ────────────────────────────────────────────────
+// The Settings toggle used to be the only thing that ever started the
+// sidecar, so a paired phone died with every relaunch of the app: port 8810
+// stayed closed until the user rediscovered the switch. The position of the
+// toggle is state worth keeping, and it lives in the app's own userData —
+// like cua-connection.json — because the app owns the toggle. Not in the
+// sidecar's ~/.openmausbot-companion, which is the child process's directory,
+// and not in the harness's config.json, which is somebody else's data layout.
+
+const settingsFile = () => path.join(app.getPath("userData"), "companion-settings.json");
+
+function companionSettings() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(settingsFile(), "utf8"));
+    return { enabled: parsed?.enabled === true, keepAwake: parsed?.keepAwake === true };
+  } catch {
+    return { enabled: false, keepAwake: false };
+  }
+}
+
+/** Whether the user left the companion on. Anything unreadable is "off" —
+ * the flag opens a network listener, so it fails closed. */
+export function companionEnabledAtRest() {
+  return companionSettings().enabled;
+}
+
+export function companionKeepAwakeAtRest() {
+  return companionSettings().keepAwake;
+}
+
+/** Remember the toggle's position. Written via temp-and-rename so a crash
+ * mid-write cannot leave a truncated file; a failed write costs auto-start
+ * on the next launch, never the toggle itself. */
+function rememberCompanionSettings(patch) {
+  const file = settingsFile();
+  const temporary = `${file}.${process.pid}.tmp`;
+  try {
+    const next = { ...companionSettings(), ...patch };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(temporary, JSON.stringify(next, null, 2));
+    fs.renameSync(temporary, file);
+  } catch {
+    try {
+      fs.unlinkSync(temporary);
+    } catch {
+      /* never created, or already renamed */
+    }
+  }
+}
+
+
+export function rememberCompanionEnabled(enabled) {
+  rememberCompanionSettings({ enabled });
+}
+
+export function rememberCompanionKeepAwake(keepAwake) {
+  rememberCompanionSettings({ keepAwake });
+}
 
 /** Ask the sidecar's own control server, which is the same API the standalone
  * page uses. Short timeout: this is loopback, and a spinner in Settings that
  * never resolves is worse than an error. */
-async function control(method, urlPath) {
-  const res = await fetch(`http://127.0.0.1:${CONTROL_PORT}${urlPath}`, {
+async function control(method, urlPath, body) {
+  const options = {
     method,
     signal: AbortSignal.timeout(4000),
-  });
+  };
+  if (body !== undefined) {
+    options.body = JSON.stringify(body);
+    options.headers = { "content-type": "application/json" };
+  }
+  const res = await fetch(`http://127.0.0.1:${CONTROL_PORT}${urlPath}`, options);
   if (!res.ok && res.status !== 404) throw new Error(`companion control ${res.status}`);
   return res.json();
 }
@@ -54,6 +131,25 @@ async function control(method, urlPath) {
 /** Whether this process owns a running sidecar. */
 export function companionRunning() {
   return proc !== null;
+}
+
+/** The hosted route the owned sidecar is currently advertising. This is
+ * process-local public state only; the connector credential never enters
+ * this module. */
+export function companionAdvertisedHostedUrl() {
+  return proc ? advertisedHostedUrl : null;
+}
+
+/** Exact private origin belonging to the currently owned sidecar. This value
+ * is main-process-only and must never cross IPC into the renderer. */
+export function companionOriginTarget() {
+  return proc && originTarget ? { ...originTarget } : null;
+}
+
+/** Main installs one synchronous exit observer. It invalidates the guardian
+ * before this module cleans up the generation's socket path. */
+export function setCompanionLifecycleListener(listener = () => {}) {
+  lifecycleListener = listener;
 }
 
 // Every lifecycle transition runs to completion before the next one begins.
@@ -91,27 +187,64 @@ export function stopCompanion() {
 }
 
 /** startCompanion's body, run inside the transition queue. */
-async function start({ resourcesPath, harnessPort, log }) {
+async function start({ resourcesPath, harnessPort, hostedUrl = null, log }) {
   if (proc) return companionState();
   lastError = null;
-  const entry = entryPoint(resourcesPath);
-  if (!entry) {
+  const resolved = entryPoint(resourcesPath);
+  if (!resolved) {
+    // In dev this now means even companion/src is gone — a broken checkout,
+    // not a missing build step, so the old "run pnpm build:companion" advice
+    // would send someone to a command that cannot help.
     lastError = app.isPackaged
       ? "the companion is missing from this build"
-      : "run `pnpm build:companion` once, then try again";
+      : "the companion sources are missing from this checkout";
     return companionState();
   }
-  log?.(`companion fork ${entry}`);
+  log?.(`companion fork ${resolved.entry}`);
 
-  const child = utilityProcess.fork(entry, [], {
-    env: {
-      ...process.env,
-      OMB_PORT: String(harnessPort),
-      OMB_COMPANION_PORT: String(COMPANION_PORT),
-      OMB_CONTROL_PORT: String(CONTROL_PORT),
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  let allocatedOrigin;
+  try {
+    allocatedOrigin = createCompanionOriginEndpoint();
+  } catch {
+    lastError = "the private companion origin could not be created";
+    return companionState();
+  }
+  let cleanedOrigin = false;
+  const cleanupOrigin = () => {
+    if (cleanedOrigin) return;
+    cleanedOrigin = true;
+    cleanupCompanionOriginEndpoint(allocatedOrigin);
+  };
+
+  // Never inherit an endpoint from the launch environment. The main process
+  // passes this value only after it has verified the managed connector, and
+  // an inherited value would bypass that gate and make Settings claim a dead
+  // or attacker-selected route is ready.
+  const childEnvironment = { ...process.env };
+  delete childEnvironment.OMB_COMPANION_HOSTED_URL;
+  delete childEnvironment.OMB_COMPANION_INTERNAL_ORIGIN;
+  if (hostedUrl) childEnvironment.OMB_COMPANION_HOSTED_URL = hostedUrl;
+  childEnvironment.OMB_COMPANION_INTERNAL_ORIGIN = allocatedOrigin.socketPath;
+
+  let child;
+  try {
+    child = utilityProcess.fork(resolved.entry, [], {
+      env: {
+        ...childEnvironment,
+        OMB_PORT: String(harnessPort),
+        OMB_COMPANION_PORT: String(COMPANION_PORT),
+        OMB_CONTROL_PORT: String(CONTROL_PORT),
+      },
+      // how the TS-source fallback gets --experimental-strip-types; empty for
+      // compiled entries
+      execArgv: resolved.execArgv,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    cleanupOrigin();
+    lastError = "the companion process could not be started";
+    return companionState();
+  }
   child.stdout?.on("data", (d) => log?.(`[companion] ${String(d).trimEnd()}`));
   child.stderr?.on("data", (d) => log?.(`[companion err] ${String(d).trimEnd()}`));
 
@@ -121,7 +254,17 @@ async function start({ resourcesPath, harnessPort, log }) {
     // A non-zero exit before we saw it answer is the interesting case: the
     // usual cause is the port already being taken, and the sidecar's own
     // message says which one and why.
-    if (proc === child) proc = null;
+    if (proc === child) {
+      proc = null;
+      advertisedHostedUrl = null;
+      originTarget = null;
+      lifecycleListener({
+        type: "exit",
+        expected: expectedStops.has(child),
+        pid: child.pid,
+      });
+    }
+    cleanupOrigin();
     log?.(`companion exited code=${code}`);
   });
 
@@ -149,7 +292,14 @@ async function start({ resourcesPath, harnessPort, log }) {
         lastError = `port ${CONTROL_PORT} is already serving another companion — stop it and try again`;
         return companionState();
       }
+      if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
+        throw new Error("child pid unavailable");
+      }
+      const target = { pid: child.pid, socketPath: allocatedOrigin.socketPath };
+      if (!(await companionOriginHealth(target))) throw new Error("private origin not ready");
       proc = child;
+      advertisedHostedUrl = hostedUrl;
+      originTarget = Object.freeze(target);
       return companionState();
     } catch {
       await new Promise((r) => setTimeout(r, 150));
@@ -168,8 +318,11 @@ async function start({ resourcesPath, harnessPort, log }) {
 async function stop() {
   const child = proc;
   proc = null;
+  advertisedHostedUrl = null;
+  originTarget = null;
   lastError = null;
   if (!child) return companionState();
+  expectedStops.add(child);
   try {
     child.kill();
   } catch {
@@ -192,26 +345,77 @@ async function stop() {
   return companionState();
 }
 
+/** Publish or withdraw the hosted route without replacing the sidecar (and
+ * therefore without changing the exact private origin the guardian owns).
+ * Callers publish only after public health verification succeeds. */
+export function setCompanionHostedUrl(endpoint) {
+  return serialize(async () => {
+    if (!proc) return companionState();
+    const state = await control("PUT", "/hosted-endpoint", { url: endpoint || null });
+    advertisedHostedUrl = endpoint || null;
+    return state;
+  });
+}
+
 /** Everything the panel renders. Shaped so "off" is a complete answer rather
  * than an absence — the panel should never have to guess. */
 export async function companionState() {
+  const keepAwake = companionKeepAwakeAtRest();
   if (!proc) {
-    return { enabled: false, port: COMPANION_PORT, devices: [], pairing: null, ...(lastError ? { error: lastError } : {}) };
+    const state = {
+      enabled: false,
+      keepAwake,
+      port: COMPANION_PORT,
+      devices: [],
+      connectedDeviceIds: [],
+      pairing: null,
+    };
+    if (lastError) state.error = lastError;
+    return state;
   }
   try {
     const state = await control("GET", "/state");
-    return { enabled: true, ...state };
+    return { enabled: true, keepAwake, ...state };
   } catch {
     // running but unreachable: report it rather than claiming health
-    return { enabled: true, port: COMPANION_PORT, devices: [], pairing: null, error: "the companion is not responding" };
+    return {
+      enabled: true,
+      keepAwake,
+      port: COMPANION_PORT,
+      devices: [],
+      connectedDeviceIds: [],
+      pairing: null,
+      error: "the companion is not responding",
+    };
   }
 }
 
-/** Open or close a pairing window on the running sidecar. */
-export async function companionPairing(open) {
+/** Open or close a pairing window on the running sidecar. A conditional close
+ * cannot erase a newer code created after the renderer began cancelling. */
+export async function companionPairing(open, expectedToken) {
   if (!proc) return companionState();
-  await control(open ? "POST" : "DELETE", "/pairing").catch(() => {});
-  return companionState();
+  const conditionalClose = !open && expectedToken !== undefined;
+  const candidate = String(expectedToken ?? "");
+  const token = /^omb_pair_[A-Za-z0-9_-]{43}$/.test(candidate)
+    ? candidate
+    : "invalid-pairing-token";
+  const path = conditionalClose
+    ? `/pairing?expectedToken=${encodeURIComponent(token)}`
+    : "/pairing";
+  try {
+    const state = await control(open ? "POST" : "DELETE", path);
+    return {
+      enabled: true,
+      keepAwake: companionKeepAwakeAtRest(),
+      ...state,
+    };
+  } catch {
+    const state = await companionState();
+    return {
+      ...state,
+      error: state.error ?? "Phone pairing could not be updated.",
+    };
+  }
 }
 
 /** Unpair one device. Ignores an id the renderer should not have sent. */
@@ -220,5 +424,13 @@ export async function companionRevoke(deviceId) {
   // the id came from the renderer, so it does not get to shape a path
   if (!/^[\w-]{1,64}$/.test(String(deviceId ?? ""))) return companionState();
   await control("DELETE", `/devices/${deviceId}`).catch(() => {});
+  return companionState();
+}
+
+/** Enable or remove interactive cloud-desktop access for one paired phone. */
+export async function companionCloudDesktopAccess(deviceId, allowed) {
+  if (!proc) return companionState();
+  if (!/^[\w-]{1,64}$/.test(String(deviceId ?? ""))) return companionState();
+  await control(allowed ? "POST" : "DELETE", `/devices/${deviceId}/cloud-desktop`).catch(() => {});
   return companionState();
 }

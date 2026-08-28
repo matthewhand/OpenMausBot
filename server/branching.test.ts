@@ -133,6 +133,12 @@ posixOnly("conversation branching e2e (fake ACP fleet)", () => {
 
       // turn 1 settles on the original branch
       expect((await api("POST", `/api/bots/${created.id}/messages`, { text: "original question" })).status).toBe(202);
+      const afterSend = await getBot(created.id);
+      const quiz = afterSend.messages.find(
+        (m: { kind: string; card?: { requestId?: string; dismissed?: boolean } }) =>
+          m.kind === "options" && !m.card?.requestId,
+      );
+      expect(quiz?.card?.dismissed).toBe(true);
       await waitFor(async () => {
         const b = await getBot(created.id);
         return !b.busy && b.messages.some((m: Msg) => m.role === "bot" && m.kind === "text" && m.text?.includes("fake acp"));
@@ -186,6 +192,12 @@ posixOnly("conversation branching e2e (fake ACP fleet)", () => {
       // start a turn that will never finish on its own
       expect((await api("POST", `/api/bots/${created.id}/messages`, { text: "first try" })).status).toBe(202);
       await waitFor(async () => (await getBot(created.id)).busy === true, "the hung turn to start");
+
+      const backendBefore = (await getBot(created.id)).cloudBackend;
+      const backendChange = await api("PATCH", `/api/bots/${created.id}`, { cloudBackend: "vps" });
+      expect(backendChange.status).toBe(409);
+      expect(backendChange.body.error).toContain("stop the active turn");
+      expect((await getBot(created.id)).cloudBackend).toBe(backendBefore);
 
       // a second send while busy queues (steer-queue) — never a parallel
       // turn: the words land in the transcript, the live turn keeps running

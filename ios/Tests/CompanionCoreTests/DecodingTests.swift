@@ -56,6 +56,154 @@ final class DecodingTests: XCTestCase {
         XCTAssertNil(fleet.bots.first?.hasMore)
     }
 
+    func testOldAndNewAvatarProfilesDecodeTogether() throws {
+        let oldBot = try XCTUnwrap(decode(Fleet.self, "bots-full").bots.first)
+        XCTAssertNil(oldBot.avatarUrl)
+        XCTAssertNil(oldBot.avatarCrop)
+
+        let newBot = try XCTUnwrap(decode(Fleet.self, "bot-avatar-profile").bots.first)
+        XCTAssertEqual(newBot.avatarUrl, "/api/attachments/123e4567-e89b-12d3-a456-426614174000.webp")
+        XCTAssertEqual(newBot.avatarCrop, .rounded)
+        XCTAssertEqual(newBot.voice, "voice-1")
+        XCTAssertEqual(newBot.speakReplies, true)
+    }
+
+    func testFutureAvatarCropFallsBackWithoutDroppingTheBot() throws {
+        let fixture = String(decoding: try fixture("bot-avatar-profile"), as: UTF8.self)
+            .replacingOccurrences(of: #""avatarCrop":"rounded""#, with: #""avatarCrop":"hexagon""#)
+        let fleet = try JSONDecoder().decode(Fleet.self, from: Data(fixture.utf8))
+
+        XCTAssertEqual(fleet.bots.count, 1)
+        XCTAssertEqual(fleet.bots.first?.avatarCrop, .mascot)
+    }
+
+    func testFutureRoutineScheduleKindRemainsVisibleAsUnknown() throws {
+        let schedule = try JSONDecoder().decode(
+            RoutineSchedule.self,
+            from: Data(#"{"type":"weekly","time":"09:00","weekdays":[1]}"#.utf8)
+        )
+
+        XCTAssertEqual(schedule.type, .unknown)
+        XCTAssertEqual(schedule.time, "09:00")
+        XCTAssertEqual(schedule.weekdays, [1])
+    }
+
+    func testNotificationTargetRequiresBothExactIds() {
+        XCTAssertEqual(
+            NotificationTarget(payload: ["botId": "bot-1", "threadId": "detached-task-2"]),
+            NotificationTarget(botId: "bot-1", threadId: "detached-task-2")
+        )
+        XCTAssertNil(NotificationTarget(payload: ["botId": "bot-1"]))
+        XCTAssertNil(NotificationTarget(payload: ["threadId": "task-1"]))
+        XCTAssertNil(NotificationTarget(botId: " ", threadId: "task-1"))
+        guard let detached = NotificationTarget(botId: "bot-1", threadId: "task-2") else {
+            return XCTFail("valid notification target")
+        }
+        XCTAssertTrue(detached.requiresTaskSwitch(activeThreadId: "task-1"))
+        XCTAssertFalse(detached.requiresTaskSwitch(activeThreadId: "task-2"))
+    }
+
+    func testDecodesTheCloudBackendAndItsAbsence() throws {
+        // The cloud-desktop button hides on cloudBackend == "vps", so both
+        // sides of that gate must decode: a harness that sends the field, and
+        // an older one that has never heard of it (nil keeps the button).
+        let json = """
+        {
+          "bots": [
+            {
+              "id":"b1","threadId":"t1","name":"Scout","title":"","description":"",
+              "notifications":true,"color":"green","unread":false,
+              "modelSelection":{"instanceId":"i1","model":"m1"},"createdAt":1,
+              "computer":"cloud","cloudBackend":"vps"
+            },
+            {
+              "id":"b2","threadId":"t2","name":"Rio","title":"","description":"",
+              "notifications":true,"color":"blue","unread":false,
+              "modelSelection":{"instanceId":"i1","model":"m1"},"createdAt":2,
+              "computer":"cloud"
+            }
+          ],
+          "groups": []
+        }
+        """
+        let fleet = try JSONDecoder().decode(Fleet.self, from: Data(json.utf8))
+        XCTAssertEqual(fleet.bots.first?.cloudBackend, "vps")
+        XCTAssertNil(fleet.bots.last?.cloudBackend)
+    }
+
+    func testDecodesMultipleConnectedAccountsAndNoAuthToolkit() throws {
+        let payload = #"""
+        {
+          "configured": true,
+          "services": {
+            "gmail": {
+              "connected": true,
+              "pending": false,
+              "status": "ACTIVE",
+              "accounts": [
+                {"id": "ca_work", "alias": "Work", "status": "ACTIVE"},
+                {"id": "ca_personal", "status": "INACTIVE"}
+              ]
+            },
+            "weather": {
+              "connected": true,
+              "pending": false,
+              "status": "ACTIVE",
+              "accounts": []
+            },
+            "slack": {
+              "connected": false,
+              "pending": true
+            }
+          }
+        }
+        """#
+        let statuses = try JSONDecoder().decode(ConnectorStatuses.self, from: Data(payload.utf8))
+        let gmail = try XCTUnwrap(statuses.services["gmail"])
+        XCTAssertEqual(gmail.accounts?.map(\.id), ["ca_work", "ca_personal"])
+        XCTAssertEqual(gmail.accounts?.first?.alias, "Work")
+        XCTAssertNil(gmail.accounts?.last?.alias)
+        XCTAssertTrue(try XCTUnwrap(gmail.accounts?.first).isActive)
+        XCTAssertFalse(try XCTUnwrap(gmail.accounts?.last).isActive)
+
+        let noAuth = try XCTUnwrap(statuses.services["weather"])
+        XCTAssertTrue(noAuth.connected)
+        XCTAssertEqual(noAuth.accounts?.isEmpty, true)
+
+        let pending = try XCTUnwrap(statuses.services["slack"])
+        XCTAssertEqual(pending.pending, true)
+        XCTAssertNil(pending.accounts)
+    }
+
+    func testAnUnreadableCredentialStoreIsNotAnEmptyInventory() throws {
+        func statuses(_ json: String) throws -> ConnectorStatuses {
+            try JSONDecoder().decode(ConnectorStatuses.self, from: Data(json.utf8))
+        }
+
+        // The one answer that withdraws its own authority: an empty map the
+        // server explicitly labels as "we could not read the store".
+        let unreadable = try statuses(#"{"configured":false,"credentialStore":"unavailable","services":{}}"#)
+        XCTAssertTrue(unreadable.services.isEmpty)
+        XCTAssertFalse(unreadable.isAuthoritative)
+
+        // The three ways of still being authoritative. Each is asserted
+        // separately because a rule that only recognised the case above would
+        // pass a test that only checked the case above — and every one of
+        // these would then start hiding accounts that really are gone.
+        XCTAssertTrue(
+            try statuses(#"{"configured":true,"credentialStore":"ok","services":{}}"#).isAuthoritative,
+            "an empty list from a readable store really does mean nothing is connected"
+        )
+        XCTAssertTrue(
+            try statuses(#"{"configured":true,"services":{}}"#).isAuthoritative,
+            "a computer older than the field would otherwise have every answer treated as unknowable"
+        )
+        XCTAssertTrue(
+            try statuses(#"{"configured":false,"credentialStore":"Unavailable","services":{}}"#).isAuthoritative,
+            "only the exact string server/index.ts writes withdraws the claim; anything else is as unknown as an absent field"
+        )
+    }
+
     func testOneMalformedBotDoesNotHideTheRestOfTheFleet() throws {
         let json = """
         {
@@ -123,6 +271,15 @@ final class DecodingTests: XCTestCase {
         XCTAssertTrue(card.isPending)
         XCTAssertTrue(card.isPermission)
         XCTAssertEqual(card.allowKey, "Bash:rm")
+        XCTAssertEqual(card.responseBehavior(for: "Allow"), "allow")
+        XCTAssertEqual(card.responseBehavior(for: "Approve"), "allow")
+        XCTAssertEqual(card.responseBehavior(for: "Yes"), "allow")
+        XCTAssertEqual(card.responseBehavior(for: "Always allow"), "allow")
+        XCTAssertEqual(card.responseBehavior(for: "Deny"), "deny")
+        XCTAssertEqual(card.responseBehavior(for: " deny "), "deny")
+        XCTAssertTrue(card.shouldRememberPermission(for: "Always allow"))
+        XCTAssertFalse(card.shouldRememberPermission(for: "Allow"))
+        XCTAssertFalse(card.shouldRememberPermission(for: " deny "))
 
         var answered = card
         answered.answered = "Allow"
@@ -131,6 +288,14 @@ final class DecodingTests: XCTestCase {
         var dismissed = card
         dismissed.dismissed = true
         XCTAssertFalse(dismissed.isPending)
+    }
+
+    func testAQuestionSendsItsChoiceAsAnAnswer() throws {
+        let message = try decode(Message.self, "options-card")
+        let card = try XCTUnwrap(message.card)
+        XCTAssertFalse(card.isPermission)
+        XCTAssertEqual(card.responseBehavior(for: "Anything"), "answer")
+        XCTAssertFalse(card.shouldRememberPermission(for: "Always allow"))
     }
 
     func testDecodesAMessageThatGainedAFieldWeDoNotKnow() throws {
@@ -152,12 +317,40 @@ final class DecodingTests: XCTestCase {
         XCTAssertFalse(paired.serverName.isEmpty)
     }
 
+    func testMalformedAdvisoryEndpointDoesNotDiscardAPairedToken() throws {
+        let json = """
+        {
+          "token":"omb_device",
+          "device":{"id":"d1","name":"Ada's iPhone","createdAt":1,"lastSeenAt":1},
+          "serverName":"Ada's Mac",
+          "hosts":["192.168.1.42"],
+          "endpoints":[
+            {"url":"https://mac.example","kind":"hosted","priority":0},
+            {"url":"https://future.example","kind":"future-transport","priority":10},
+            {"url":"http://192.168.1.42:8810","kind":"lan","priority":200}
+          ]
+        }
+        """
+
+        let paired = try JSONDecoder().decode(PairResponse.self, from: Data(json.utf8))
+
+        XCTAssertEqual(paired.token, "omb_device")
+        XCTAssertEqual(paired.hosts, ["192.168.1.42"])
+        XCTAssertEqual(paired.endpoints?.map(\.kind), [.hosted, .lan])
+    }
+
     func testDecodesTheHarnessErrorBodies() throws {
-        // these strings are written for people, and the client shows them
-        // rather than inventing its own
-        XCTAssertTrue(try decode(APIErrorBody.self, "unauthorized").error.contains("pair"))
+        // These are captured server contracts. Keep them verbatim until the
+        // desktop changes in lockstep; the client passes them through.
+        XCTAssertEqual(
+            try decode(APIErrorBody.self, "unauthorized").error,
+            "pair this device from Phone settings in OpenMausBot on your computer"
+        )
         XCTAssertFalse(try decode(APIErrorBody.self, "forbidden").error.isEmpty)
-        XCTAssertFalse(try decode(APIErrorBody.self, "pair-rejected").error.isEmpty)
+        XCTAssertEqual(
+            try decode(APIErrorBody.self, "pair-rejected").error,
+            "no pairing is in progress — open Phone settings on your computer"
+        )
     }
 
     func testDecodesInstancesAndConfig() throws {
@@ -173,6 +366,14 @@ final class DecodingTests: XCTestCase {
         let config = try decode(ConfigStatus.self, "config")
         XCTAssertEqual(config.profile?.name, "Ada Lovelace")
         XCTAssertEqual(config.box?.configured, false)
+        // Captured bytes, not our idea of them: `describeVoice` always sends
+        // the engine, so a sidecar that stopped forwarding it fails here
+        // instead of quietly sending every built-in-voices user back to an
+        // explanation about an ElevenLabs key. The captured value is stable on
+        // any platform — the fabricated config selects no provider, so the
+        // server's own fallback decides it.
+        XCTAssertEqual(config.tts?.provider, "elevenlabs")
+        XCTAssertEqual(config.voiceProvider, .elevenlabs)
     }
 
     // MARK: - Frames
