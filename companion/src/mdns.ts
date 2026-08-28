@@ -15,7 +15,7 @@
 // network, and the cost of that is a duplicate row in a picker rather than
 // anything broken.
 import { createHash } from "node:crypto";
-import { createSocket, type Socket } from "node:dgram";
+import { createSocket } from "node:dgram";
 import { hostname, networkInterfaces } from "node:os";
 
 import { lanAddresses } from "./listener.ts";
@@ -184,9 +184,48 @@ export function decodeMessage(buf: Buffer): DnsMessage | null {
   }
 }
 
+/**
+ * May this record tell a client to discard what it already holds?
+ *
+ * The cache-flush bit means "everything else you have cached for this name
+ * and type is stale, drop it" (RFC 6762 §10.2), and two rules keep it off a
+ * record here:
+ *
+ * - **Shared records (§10.2).** The PTR of `_openmausbot._tcp.local` is
+ *   shared: every computer running the companion answers that same name with
+ *   its own instance, and the service-type enumeration PTR is shared wider
+ *   still. Flushing one tells the client to throw away the instances the
+ *   other machines advertised, so the bit is forbidden on both.
+ * - **Legacy-unicast replies (§6.7).** They go to a resolver with no mDNS
+ *   cache to invalidate, which reads the top class bit as part of the class,
+ *   so nothing in such a response may carry it.
+ *
+ * The rrtype test below is a shorthand that holds *for the records this file
+ * builds*, and not a general rule: §2 defines shared versus unique over the
+ * RRset, not over the type, so a PTR is not inherently shared nor an SRV
+ * inherently unique. `serviceRecords` emits exactly four RRsets — two shared
+ * PTRs, and SRV/TXT/A on names derived from this machine — and no other
+ * shared type is constructed anywhere here, which is what makes the
+ * shorthand safe. Add a record type and this predicate is the thing to
+ * revisit.
+ *
+ * Nor does "unique" mean *verified* unique: §8.3 and §10.2 want the bit only
+ * on a name defended by probing, and this responder deliberately does not
+ * probe (see the note at the top of this file). Marking SRV/TXT/A is how a
+ * client learns an address changed instead of holding the old one alongside
+ * the new for its TTL — but the claim of sole ownership rests on the hashed
+ * host name, not on §8.1. That gap predates this function and is unchanged
+ * by it; the bit simply stopped going where the RFC forbids it outright.
+ */
+function mayFlush(record: ResourceRecord, legacy: boolean): boolean {
+  return !legacy && record.type !== TYPE.PTR;
+}
+
 /** One resource record on the wire. `ttlOverride` is how a goodbye is sent:
- * the same records, TTL 0, meaning "forget what I told you". */
-function encodeRecord(record: ResourceRecord, ttlOverride?: number): Buffer {
+ * the same records, TTL 0, meaning "forget what I told you". `flush` is the
+ * caller's answer to `mayFlush` — stated at every call site rather than
+ * defaulted, because the default that used to be here was "always". */
+function encodeRecord(record: ResourceRecord, ttlOverride: number | undefined, flush: boolean): Buffer {
   let rdata: Buffer;
   let ttl: number;
   switch (record.type) {
@@ -228,7 +267,7 @@ function encodeRecord(record: ResourceRecord, ttlOverride?: number): Buffer {
   const name = encodeName(record.name);
   const fixed = Buffer.alloc(10);
   fixed.writeUInt16BE(record.type, 0);
-  fixed.writeUInt16BE(CLASS_IN | FLUSH, 2);
+  fixed.writeUInt16BE(flush ? CLASS_IN | FLUSH : CLASS_IN, 2);
   fixed.writeUInt32BE(ttlOverride ?? ttl, 4);
   fixed.writeUInt16BE(rdata.length, 8);
   return Buffer.concat([name, fixed, rdata]);
@@ -237,9 +276,13 @@ function encodeRecord(record: ResourceRecord, ttlOverride?: number): Buffer {
 export function encodeResponse(
   answers: ResourceRecord[],
   additionals: ResourceRecord[] = [],
-  opts: { id?: number; ttl?: number; questions?: Question[] } = {},
+  opts: { id?: number; ttl?: number; questions?: Question[]; legacy?: boolean } = {},
 ): Buffer {
   const questions = opts.questions ?? [];
+  // Carried explicitly rather than inferred from the echoed questions: the
+  // echo is what §6.7 asks for, the flush policy is a separate rule of the
+  // same section, and tying one to the other hides the second.
+  const legacy = opts.legacy ?? false;
   const header = Buffer.alloc(12);
   header.writeUInt16BE(opts.id ?? 0, 0);
   header.writeUInt16BE(0x8400, 2); // QR=1 (response), AA=1 (authoritative)
@@ -258,8 +301,8 @@ export function encodeResponse(
   return Buffer.concat([
     header,
     ...questionBytes,
-    ...answers.map((record) => encodeRecord(record, opts.ttl)),
-    ...additionals.map((record) => encodeRecord(record, opts.ttl)),
+    ...answers.map((record) => encodeRecord(record, opts.ttl, mayFlush(record, legacy))),
+    ...additionals.map((record) => encodeRecord(record, opts.ttl, mayFlush(record, legacy))),
   ]);
 }
 
@@ -424,28 +467,53 @@ export function advertisableAddresses(): string[] {
 
 // ── the responder ──────────────────────────────────────────────────────
 
-/** Bind port and mode. Both exist for tests: the real thing is 5353,
- * multicast, and has no reason to be anything else. */
+/** The slice of `dgram.Socket` the responder drives. A structural seam
+ * rather than the concrete class, because the multicast behaviour that
+ * matters most — every group send pinned to each advertised interface —
+ * is observable only from the socket's side of the call, and CI runners
+ * rarely route multicast at all. The real socket satisfies this shape. */
+export interface ResponderSocket {
+  on(event: "error", listener: (error: Error) => void): void;
+  on(event: "message", listener: (message: Buffer, remote: { address: string; port: number }) => void): void;
+  once(event: "error", listener: (error: Error) => void): void;
+  bind(port: number, callback?: () => void): void;
+  setMulticastTTL(ttl: number): void;
+  addMembership(group: string, membershipInterface?: string): void;
+  setMulticastInterface(multicastInterface: string): void;
+  send(packet: Buffer, port: number, address: string, callback?: (error: Error | null) => void): void;
+  close(callback?: () => void): void;
+  address(): { port: number };
+}
+
+/** Bind port and mode. All of these exist for tests: the real thing is 5353,
+ * multicast, on a real socket, and has no reason to be anything else. */
 export interface ResponderOptions {
   /** Test rigs bind an ephemeral port and skip the group join; the packet
    * handling below is the same code either way. */
   port?: number;
   multicast?: boolean;
+  /** Test rigs substitute a recording socket: interface pinning never
+   * reaches the wire in CI, so the socket is where it can be asserted. */
+  socketFactory?: () => ResponderSocket;
 }
 
 /** A Bonjour responder, small enough to read: it announces one service, and
  * answers questions about that service from the local link. No dependency,
  * because a discovery nicety is not worth a supply chain. */
 export class MdnsResponder {
-  private socket: Socket | null = null;
+  private socket: ResponderSocket | null = null;
   private service: ServiceInfo | null = null;
   private timers: ReturnType<typeof setTimeout>[] = [];
+  /** Multicast sends, strictly one after another — see `send`. */
+  private sendQueue: Promise<void> = Promise.resolve();
   private readonly port: number;
   private readonly multicast: boolean;
+  private readonly socketFactory: () => ResponderSocket;
 
   constructor(options: ResponderOptions = {}) {
     this.port = options.port ?? MDNS_PORT;
     this.multicast = options.multicast ?? true;
+    this.socketFactory = options.socketFactory ?? (() => createSocket({ type: "udp4", reuseAddr: true }));
   }
 
   /** Whether the socket is up. False is normal and not an error. */
@@ -469,7 +537,7 @@ export class MdnsResponder {
     await this.stop();
     if (!service.addresses.length) return false;
 
-    const socket = createSocket({ type: "udp4", reuseAddr: true });
+    const socket = this.socketFactory();
     // Bind errors arrive as events, and an unhandled 'error' on a socket
     // is an uncaught exception that would take the harness with it.
     socket.on("error", () => void this.stop());
@@ -553,7 +621,7 @@ export class MdnsResponder {
         const timer = setTimeout(finish, GOODBYE_FLUSH_MS);
         timer.unref?.();
         try {
-          this.send(socket, encodeResponse(announcement(service), [], { ttl: 0 }), () => {
+          this.send(socket, encodeResponse(announcement(service), [], { ttl: 0 }), service.addresses, () => {
             clearTimeout(timer);
             finish();
           });
@@ -577,7 +645,7 @@ export class MdnsResponder {
   private announce() {
     if (!this.socket || !this.service) return;
     try {
-      this.send(this.socket, encodeResponse(announcement(this.service)));
+      this.send(this.socket, encodeResponse(announcement(this.service)), this.service.addresses);
     } catch {
       /* the interface may have gone away between timer and send */
     }
@@ -605,30 +673,71 @@ export class MdnsResponder {
     const packet = encodeResponse(
       answers,
       additionals,
-      legacy ? { id: message.id, questions: message.questions } : {},
+      legacy ? { id: message.id, questions: message.questions, legacy: true } : {},
     );
     try {
+      // A unicast answer goes back the way the question came — the kernel
+      // routes it like any datagram, and pinning it to an advertised
+      // interface would be exactly wrong. Only group sends are pinned.
       if (unicast) this.socket.send(packet, fromPort, from);
-      else this.send(this.socket, packet);
+      else this.send(this.socket, packet, this.service.addresses);
     } catch {
       /* a send failure is one lost answer; the asker retries */
     }
   }
 
-  /** Multicast a packet to the group.
+  /** Multicast a packet to the group, once per advertised interface.
    *
    * Always to 5353, whatever port this responder is bound to: the destination
    * is where mDNS listens, not where we happen to be. Using the bind port
    * sent announcements to a port with nobody on it — and threw outright when
    * that port was 0, which is what an ephemeral bind gives you.
    *
+   * Once per interface, because a bare group send leaves on whichever single
+   * interface the kernel routes 224.0.0.251 to — with a VPN or a VM bridge
+   * up, that can be a network the phone is not on, and the responder then
+   * believes it is advertising while nobody can hear it. Joining the group
+   * per interface (in `advertise`) only fixes the receive side; the send
+   * side is pinned here with `setMulticastInterface`.
+   *
+   * And strictly serialized, because `setMulticastInterface` redirects every
+   * *subsequent* send on the socket while `send` itself completes a tick
+   * later: two bursts running interleaved could race their pins and both
+   * leave on whichever interface was pinned last. One queue, pin, wait for
+   * the datagram out, pin the next.
+   *
    * Unicast mode has no group to announce to, so there is nothing to send;
    * it exists for tests, which ask directly and are answered in `handle`. */
-  private send(socket: Socket, packet: Buffer, done?: (error: Error | null) => void) {
+  private send(
+    socket: ResponderSocket,
+    packet: Buffer,
+    addresses: string[],
+    done?: (error: Error | null) => void,
+  ) {
     if (!this.multicast) {
       done?.(null);
       return;
     }
-    socket.send(packet, MDNS_PORT, MDNS_ADDRESS, done);
+    this.sendQueue = this.sendQueue.then(async () => {
+      for (const address of addresses) {
+        await new Promise<void>((resolve) => {
+          try {
+            socket.setMulticastInterface(address);
+          } catch {
+            // the interface vanished between enumeration and send — sleep,
+            // VPN drop, cable pulled. Its packet is lost either way; the
+            // remaining interfaces still matter, so skip rather than throw.
+            resolve();
+            return;
+          }
+          try {
+            socket.send(packet, MDNS_PORT, MDNS_ADDRESS, () => resolve());
+          } catch {
+            resolve();
+          }
+        });
+      }
+      done?.(null);
+    });
   }
 }

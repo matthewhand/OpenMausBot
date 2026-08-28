@@ -15,15 +15,26 @@
 import { createServer, type Server, type ServerResponse } from "node:http";
 
 import type { DeviceRegistry } from "./devices.ts";
+import { companionEndpointCandidates, hostedCompanionUrl } from "./endpoints.ts";
 import { lanAddresses, tailnetName, tailscaleAddress } from "./listener.ts";
+import { defaultHostName } from "./mdns.ts";
 
 /** What the pairing page needs to render itself and act on what you click. */
 export interface ControlOptions {
   devices: DeviceRegistry;
   /** Where a phone connects — for display, and for the pairing instructions. */
   companionPort: number;
+  /** Stable HTTPS route provisioned for this computer, when available. */
+  hostedUrl?: () => string | null;
+  /** Electron alone uses this to publish a route after its connector health
+   * check succeeds, and to withdraw it immediately on connector loss. */
+  setHostedUrl?: (url: string | null) => void;
   /** Whether Bonjour came up, and under what name. */
   discovery: () => { advertising: boolean; name: string };
+  /** Device ids with at least one live authenticated event stream. */
+  connectedDeviceIds?: () => string[];
+  /** Terminate every authenticated event stream owned by a revoked device. */
+  disconnectDevice?: (deviceId: string) => void;
 }
 
 /** The host out of a `Host` header, port removed.
@@ -80,6 +91,80 @@ const json = (res: ServerResponse, status: number, body: unknown) => {
   res.end(text);
 };
 
+interface HostedEndpointPayload {
+  url: string | null;
+}
+
+/** The control socket is also used by the packaged Electron app, where the
+ * sidecar runs directly from its compiled output without a node_modules tree.
+ * Keep this tiny wire contract dependency-free and deliberately exact: one
+ * own enumerable `url` property, with no silently discarded extras. */
+const isHostedEndpointPayload = (value: unknown): value is HostedEndpointPayload => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  if (keys.length !== 1 || keys[0] !== "url") return false;
+  const url = (value as { url?: unknown }).url;
+  return url === null || typeof url === "string";
+};
+
+const readHostedEndpoint = (
+  req: import("node:http").IncomingMessage,
+): Promise<HostedEndpointPayload> =>
+  new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > 4096) {
+        reject(new Error("body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("error", reject);
+    req.on("end", () => {
+      try {
+        const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        if (!isHostedEndpointPayload(parsed)) throw new Error("invalid shape");
+        resolve(parsed);
+      } catch {
+        reject(new Error("invalid JSON body"));
+      }
+    });
+  });
+
+const currentHostedUrl = (options: ControlOptions): string | null =>
+  options.hostedUrl?.() ?? null;
+
+/** Every host a phone could dial for this computer, best first.
+ *
+ * One address is one point of failure: a phone paired over the tailnet keeps
+ * a MagicDNS name that stops resolving the moment either device leaves the
+ * tailnet — while the same computer sits reachable on the LAN. Handing the
+ * phone the whole ordered list at pairing time is what lets it walk to the
+ * next candidate instead of failing forever on the first.
+ *
+ * The order is the reachability story: the MagicDNS name works from anywhere
+ * the tailnet does, the LAN addresses work on this network, and the sidecar's
+ * synthetic mDNS name comes last because it only resolves while the sidecar
+ * itself is running. The bare tailnet address is deliberately absent — iOS
+ * refuses plain HTTP to 100.64/10, so it would be a candidate that can never
+ * succeed. */
+export function hostCandidates(
+  addresses: string[] = lanAddresses(),
+  magicDnsName: string | null = tailnetName(),
+): string[] {
+  const tailscale = tailscaleAddress(addresses);
+  const out: string[] = [];
+  if (tailscale && magicDnsName) out.push(magicDnsName);
+  for (const address of addresses) {
+    if (address !== tailscale) out.push(address);
+  }
+  out.push(defaultHostName());
+  return out;
+}
+
 /** Everything the page shows, in one object: where to connect, whether a
  * pairing window is open, and which phones are paired. Recomputed per request
  * rather than cached — addresses change when you join another network. */
@@ -98,8 +183,20 @@ export function companionState(options: ControlOptions) {
     ...(tailscale ? { tailscale } : {}),
     ...(tailscale && name ? { tailnetName: name } : {}),
     lan: addresses.find((a) => a !== tailscale) ?? null,
-    pairing: pairing ? { code: pairing.code, expiresAt: pairing.expiresAt } : null,
+    // The ordered fallback list the pairing QR hands the phone, so it can
+    // walk to the next address when the first stops resolving.
+    hosts: hostCandidates(addresses, name),
+    // Complete URLs for new clients. Unlike `hosts`, this can represent an
+    // HTTPS route on its natural port without teaching the client to guess.
+    endpoints: companionEndpointCandidates(
+      options.companionPort,
+      addresses,
+      name,
+      currentHostedUrl(options),
+    ),
+    pairing: pairing ? { code: pairing.code, token: pairing.token, expiresAt: pairing.expiresAt } : null,
     devices: options.devices.list(),
+    connectedDeviceIds: options.connectedDeviceIds?.() ?? [],
     discovery: options.discovery(),
   };
 }
@@ -109,7 +206,8 @@ export function companionState(options: ControlOptions) {
  * and it refuses anything suggesting it was reached from anywhere else. */
 export function createControlServer(options: ControlOptions): Server {
   return createServer((req, res) => {
-    const path = (req.url ?? "/").split("?")[0];
+    const requestUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+    const path = requestUrl.pathname;
     const method = req.method ?? "GET";
 
     // Belt and braces: this server binds 127.0.0.1, so a non-loopback Host
@@ -163,15 +261,51 @@ export function createControlServer(options: ControlOptions): Server {
     if (method === "GET" && path === "/state") return json(res, 200, companionState(options));
     if (method === "POST" && path === "/pairing") {
       const window = options.devices.openPairing();
-      return json(res, 201, { ...companionState(options), code: window.code });
+      // Keep the freshly issued credentials at the top level as well as in
+      // `pairing`, matching the existing code response and making this write
+      // sufficient for native control clients that do not immediately poll.
+      return json(res, 201, {
+        ...companionState(options),
+        code: window.code,
+        token: window.token,
+      });
     }
     if (method === "DELETE" && path === "/pairing") {
-      options.devices.closePairing();
+      const expectedToken = requestUrl.searchParams.get("expectedToken") ?? undefined;
+      options.devices.closePairing(expectedToken);
+      return json(res, 200, companionState(options));
+    }
+    const updateHostedUrl = options.setHostedUrl;
+    if (method === "PUT" && path === "/hosted-endpoint" && updateHostedUrl) {
+      readHostedEndpoint(req).then(
+        (body) => {
+          try {
+            const requested = body.url == null || body.url === "" ? null : hostedCompanionUrl(body.url);
+            updateHostedUrl(requested);
+            return json(res, 200, companionState(options));
+          } catch {
+            return json(res, 400, { error: "invalid hosted endpoint" });
+          }
+        },
+        (error: Error) => json(res, 400, { error: error.message }),
+      );
+      return;
+    }
+    const cloudDesktop = path.match(/^\/devices\/([\w-]+)\/cloud-desktop$/);
+    if (cloudDesktop && (method === "POST" || method === "DELETE")) {
+      try {
+        if (!options.devices.setCloudDesktopAccess(cloudDesktop[1], method === "POST")) {
+          return json(res, 404, { error: "no such device" });
+        }
+      } catch {
+        return json(res, 500, { error: "could not save cloud desktop access" });
+      }
       return json(res, 200, companionState(options));
     }
     const revoke = path.match(/^\/devices\/([\w-]+)$/);
     if (revoke && method === "DELETE") {
       if (!options.devices.revoke(revoke[1])) return json(res, 404, { error: "no such device" });
+      options.disconnectDevice?.(revoke[1]);
       return json(res, 200, companionState(options));
     }
     return json(res, 404, { error: `no route: ${method} ${path}` });
@@ -272,7 +406,9 @@ function render(s) {
     (s.devices.length
       ? "<ul>" + s.devices.map((d) =>
           "<li><div class='grow'><div class=name>" + esc(d.name) + "</div>" +
-          "<div class=dim>Last seen " + ago(d.lastSeenAt) + "</div></div>" +
+          "<div class=dim>Last seen " + ago(d.lastSeenAt) + "</div>" +
+          "<button data-cloud='" + esc(d.id) + "' data-allowed='" + (d.cloudDesktopAccess ? "1" : "0") + "'>" +
+          (d.cloudDesktopAccess ? "Cloud desktop on" : "Allow cloud desktop") + "</button></div>" +
           "<button data-revoke='" + esc(d.id) + "'>Remove</button></li>").join("") + "</ul>"
       : "<p class=dim>No phones are paired yet.</p>");
 
@@ -280,6 +416,12 @@ function render(s) {
   el("cancel")?.addEventListener("click", async () => render(await api("/pairing", "DELETE")));
   for (const b of document.querySelectorAll("[data-revoke]")) {
     b.addEventListener("click", async () => render(await api("/devices/" + b.dataset.revoke, "DELETE")));
+  }
+  for (const b of document.querySelectorAll("[data-cloud]")) {
+    b.addEventListener("click", async () => render(await api(
+      "/devices/" + b.dataset.cloud + "/cloud-desktop",
+      b.dataset.allowed === "1" ? "DELETE" : "POST"
+    )));
   }
   if (s.pairing) {
     const tick = () => {

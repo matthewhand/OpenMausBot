@@ -39,7 +39,31 @@ pnpm package:mac   # DMG + ZIP; requires Swift/Xcode tools
 pnpm package:linux # Ubuntu x64 .deb + AppImage; no Swift required
 ```
 
+`pnpm dev:desktop` downloads and verifies the pinned Cloudflare Tunnel connector for the current
+platform and architecture before Electron starts. Later launches re-verify and reuse the staged
+binary. Packaging continues to use `pnpm build:cloudflared`, which stages every architecture the
+host's desktop package build requires. To stage only the current development target without
+launching Electron, run `node scripts/prepare-cloudflared.mjs --current`.
+
 For Ubuntu installation and real desktop checks, see [`docs/linux-desktop.md`](docs/linux-desktop.md).
+
+## Ubuntu release checklist
+
+Ubuntu release packages must come from the manual **Package Ubuntu** workflow on an exact release commit or tag,
+not from a developer workstation. The Ubuntu 24.04 runner builds and verifies both formats, launches the unpacked
+app and AppImage, routes `click` and `type_text` through the overlay-free bundled Cua runtime on Xorg, runs the
+fail-closed Wayland CUA smoke,
+and produces one release artifact containing:
+
+- the versioned `.deb` and AppImage;
+- stable `OpenMausBot-amd64.deb` and `OpenMausBot.AppImage` copies used by the latest-download links;
+- `SHA256SUMS-ubuntu-x64.txt` covering both versioned and stable names.
+
+Before publishing, confirm that `package.json` has the release version and dispatch the workflow against the same
+commit used for the other platforms. Attach all five Ubuntu files to the matching release in the separate
+[`openmausbot-releases`](https://github.com/milind-soni/openmausbot-releases) repository. Then verify the checksum
+file and install the `.deb` plus launch the AppImage in a clean Ubuntu 24.04 x86_64 GNOME environment. Never combine
+packages built from different commits under one version.
 
 ## Repo map
 
@@ -94,6 +118,24 @@ The SPI in [`server/contracts.ts`](server/contracts.ts) is deliberately small. A
    failed spawn as a failed turn — never a hang, never a crash.
 5. Bring a contract test following the fake-CLI pattern (scripted fake process + `recordEvents`).
 
+## MCP tool schemas
+
+Tool `inputSchema`s travel through every engine's own MCP-to-provider conversion before a model
+sees them, and those converters are lossy: composition keywords get flattened, dropped, or pruned
+by size-compaction passes (codex only began preserving `oneOf` in mid-2026; others simplify
+harder). A model that never saw your schema's branches guesses shapes forever — that is exactly
+how chat routine proposals failed in the field hours after 0.1.38 shipped (#544).
+
+- **Never use `oneOf`, `anyOf`, `allOf`, `const`, or `format` in a tool `inputSchema`.** Advertise
+  one flat object; put per-variant rules in `description`s. `enum` on plain strings is fine.
+- **Coerce before you reject.** Models stringify nested objects, shorten enum values, and vary
+  case. If an input has one obvious meaning, accept it and normalize on the wire.
+- **Errors must teach.** When you refuse an input, the message states the supported shapes with a
+  literal example the model can copy. "Invalid discriminator value" burns a turn; an example
+  fixes the next call.
+- A schema test should assert the tool surface stays flat
+  (see `server/drivers/agents-proxy.test.ts` — it regexp-guards the serialized schema).
+
 ## Platform rules
 
 - The harness (`server/`) must stay portable Node. Anything macOS-only (TCC, Swift helpers,
@@ -101,8 +143,25 @@ The SPI in [`server/contracts.ts`](server/contracts.ts) is deliberately small. A
 - Renderer code must consume the desktop capability contract rather than infer support from Electron,
   the user agent, or the presence of a preload bridge. Screen preview, dictation, and local control are
   independent capabilities.
-- Test Ubuntu platform claims on a real GNOME session. Xvfb proves packaging and lifecycle, not Wayland
-  portal behavior or local computer control.
+- Test Ubuntu platform claims on a real GNOME session. Xvfb proves packaging and fake-driver orchestration, not
+  Wayland portal behavior or real CUA inspection/input delivery.
+- Linux local control is enabled only on GNOME/Xorg after explicit opt-in. The owned daemon must start with
+  `--no-overlay`: the decorative full-screen Cua cursor surface is not part of the product contract and must never
+  sit between the person and their desktop. GNOME/Wayland must clear a legacy durable opt-in, report
+  `linux-wayland-seat-safety-blocked`, and never start Cua until it independently passes the real-seat matrix in
+  #345. Xvfb proves the overlay-free arguments, lifecycle, and input routing; it does not waive real-seat evidence.
+  An unrelated app must remain clickable/typeable before any approved action. Global opt-in plus per-bot
+  **This computer** remains mandatory; Linux Auto, full-auto/bypass modes, remembered grants, and cloud approvals
+  must never authorize the user's desktop.
+- Keep CUA discovery shell-free and pin accepted archive, inner-file, manifest, and driver contracts. Packaged Linux
+  builds must prefer their reviewed outside-ASAR runtime and fail closed instead of executing ambient PATH code;
+  source/dev builds may use the validated explicit/user-local paths. Never add a runtime downloader/self-updater or
+  silently install GNOME extensions. GNOME/Wayland readiness must require its exact compositor/helper/portal health
+  contract; never infer it from `WAYLAND_DISPLAY` or XWayland.
+- Native release changes must update the checked-in Cua license report/SBOM, preserve MIT/OFL/MPL notices, pass the
+  malicious-archive tests, and prove identical hashes in `linux-unpacked`, `.deb`, and AppImage artifacts. AppImage
+  must additionally prove post-copy hashing in its private `0700` execution stage; never weaken the general path
+  validator to accept a root-owned group-writable SquashFS path when its toolchain emits `0775` rather than `0755`.
 - **Never build command strings for a shell.** No `shell: true`, no spawning through `cmd.exe` with
   quoted strings — model names, personas, and MCP config JSON travel through argv, and cmd.exe
   metacharacter expansion is a real injection class. On Windows, resolve `.cmd` shims to their JS
@@ -126,4 +185,5 @@ responses or events, no baking them into argv where another local process could 
 - [ ] macOS-only code is platform-gated; nothing breaks the packaged app
 - [ ] UI changes include before/after screenshots
 
-By contributing you agree your contributions are licensed under the [MIT License](LICENSE).
+By contributing you agree your contributions are licensed under the
+[Apache License, Version 2.0](LICENSE).

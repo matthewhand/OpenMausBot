@@ -10,9 +10,11 @@ import { peerAllowKey, type PeerAction } from "./peer-approval-key.ts";
 import { DATA_DIR } from "./config.ts";
 import * as mdb from "./message-db.ts";
 import { workspaceDir } from "./workspace.ts";
-import { newId, type ModelSelection, type ThreadId } from "./contracts.ts";
+import { newId, type CloudBackend, type ModelSelection, type ThreadId } from "./contracts.ts";
 import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
+import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
+import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 
 export type MausColor =
   | "green"
@@ -48,6 +50,11 @@ export interface OptionCardData {
   held?: string;
   /** the narrow grant "always allow" remembers, e.g. "Bash:git" */
   allowKey?: string;
+  /** Local actions never share remembered grants with cloud/tool approvals. */
+  approvalScope?: "local-computer";
+  /** A durable chat-created routine proposal. The scheduler only applies it
+   * after this card is explicitly confirmed by the user. */
+  routineRequest?: RoutineRequestCardData;
 }
 
 export interface ConnectorCardData {
@@ -63,13 +70,28 @@ export interface ConnectorCardData {
   resumed?: boolean;
 }
 
+export interface SecretRequestCardData {
+  /** Fixed allowlisted credential id; never an arbitrary config path. */
+  target: import("../shared/credential-request.ts").CredentialTargetId;
+  label: string;
+  description: string;
+  placeholder: string;
+  helpUrl: string;
+  requestKey: string;
+  provided?: boolean;
+  dismissed?: boolean;
+  resumed?: boolean;
+  error?: string;
+}
+
 export interface Message {
   id: string;
   role: "bot" | "user";
-  kind: "text" | "options" | "activity" | "screen" | "connector";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
   card?: OptionCardData;
   connector?: ConnectorCardData;
+  secret?: SecretRequestCardData;
   /** activity messages: tool name + outcome. `spoken` is the same chip as
    * a phrase a voice can read ("reading a file") — computed once here so
    * call mode never has to re-derive it from the raw tool name, and absent
@@ -77,6 +99,10 @@ export interface Message {
   /** `setup` marks an error the user fixes by installing or configuring
    * something — the UI offers setup instead of a retry that cannot work. */
   tool?: { name: string; ok?: boolean; spoken?: string; setup?: boolean };
+  /** user messages sent INTO a running turn (capabilities.queueing): the
+   * model saw it mid-turn, so the transcript marks it — a reader should
+   * know the reply above it may already account for this line */
+  steered?: boolean;
   /** screen messages: a frame of the bot's computer (base64 image) */
   png?: string;
   mime?: string;
@@ -84,6 +110,9 @@ export interface Message {
   /** the message this one follows; null = thread root. Edited messages
    * share a parentId with the version they replace — that's a fork. */
   parentId?: string | null;
+  /** Optional flat reply reference. Unlike parentId this never changes the
+   * conversation branch; it only quotes one earlier text message inline. */
+  replyToId?: string;
   /** group threads: which member said this (sender attribution). */
   from?: { botId: string; name: string; color: string };
   /** emoji reactions; by = "user" or a member botId. */
@@ -96,6 +125,9 @@ export interface Message {
    * them; a true stranded by a restart is inert because the client only
    * shows the affordance while the bot is busy. */
   queued?: boolean;
+  /** steer-queue entry this drained user line came from. The client pending
+   * chip matches on this id, not on equal text. Absent on ordinary sends. */
+  queueId?: string;
 }
 
 export type GroupDefaultResponder =
@@ -103,13 +135,28 @@ export type GroupDefaultResponder =
   | { kind: "everyone" }
   | { kind: "mentions" };
 
+/** One independent conversation inside a user-created channel. Channel
+ * membership and instructions stay on GroupRecord; transcript-bound state
+ * lives here so switching tasks never moves a pin or working directory into
+ * another provider context. */
+export interface GroupTaskRecord {
+  threadId: ThreadId;
+  title: string;
+  createdAt: number;
+  pinnedCwd?: string | null;
+  pinnedMessageId?: string;
+}
+
 /** A room: a shared thread where several bots + the user talk. Plain
  * messages follow `defaultResponder`; explicit @mentions always override it.
  * The bulletin is the room's shared instructions — every member's turn gets
  * it as part of its system prompt. */
 export interface GroupRecord {
   id: string;
+  /** The active task's thread. Direct-message channels remain single-threaded. */
   threadId: ThreadId;
+  /** User-created channels have independent tasks, newest first. */
+  tasks?: GroupTaskRecord[];
   name: string;
   memberIds: string[];
   defaultResponder: GroupDefaultResponder;
@@ -125,10 +172,18 @@ export interface GroupRecord {
    * overriding each member's own folder. The room pins its own copy on its
    * first turn (pinnedCwd). Absent = each member's own default. */
   cwd?: string;
-  /** the folder this room's turns actually run in, pinned on the first
-   * turn that dispatches. null = each member's own default; absent = not
-   * pinned yet. See pinGroupCwd for why it never moves. */
+  /** Compatibility mirror of the active task's pinned folder. */
   pinnedCwd?: string | null;
+  /** Compatibility mirror of the active task's pinned message. */
+  pinnedMessageId?: string;
+  /** sidebar section heading this room is filed under; shares the bots'
+   * namespace so one heading can hold a project's room and its people */
+  section?: string;
+  /** New user-created rooms start with setup pending. Null timestamps are
+   * intentional: records from before room setup has existed omit both keys
+   * and remain immediately usable. */
+  setupCompletedAt?: number | null;
+  setupSkippedAt?: number | null;
 }
 
 /** One task = one conversation with its own context.
@@ -163,6 +218,11 @@ export interface TaskRecord {
 export interface TaskUsage {
   input: number;
   output: number;
+  /** The part of `input` the provider served from its prompt cache — context
+   * the model re-read rather than fresh text. Every turn resends the whole
+   * conversation plus the system prompt and tool schemas, so on a chatty
+   * thread this is most of `input`. Absent on records from older builds. */
+  cachedInput?: number;
   /** null until any turn reports a cost — most engines never do. Records
    * written by builds before cost existed lack the field; read as null. */
   costUsd: number | null;
@@ -185,6 +245,39 @@ function redactBotAuthored<T extends Omit<Message, "id" | "at"> & { at?: number 
     card.title = redactSecretsInText(card.title);
     if (typeof card.subtitle === "string") card.subtitle = redactSecretsInText(card.subtitle);
     if (typeof card.summary === "string") card.summary = redactSecretsInText(card.summary);
+    if (typeof card.held === "string") card.held = redactSecretsInText(card.held);
+    // Routine definitions are executable bot-authored text stored behind the
+    // visible summary. Scrub the durable payload too so nesting it on a card
+    // cannot bypass the transcript's secret-redaction boundary.
+    if (card.routineRequest) {
+      const operation = card.routineRequest.operation;
+      card.routineRequest = {
+        ...card.routineRequest,
+        operation: operation.action === "create"
+          ? {
+              ...operation,
+              routine: {
+                ...operation.routine,
+                name: redactSecretsInText(operation.routine.name),
+                instructions: redactSecretsInText(operation.routine.instructions),
+              },
+            }
+          : operation.action === "update"
+            ? {
+                ...operation,
+                changes: {
+                  ...operation.changes,
+                  ...(typeof operation.changes.name === "string"
+                    ? { name: redactSecretsInText(operation.changes.name) }
+                    : {}),
+                  ...(typeof operation.changes.instructions === "string"
+                    ? { instructions: redactSecretsInText(operation.changes.instructions) }
+                    : {}),
+                },
+              }
+            : { ...operation },
+      };
+    }
     out.card = card;
   }
   if (out.connector) {
@@ -193,6 +286,14 @@ function redactBotAuthored<T extends Omit<Message, "id" | "at"> & { at?: number 
       label: redactSecretsInText(out.connector.label),
       description: redactSecretsInText(out.connector.description),
       error: out.connector.error ? redactSecretsInText(out.connector.error) : undefined,
+    };
+  }
+  if (out.secret) {
+    out.secret = {
+      ...out.secret,
+      label: redactSecretsInText(out.secret.label),
+      description: redactSecretsInText(out.secret.description),
+      error: out.secret.error ? redactSecretsInText(out.secret.error) : undefined,
     };
   }
   return out;
@@ -213,6 +314,7 @@ export type StoreChange =
   | { type: "message"; threadId: string; message: Message }
   | { type: "message.patch"; threadId: string; message: Message }
   | { type: "thread"; threadId: string; activeLeafId: string }
+  | { type: "thread.deleted"; threadId: string }
   | { type: "bot"; botId: string }
   | { type: "bot.deleted"; botId: string }
   | { type: "group"; groupId: string }
@@ -239,6 +341,10 @@ export interface BotRecord {
   notifications: boolean;
   color: MausColor;
   mascotExpression?: MausExpression | null;
+  /** App-owned attachment served as this bot's custom profile image. */
+  avatarUrl?: string;
+  /** Mascot, or the crop applied to avatarUrl. */
+  avatarCrop?: BotAvatarCrop;
   unread: boolean;
   modelSelection: ModelSelection;
   /** provider-native continuation per instance (e.g. claude session id) */
@@ -246,6 +352,11 @@ export interface BotRecord {
   /** which computer the bot acts on: its cloud box, this Mac (local CUA),
    * or none. Unset = auto (box when it exists, else local when available). */
   computer?: "cloud" | "vm" | "local" | "off";
+  /** Which cloud computer backs `computer: "cloud"`; absent means Box. */
+  cloudBackend?: CloudBackend;
+  /** Auto mode may prepare/start this bot's managed VPS container. Off by
+   * default because starting remote infrastructure is an external action. */
+  autoStartVps?: boolean;
   /** where NEW tasks run their shell tools; each task pins its own copy
    * on its first turn (TaskRecord.cwd). Absent = the home folder. */
   cwd?: string;
@@ -253,6 +364,9 @@ export interface BotRecord {
    * working instead of stopping to ask. Questions it asks YOU still come
    * through, and a short list of destructive commands still stops it. */
   autoApprove?: boolean;
+  /** Optional model review of otherwise undecided, attended approval cards.
+   * Unknown persisted values are treated as off by the review boundary. */
+  autoReview?: "off" | "shadow" | "enforce";
   /** Tools this bot may always use without asking, even outside auto mode
    * (set by "Always allow" on an approval card). */
   alwaysAllow?: string[];
@@ -269,8 +383,13 @@ export interface BotRecord {
   rewound?: boolean;
   pinned?: boolean;
   hidden?: boolean;
-  /** The single workspace-wide coordinator. The store enforces that at
-   * most one bot owns this role, even if an older/corrupt file says more. */
+  /** Optional labeled divider used to organize this bot in the sidebar. */
+  section?: string;
+  /** the one message pinned to the top of this bot's active thread; a pin
+   * that no longer resolves (branch switched away, deleted) renders nothing */
+  pinnedMessageId?: string;
+  /** The coordinator for this bot's sidebar section. The store enforces
+   * at most one Chief per section (including the unsectioned area). */
   chiefOfStaff?: boolean;
   /** Pause for human approval before this bot talks to a peer (ask_bot,
    * delegate_bot). Off by default: a chief-of-staff-style bot is most
@@ -282,6 +401,12 @@ export interface BotRecord {
    * start false — a shared persona must not reach the user's Gmail on
    * turn one. */
   composio?: boolean;
+  /** Public, package-authored playbooks installed for this bot. They carry
+   * process guidance only—never executable code, credentials, or grants. */
+  playbooks?: InstalledPlaybook[];
+  /** Listing provenance and connector intent retained for package details
+   * and future re-export. It never means the apps are authorized. */
+  installedPackage?: InstalledPackageMetadata;
   /** Derived from `activity` — kept so the 200+ readers across the app and
    * tests keep working unchanged. Write through setActivity(), never here. */
   busy?: boolean;
@@ -290,6 +415,21 @@ export interface BotRecord {
    * Transient like busy: reset to idle on load. */
   activity?: BotActivity;
   createdAt: number;
+}
+
+export interface InstalledPlaybook {
+  key: string;
+  name: string;
+  summary: string;
+  triggers: string[];
+  instructions: string;
+}
+
+export interface InstalledPackageMetadata {
+  id: string;
+  name: string;
+  release: string;
+  requiredApps: Array<{ slug: string; label: string; reason: string; optional?: boolean }>;
 }
 
 const BOTS_FILE = join(DATA_DIR, "bots.json");
@@ -308,6 +448,10 @@ const COLORS: MausColor[] = [
   "teal",
   "coral",
 ];
+
+/** Sections are persisted as display labels, so exact trimmed labels are
+ * their identity. Missing/blank means the unsectioned (General) team. */
+export const sectionKey = (section?: string | null): string => section?.trim() || "";
 
 /** Resolve @mentions in a message against a bot roster: `@` must start a
  * word, the name must end on a word boundary (so "@New Bottle" never matches
@@ -415,7 +559,7 @@ export class Store {
     // busy never survives a restart — no turn does either. Rooms saved
     // before default responders existed adopt their first member as lead.
     let botsMigrated = false;
-    let chiefSeen = false;
+    const chiefSectionsSeen = new Set<string>();
     let groupsMigrated = false;
     for (const b of this.bots) {
       // transient state never survives a restart — and if a previous
@@ -424,11 +568,29 @@ export class Store {
       if (b.busy || (b.activity !== undefined && b.activity !== "idle")) botsMigrated = true;
       b.busy = false;
       b.activity = "idle";
+      if (b.cloudBackend !== undefined && b.cloudBackend !== "box" && b.cloudBackend !== "vps") {
+        delete b.cloudBackend;
+        botsMigrated = true;
+      }
+      if (b.autoStartVps !== undefined && b.autoStartVps !== true && b.autoStartVps !== false) {
+        delete b.autoStartVps;
+        botsMigrated = true;
+      }
+      const avatar = botAvatarProfile(b);
+      if (b.avatarUrl !== undefined && avatar.avatarUrl !== b.avatarUrl) {
+        delete b.avatarUrl;
+        botsMigrated = true;
+      }
+      if (b.avatarCrop !== undefined && avatar.avatarCrop !== b.avatarCrop) {
+        delete b.avatarCrop;
+        botsMigrated = true;
+      }
     }
     for (const b of this.bots) {
       if (!b.chiefOfStaff) continue;
-      if (!chiefSeen) {
-        chiefSeen = true;
+      const key = sectionKey(b.section);
+      if (!chiefSectionsSeen.has(key)) {
+        chiefSectionsSeen.add(key);
         if (b.hidden) {
           b.hidden = false;
           botsMigrated = true;
@@ -462,6 +624,36 @@ export class Store {
       const normalized = normalizeGroupDefaultResponder(g.defaultResponder, g.memberIds, Boolean(g.dm));
       if (JSON.stringify(normalized) !== JSON.stringify(g.defaultResponder)) groupsMigrated = true;
       g.defaultResponder = normalized;
+      // Bot-to-bot channels intentionally remain one canonical thread.
+      if (g.dm) {
+        if (g.tasks !== undefined) {
+          delete g.tasks;
+          groupsMigrated = true;
+        }
+        continue;
+      }
+      if (!g.tasks?.length) {
+        g.tasks = [
+          {
+            threadId: g.threadId,
+            title: this.firstUserLine(g.threadId) ?? UNTITLED_TASK,
+            createdAt: g.createdAt,
+            ...(g.pinnedCwd !== undefined ? { pinnedCwd: g.pinnedCwd } : {}),
+            ...(g.pinnedMessageId ? { pinnedMessageId: g.pinnedMessageId } : {}),
+          },
+        ];
+        groupsMigrated = true;
+      }
+      // Repair a malformed/stale active pointer conservatively. Every task
+      // transcript is retained; the newest known task becomes active.
+      let active = g.tasks.find((task) => task.threadId === g.threadId);
+      if (!active) {
+        active = g.tasks[0]!;
+        g.threadId = active.threadId;
+        groupsMigrated = true;
+      }
+      g.pinnedCwd = active.pinnedCwd;
+      g.pinnedMessageId = active.pinnedMessageId;
     }
     if (botsMigrated) this.saveBots();
     if (groupsMigrated) this.saveGroups();
@@ -483,7 +675,7 @@ export class Store {
     // pending JSON files are touched; already-migrated threads stay lazy.
     const knownThreads = new Set([
       ...this.bots.flatMap((b) => [b.threadId, ...(b.tasks ?? []).map((task) => task.threadId)]),
-      ...this.groups.map((group) => group.threadId),
+      ...this.groups.flatMap((group) => [group.threadId, ...(group.tasks ?? []).map((task) => task.threadId)]),
     ]);
     for (const threadId of knownThreads) {
       const legacyFile = messagesFile(threadId);
@@ -522,21 +714,47 @@ export class Store {
   }
 
   groupByThread(threadId: string): GroupRecord | undefined {
-    return this.groups.find((g) => g.threadId === threadId);
+    return this.groups.find(
+      (group) => group.threadId === threadId || group.tasks?.some((task) => task.threadId === threadId),
+    );
   }
 
-  createGroup(name: string, memberIds: string[], dm = false): GroupRecord {
+  createGroup(
+    name: string,
+    memberIds: string[],
+    dm = false,
+    section?: string,
+    setup?: {
+      bulletin?: string;
+      defaultResponder?: GroupDefaultResponder;
+      completed?: boolean;
+    },
+  ): GroupRecord {
+    const threadId = newId();
+    const createdAt = Date.now();
     const group: GroupRecord = {
       id: newId(),
-      threadId: newId(),
+      threadId,
+      ...(dm
+        ? {}
+        : { tasks: [{ threadId, title: UNTITLED_TASK, createdAt }] }),
       name,
       memberIds,
-      defaultResponder: dm ? { kind: "mentions" } : { kind: "member", botId: memberIds[0] },
-      bulletin: "",
+      defaultResponder: dm
+        ? { kind: "mentions" }
+        : normalizeGroupDefaultResponder(setup?.defaultResponder, memberIds, false),
+      bulletin: setup?.bulletin ?? "",
       unread: false,
-      createdAt: Date.now(),
+      createdAt,
       dm: dm || undefined,
       busyBotId: null,
+      section,
+      ...(dm
+        ? {}
+        : {
+            setupCompletedAt: setup?.completed ? createdAt : null,
+            setupSkippedAt: null,
+          }),
     };
     this.groups.unshift(group);
     this.saveGroups();
@@ -551,10 +769,14 @@ export class Store {
     );
   }
 
-  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd">>): GroupRecord | null {
+  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd" | "pinnedMessageId" | "section" | "setupCompletedAt" | "setupSkippedAt">>): GroupRecord | null {
     const group = this.group(id);
     if (!group) return null;
     Object.assign(group, patch);
+    if (!group.dm && Object.prototype.hasOwnProperty.call(patch, "pinnedMessageId")) {
+      const active = this.activeGroupTask(group.id);
+      if (active) active.pinnedMessageId = patch.pinnedMessageId;
+    }
     group.defaultResponder = normalizeGroupDefaultResponder(
       group.defaultResponder,
       group.memberIds,
@@ -574,6 +796,7 @@ export class Store {
         unlinkSync(file);
       } catch {}
     }
+    this.emit({ type: "thread.deleted", threadId });
   }
 
   deleteGroup(id: string): boolean {
@@ -581,9 +804,91 @@ export class Store {
     if (!group) return false;
     this.groups = this.groups.filter((g) => g.id !== id);
     this.saveGroups();
-    this.deleteThreadRecord(group.threadId);
+    for (const threadId of new Set([group.threadId, ...(group.tasks ?? []).map((task) => task.threadId)])) {
+      this.deleteThreadRecord(threadId);
+    }
     this.emit({ type: "group.deleted", groupId: id });
     return true;
+  }
+
+  // ── channel tasks ────────────────────────────────────────────────────
+  groupTasks(groupId: string): GroupTaskRecord[] {
+    const group = this.group(groupId);
+    return group?.dm ? [] : (group?.tasks ?? []);
+  }
+
+  activeGroupTask(groupId: string): GroupTaskRecord | undefined {
+    const group = this.group(groupId);
+    return group?.tasks?.find((task) => task.threadId === group.threadId);
+  }
+
+  groupTaskByThread(groupId: string, threadId: string): GroupTaskRecord | undefined {
+    const group = this.group(groupId);
+    if (!group || group.dm) return undefined;
+    return group.tasks?.find((task) => task.threadId === threadId);
+  }
+
+  createGroupTask(groupId: string, title?: string): GroupTaskRecord | null {
+    const group = this.group(groupId);
+    if (!group || group.dm) return null;
+    const task: GroupTaskRecord = {
+      threadId: newId(),
+      title: title?.trim() || UNTITLED_TASK,
+      createdAt: Date.now(),
+    };
+    group.tasks = [task, ...(group.tasks ?? [])];
+    group.threadId = task.threadId;
+    group.pinnedCwd = undefined;
+    group.pinnedMessageId = undefined;
+    this.saveGroups();
+    this.emit({ type: "group", groupId });
+    return task;
+  }
+
+  switchGroupTask(groupId: string, threadId: string): GroupRecord | null {
+    const group = this.group(groupId);
+    const task = group?.tasks?.find((candidate) => candidate.threadId === threadId);
+    if (!group || group.dm || !task) return null;
+    group.threadId = task.threadId;
+    group.pinnedCwd = task.pinnedCwd;
+    group.pinnedMessageId = task.pinnedMessageId;
+    this.saveGroups();
+    this.emit({ type: "group", groupId });
+    return group;
+  }
+
+  renameGroupTask(groupId: string, threadId: string, title: string): GroupTaskRecord | null {
+    const task = this.groupTaskByThread(groupId, threadId);
+    if (!task) return null;
+    task.title = title.trim().slice(0, 80) || UNTITLED_TASK;
+    this.saveGroups();
+    this.emit({ type: "group", groupId });
+    return task;
+  }
+
+  titleGroupTaskFromFirstMessage(groupId: string, text: string, threadId?: string) {
+    const task = threadId ? this.groupTaskByThread(groupId, threadId) : this.activeGroupTask(groupId);
+    if (!task || task.title !== UNTITLED_TASK) return;
+    task.title = titleFromMessage(text);
+    this.saveGroups();
+    this.emit({ type: "group", groupId });
+  }
+
+  deleteGroupTask(groupId: string, threadId: string): GroupRecord | null {
+    const group = this.group(groupId);
+    if (!group || group.dm || !group.tasks || group.tasks.length < 2) return null;
+    if (!group.tasks.some((task) => task.threadId === threadId)) return null;
+    group.tasks = group.tasks.filter((task) => task.threadId !== threadId);
+    this.deleteThreadRecord(threadId);
+    if (group.threadId === threadId) {
+      const next = group.tasks[0]!;
+      group.threadId = next.threadId;
+      group.pinnedCwd = next.pinnedCwd;
+      group.pinnedMessageId = next.pinnedMessageId;
+    }
+    this.saveGroups();
+    this.emit({ type: "group", groupId });
+    return group;
   }
 
   /** Toggle an emoji reaction on a message ("user" or a member botId). */
@@ -649,7 +954,21 @@ export class Store {
       }
     }
     this.emit({ type: "message", threadId, message: full });
+    // The first-run quiz is not a live ask. Talking past it hides it so the
+    // transcript is just the greeting plus what they said. Cards with a
+    // requestId are permission/question prompts and stay until answered.
+    if (full.role === "user" && full.kind === "text") this.dismissOnboardingCard(threadId);
     return full;
+  }
+
+  /** Hide the first-run quiz on this thread, if it is still open. */
+  dismissOnboardingCard(threadId: string): Message | null {
+    const t = this.thread(threadId);
+    const card = t.messages.find(
+      (message) => message.kind === "options" && message.card && !message.card.requestId && !message.card.dismissed,
+    );
+    if (!card?.card) return null;
+    return this.patchMessage(threadId, card.id, { card: { ...card.card, dismissed: true } });
   }
 
   /** Screen frames are ~100-500KB of base64 each; keeping every frame of a
@@ -686,6 +1005,7 @@ export class Store {
       kind: "text",
       text,
       parentId: source.parentId ?? null,
+      replyToId: source.replyToId,
     };
     t.messages.push(full);
     t.activeLeafId = full.id;
@@ -731,7 +1051,7 @@ export class Store {
 
   createBot(
     profile: Partial<
-      Pick<BotRecord, "name" | "title" | "description" | "color" | "mascotExpression" | "modelSelection">
+      Pick<BotRecord, "name" | "title" | "description" | "color" | "mascotExpression" | "modelSelection" | "section">
     > = {},
     opts: {
       /** false = no greeting/onboarding seed. Imported bots must not open
@@ -740,6 +1060,7 @@ export class Store {
     } = {},
   ): BotRecord {
     const name = profile.name?.trim() || pickBotName(this.bots.map((b) => b.name));
+    const section = sectionKey(profile.section);
     const bot: BotRecord = {
       id: newId(),
       threadId: newId(),
@@ -754,6 +1075,7 @@ export class Store {
       resumeCursors: {},
       createdAt: Date.now(),
     };
+    if (section) bot.section = section;
     bot.tasks = [{ threadId: bot.threadId, title: UNTITLED_TASK, createdAt: bot.createdAt, resumeCursors: {} }];
     this.bots.unshift(bot);
     this.saveBots();
@@ -812,18 +1134,21 @@ export class Store {
     return bot;
   }
 
-  /** Elect one Chief of Staff (or clear the role) as one persisted change.
+  /** Elect one Chief of Staff in its section (or clear one section) as one persisted change.
    * The changed records are returned so the server can update every open
    * window, including the bot that just handed the role over. */
-  setChiefOfStaff(id: string | null): BotRecord[] | null {
-    if (id && !this.bot(id)) return null;
+  setChiefOfStaff(id: string | null, section?: string | null): BotRecord[] | null {
+    const selected = id ? this.bot(id) : null;
+    if (id && !selected) return null;
+    const targetSection = sectionKey(selected?.section ?? section);
     const changed: BotRecord[] = [];
     for (const bot of this.bots) {
+      if (sectionKey(bot.section) !== targetSection) continue;
       const next = bot.id === id;
       if (Boolean(bot.chiefOfStaff) === next && !(next && bot.hidden)) continue;
       if (next) {
         bot.chiefOfStaff = true;
-        // The workspace's main contact must stay reachable in the sidebar.
+        // A section's main contact must stay reachable in the sidebar.
         bot.hidden = false;
       } else {
         bot.chiefOfStaff = false;
@@ -864,7 +1189,7 @@ export class Store {
   addTaskUsage(
     botId: string,
     threadId: string,
-    turn: { input?: number; output?: number; costUsd: number | null },
+    turn: { input?: number; output?: number; cachedInput?: number; costUsd: number | null },
   ): TaskUsage | null {
     const task = this.taskByThread(botId, threadId);
     if (!task) return null;
@@ -874,9 +1199,17 @@ export class Store {
     // providers occasionally report NaN or a negative on a partial turn —
     // never let that poison a running tally
     const clean = (n: number | undefined) => (typeof n === "number" && Number.isFinite(n) ? Math.max(0, Math.trunc(n)) : 0);
+    // the cached share exists on a record only once a driver has reported
+    // it — a driver that never does leaves the record shaped as before
+    const cachedKnown = typeof prev.cachedInput === "number" || typeof turn.cachedInput === "number";
+    const prevInput = clean(prev.input);
+    const turnInput = clean(turn.input);
+    const nextCachedInput = Math.min(clean(prev.cachedInput), prevInput)
+      + Math.min(clean(turn.cachedInput), turnInput);
     task.usage = {
-      input: prev.input + clean(turn.input),
+      input: prevInput + turnInput,
       output: prev.output + clean(turn.output),
+      ...(cachedKnown ? { cachedInput: nextCachedInput } : {}),
       costUsd: cost === null ? prevCost : (prevCost ?? 0) + cost,
       turns: prev.turns + 1,
     };
@@ -917,15 +1250,27 @@ export class Store {
    * future rooms, never under a room that already started working
    * somewhere. Returns the pinned value: a path, or null = each member's
    * own default. */
-  pinGroupCwd(groupId: string): string | null {
+  pinGroupCwd(groupId: string, threadId?: string): string | null {
     const group = this.group(groupId);
     if (!group) return null;
-    if (group.pinnedCwd === undefined) {
-      group.pinnedCwd = group.cwd ?? null;
+    const task = threadId ? this.groupTaskByThread(groupId, threadId) : this.activeGroupTask(groupId);
+    // Direct-message channels retain the original single-thread contract.
+    if (!task) {
+      if (!group.dm) return null;
+      if (group.pinnedCwd === undefined) {
+        group.pinnedCwd = group.cwd ?? null;
+        this.saveGroups();
+        this.emit({ type: "group", groupId: group.id });
+      }
+      return group.pinnedCwd;
+    }
+    if (task.pinnedCwd === undefined) {
+      task.pinnedCwd = group.cwd ?? null;
+      if (group.threadId === task.threadId) group.pinnedCwd = task.pinnedCwd;
       this.saveGroups();
       this.emit({ type: "group", groupId: group.id });
     }
-    return group.pinnedCwd;
+    return task.pinnedCwd;
   }
 
   // ── tasks ─────────────────────────────────────────────────────────────

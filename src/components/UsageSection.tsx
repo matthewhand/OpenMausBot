@@ -5,7 +5,7 @@
 import { useStore } from "@/state/store";
 import { MausAvatar } from "./Avatar";
 import { Card } from "./SettingsPrimitives";
-import { botUsage, costCaption, formatTokens, formatUsd, sumUsage } from "@/lib/usage";
+import { botUsage, cachedInput, costCaption, formatTokens, formatUsd, hasFiniteCost, sumUsage, usageDetail } from "@/lib/usage";
 
 export function UsageSection() {
   const { state } = useStore();
@@ -17,8 +17,12 @@ export function UsageSection() {
       return { bot, usage, billing: instance?.snapshot.billing };
     })
     .filter((r) => r.usage.turns > 0)
-    // money first, then volume
-    .sort((a, b) => (b.usage.costUsd ?? -1) - (a.usage.costUsd ?? -1) || b.usage.input + b.usage.output - (a.usage.input + a.usage.output));
+    // money first, then volume. Non-finite/missing costs sort last.
+    .sort((a, b) => {
+      const costOf = (value: number | null | undefined) =>
+        hasFiniteCost(value) ? value : Number.NEGATIVE_INFINITY;
+      return costOf(b.usage.costUsd) - costOf(a.usage.costUsd) || b.usage.input + b.usage.output - (a.usage.input + a.usage.output);
+    });
   const total = sumUsage(rows.map((r) => r.usage));
   const billings = new Set(rows.map((r) => r.billing));
 
@@ -41,19 +45,26 @@ export function UsageSection() {
                 <span className="truncate">{bot.name}</span>
               </span>
               <span className="text-right tabular-nums text-ink-secondary">{usage.turns}</span>
-              <span className="text-right tabular-nums text-ink" title={`${formatTokens(usage.input)} in · ${formatTokens(usage.output)} out`}>
+              <span className="text-right tabular-nums text-ink" title={usageDetail(usage)}>
                 {formatTokens(usage.input + usage.output)}
               </span>
-              <span className="text-right tabular-nums text-ink">{usage.costUsd === null ? <span className="text-ink-secondary">—</span> : formatUsd(usage.costUsd)}</span>
+              <span className="text-right tabular-nums text-ink">{hasFiniteCost(usage.costUsd) ? formatUsd(usage.costUsd) : <span className="text-ink-secondary">—</span>}</span>
             </div>
           ))}
           <div className="grid grid-cols-[1fr_auto_auto_auto] items-center gap-x-5 pt-2.5 text-[13px] font-medium text-ink">
             <span>All bots</span>
             <span className="text-right tabular-nums">{total.turns}</span>
-            <span className="text-right tabular-nums">{formatTokens(total.input + total.output)}</span>
-            <span className="text-right tabular-nums">{total.costUsd === null ? "—" : formatUsd(total.costUsd)}</span>
+            <span className="text-right tabular-nums" title={usageDetail(total)}>{formatTokens(total.input + total.output)}</span>
+            <span className="text-right tabular-nums">{hasFiniteCost(total.costUsd) ? formatUsd(total.costUsd) : "—"}</span>
           </div>
-          {total.costUsd !== null && (
+          {cachedInput(total) > 0 && (
+            <div className="mt-3 text-[12px] leading-relaxed text-ink-secondary">
+              Tokens count everything the model read and wrote. Each turn resends the whole conversation with the system prompt and tool
+              schemas, so {formatTokens(cachedInput(total))} of the input was context re-read from the provider's cache rather than new text —
+              hover a figure for the split.
+            </div>
+          )}
+          {hasFiniteCost(total.costUsd) && (
             <div className="mt-3 text-[12px] leading-relaxed text-ink-secondary">
               Cost is {billings.size === 1 ? costCaption([...billings][0]) : "as each engine reports it — on a subscription it's an equivalent, not a charge"}.
             </div>
