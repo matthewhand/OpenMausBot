@@ -1446,7 +1446,7 @@ bus.subscribe((event: RuntimeEvent) => {
           const existing = store.messagesFor(event.threadId).find((m) => m.id === messageId)?.tool;
           toolName = existing?.name ?? "tool";
           store.patchMessage(event.threadId, messageId, {
-            tool: { name: toolName, ok: event.ok, spoken: existing?.spoken },
+            tool: { name: toolName, ok: event.ok, spoken: existing?.spoken, itemId: existing?.itemId ?? event.itemId },
           });
           toolMessageByItem.delete(itemKey);
         }
@@ -1471,7 +1471,7 @@ bus.subscribe((event: RuntimeEvent) => {
         const message = pushMessage({
           role: "bot",
           kind: "activity",
-          tool: { name, spoken: narrateTool(name) ?? undefined },
+          tool: { name, spoken: narrateTool(name) ?? undefined, itemId: event.itemId },
         });
         if (event.itemId) toolMessageByItem.set(`${event.threadId}:${event.itemId}`, message.id);
       }

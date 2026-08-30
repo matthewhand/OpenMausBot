@@ -176,6 +176,66 @@ export function toRows(entries: InspectorEntry[]): InspectorRow[] {
   return rows;
 }
 
+export type InspectorToolFocus = {
+  itemId?: string;
+  toolName: string;
+  at?: number;
+};
+
+function runtimeEvent(row: InspectorRow): RuntimeEvent | undefined {
+  if (row.kind !== "runtime" || Array.isArray(row.data)) return undefined;
+  return row.data as RuntimeEvent;
+}
+
+function nativeRecord(row: InspectorRow): NativeRecord | undefined {
+  if (row.kind !== "native") return undefined;
+  return row.data as NativeRecord;
+}
+
+function toolNameMatches(candidate: string | undefined, toolName: string): boolean {
+  const have = oneLine(candidate ?? "").toLowerCase();
+  const want = oneLine(toolName).toLowerCase();
+  if (!have || !want) return false;
+  return have === want || have.includes(want) || want.includes(have);
+}
+
+function nativeLooksLikeTool(record: NativeRecord, focus: InspectorToolFocus): boolean {
+  const blob = JSON.stringify(record.msg ?? "").toLowerCase();
+  if (focus.itemId && blob.includes(focus.itemId.toLowerCase())) return true;
+  const want = oneLine(focus.toolName).toLowerCase();
+  if (!want) return false;
+  return (
+    blob.includes("tool_call") ||
+    blob.includes("tool_use") ||
+    blob.includes("commandexecution") ||
+    blob.includes("mcptoolcall")
+  ) && blob.includes(want);
+}
+
+/** Pick the inspector row a tool chip should expand: the runtime item for
+ * that tool, or the native protocol line if Events has nothing to show. */
+export function matchInspectorTool(
+  rows: InspectorRow[],
+  focus: InspectorToolFocus,
+): { row: InspectorRow; lens: "events" | "raw" } | null {
+  const runtime = rows.filter((row) => {
+    const event = runtimeEvent(row);
+    if (!event || event.itemType !== "tool") return false;
+    if (focus.itemId && event.itemId === focus.itemId) return true;
+    if (event.type === "item.started") return toolNameMatches(event.title, focus.toolName);
+    return false;
+  });
+  const started = runtime.find((row) => runtimeEvent(row)?.type === "item.started");
+  if (started) return { row: started, lens: "events" };
+  if (runtime[0]) return { row: runtime[0], lens: "events" };
+
+  const native = rows.find((row) => {
+    const record = nativeRecord(row);
+    return record ? nativeLooksLikeTool(record, focus) : false;
+  });
+  return native ? { row: native, lens: "raw" } : null;
+}
+
 export function formatTime(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "--:--:--";

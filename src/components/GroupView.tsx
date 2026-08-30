@@ -3,7 +3,7 @@
 // does not become a wall of competing motion. Plain messages go to the room's
 // default responder; @mentions override that routing.
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, Check, ChevronDown, Folder, FolderOpen, Loader2, MessageSquareReply, Pin, PinOff, Plus, Search, X } from "lucide-react";
+import { ArrowDown, Check, ChevronDown, ChevronRight, Folder, FolderOpen, Loader2, MessageSquareReply, Pin, PinOff, Plus, Search, X } from "lucide-react";
 import {
   api,
   useStore,
@@ -66,20 +66,35 @@ function dayLabel(at: number): string {
 }
 
 /** One finished tool step in a room. Same pill the 1:1 chat uses, minus the
- * status glyph — a room reads as a conversation, not a build log. */
-function RoomToolChip({ message }: { message: Message }) {
+ * status glyph — a room reads as a conversation, not a build log. Click
+ * opens the Inspector on that tool's runtime event (or the raw line). */
+function RoomToolChip({ message, threadId }: { message: Message; threadId: string }) {
+  const { dispatch } = useStore();
+  if (isCommChipMessage(message)) return <CommChip message={message} />;
   const tool = message.tool;
   if (!tool) return null;
   return (
     <div className="flex justify-start">
-      <div
+      <button
+        type="button"
+        onClick={() =>
+          dispatch({
+            type: "focusInspector",
+            threadId,
+            itemId: tool.itemId,
+            toolName: tool.name,
+            at: message.at,
+          })
+        }
+        title={`Inspect ${tool.name}`}
         className={cn(
-          "flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px]",
+          "flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px] hover:bg-raised hover:text-ink",
           tool.ok === false ? "text-danger" : "text-ink-secondary",
         )}
       >
         <span className="max-w-[480px] truncate font-mono">{tool.name}</span>
-      </div>
+        <ChevronRight size={13} />
+      </button>
     </div>
   );
 }
@@ -171,7 +186,7 @@ const Transcript = memo(function Transcript({
               <ActivityRun messages={item.messages} forceOpen={item.messages.some((step) => step.id === focusedId)}>
                 {item.messages.map((step) => (
                   <div key={step.id} className="contents" data-mid={step.id}>
-                    <RoomToolChip message={step} />
+                    <RoomToolChip message={step} threadId={group.threadId} />
                   </div>
                 ))}
               </ActivityRun>
@@ -215,7 +230,7 @@ const Transcript = memo(function Transcript({
             <CommChip message={m} />
           ) : m.kind === "activity" && m.tool ? (
             m.tool.ok === false || m.tool.name.startsWith("error:") || showToolCalls ? (
-              <RoomToolChip message={m} />
+              <RoomToolChip message={m} threadId={group.threadId} />
             ) : null
           ) : m.kind === "text" && m.text ? (
             <div className={cn("group flex w-full flex-col", user ? "items-end" : "items-start")}>

@@ -86,7 +86,7 @@ export interface Message {
   /** activity messages: tool name + outcome. `spoken` is the server's
    * narration of the same chip ("reading a file"), used by call mode. */
   /** `setup` marks an error fixed by installing something, not by retrying. */
-  tool?: { name: string; ok?: boolean; spoken?: string; setup?: boolean };
+  tool?: { name: string; ok?: boolean; spoken?: string; setup?: boolean; itemId?: string };
   /** user messages sent into a running turn — the model saw it mid-turn */
   steered?: boolean;
   /** screen messages: a frame of the bot's computer (base64) */
@@ -425,6 +425,15 @@ export interface AppState {
   /** a search hit to scroll to once its thread is on screen; nonce lets the
    * same message be focused twice in a row */
   focusMessage: { threadId: string; messageId: string; nonce: number; consumed: boolean } | null;
+  /** Jump the Inspector to a tool call from a transcript chip. */
+  focusInspector: {
+    threadId: string;
+    itemId?: string;
+    toolName: string;
+    at: number;
+    nonce: number;
+    consumed: boolean;
+  } | null;
   connected: boolean;
   error: string | null;
   mascotMotion: {
@@ -599,6 +608,14 @@ export type Action =
   | { type: "toggleInspector"; open?: boolean }
   | { type: "focusMessage"; threadId: string; messageId: string }
   | { type: "focusMessageConsumed"; nonce: number }
+  | {
+      type: "focusInspector";
+      threadId: string;
+      itemId?: string;
+      toolName: string;
+      at: number;
+    }
+  | { type: "focusInspectorConsumed"; nonce: number }
   | { type: "toggleAppSettings"; open?: boolean; section?: AppSettingsSection }
   | {
       type: "updateBot";
@@ -1053,6 +1070,26 @@ export function reducer(state: AppState, action: Action): AppState {
     case "focusMessageConsumed":
       if (!state.focusMessage || state.focusMessage.nonce !== action.nonce) return state;
       return { ...state, focusMessage: { ...state.focusMessage, consumed: true } };
+    case "focusInspector":
+      return {
+        ...state,
+        inspectorOpen: true,
+        settingsOpen: false,
+        computerOpen: false,
+        appSettingsOpen: false,
+        pluginsOpen: false,
+        focusInspector: {
+          threadId: action.threadId,
+          itemId: action.itemId,
+          toolName: action.toolName,
+          at: action.at,
+          nonce: (state.focusInspector?.nonce ?? 0) + 1,
+          consumed: false,
+        },
+      };
+    case "focusInspectorConsumed":
+      if (!state.focusInspector || state.focusInspector.nonce !== action.nonce) return state;
+      return { ...state, focusInspector: { ...state.focusInspector, consumed: true } };
     case "toggleComputer": {
       const open = action.open ?? !state.computerOpen;
       return {
@@ -1276,6 +1313,7 @@ export const initialState: AppState = {
   provisioning: {},
   computerControl: {},
   focusMessage: null,
+  focusInspector: null,
   connected: false,
   error: null,
   mascotMotion: null,

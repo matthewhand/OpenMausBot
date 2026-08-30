@@ -40,6 +40,7 @@ function Shell() {
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const group = state.groups.find((g) => g.id === state.selectedId);
   const bot = group ? undefined : (state.bots.find((b) => b.id === state.selectedId) ?? state.bots[0]);
+  const inspectThread = group?.threadId ?? bot?.threadId;
 
   // Nothing on this machine can run a bot. A missing cloud login does not
   // count — that CLI can still host a local model. Wait for the first
@@ -246,7 +247,7 @@ function Shell() {
       {state.computerOpen && bot && (
         <ComputerPanel bot={bot} onOpenVmWorkspace={openLocalVmWorkspace} onExpandBrowser={openBrowserWorkspace} />
       )}
-      {state.inspectorOpen && bot && <InspectorPanel bot={bot} />}
+      {state.inspectorOpen && inspectThread ? <InspectorPanel threadId={inspectThread} /> : null}
       {state.appSettingsOpen && <SettingsModal />}
       {state.pluginsOpen && <PluginsPanel />}
       {/* mounted after the modals: same z-50 tier, so DOM order keeps the

@@ -538,17 +538,30 @@ function Bubble({
   );
 }
 
-/** A tool run: spinner while live, check/cross once settled. */
-function ActivityChip({ message }: { message: Message }) {
-  const tool = message.tool;
+/** A tool run: spinner while live, check/cross once settled. Click opens
+ * the Inspector on that tool's runtime event (or the raw protocol line). */
+function ActivityChip({ message, threadId }: { message: Message; threadId: string }) {
+  const { dispatch } = useStore();
   if (isCommChipMessage(message)) return <CommChip message={message} />;
+  const tool = message.tool;
   if (!tool) return null;
   const failed = tool.ok === false;
   return (
     <div className="flex justify-start">
-      <div
+      <button
+        type="button"
+        onClick={() =>
+          dispatch({
+            type: "focusInspector",
+            threadId,
+            itemId: tool.itemId,
+            toolName: tool.name,
+            at: message.at,
+          })
+        }
+        title={`Inspect ${tool.name}`}
         className={cn(
-          "flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px]",
+          "flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px] hover:bg-raised hover:text-ink",
           failed ? "text-danger" : "text-ink-secondary",
         )}
       >
@@ -560,7 +573,8 @@ function ActivityChip({ message }: { message: Message }) {
           <Check size={13} className="text-success" />
         )}
         <span className="max-w-[480px] truncate font-mono">{tool.name}</span>
-      </div>
+        <ChevronRight size={13} />
+      </button>
     </div>
   );
 }
@@ -652,7 +666,7 @@ const MessagesList = memo(function MessagesList({
               <ActivityRun messages={item.messages} forceOpen={item.messages.some((step) => step.id === focusedId)}>
                 {item.messages.map((step) => (
                   <div key={step.id} className="contents" data-mid={step.id}>
-                    <ActivityChip message={step} />
+                    <ActivityChip message={step} threadId={bot.threadId} />
                   </div>
                 ))}
               </ActivityRun>
@@ -705,7 +719,7 @@ const MessagesList = memo(function MessagesList({
                 );
               }
               if (!showToolCalls && !m.comm) return null;
-              return <ActivityChip message={m} />;
+              return <ActivityChip message={m} threadId={bot.threadId} />;
             }
             case "screen":
               return m.png ? <ScreenFrame png={m.png} mime={m.mime} /> : null;

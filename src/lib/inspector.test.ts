@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { summarizeNative, summarizeRuntime, toRows, type InspectorEntry } from "./inspector";
+import { matchInspectorTool, summarizeNative, summarizeRuntime, toRows, type InspectorEntry } from "./inspector";
 
 const base = { eventId: "e", provider: "claudeAgent" as const, threadId: "t", createdAt: "2026-08-17T10:00:00.000Z" };
 
@@ -73,5 +73,28 @@ describe("toRows", () => {
     expect(row.summary.endsWith("…")).toBe(true);
     expect(row.summary.length).toBeLessThanOrEqual("assistant_text: ".length + 120);
     expect((row.data as unknown[])).toHaveLength(500);
+  });
+});
+
+describe("matchInspectorTool", () => {
+  it("prefers the runtime item.started row for a tool chip", () => {
+    const rows = toRows([
+      { kind: "runtime", at: "1", data: { ...base, eventId: "s", type: "item.started", itemType: "tool", itemId: "tc-1", title: "Bash" } },
+      { kind: "runtime", at: "2", data: { ...base, eventId: "c", type: "item.completed", itemType: "tool", itemId: "tc-1", ok: true } },
+      { kind: "native", at: "3", data: { at: "3", dir: "in", source: "acp", msg: { method: "session/update", params: { update: { sessionUpdate: "tool_call", toolCallId: "tc-1", title: "Bash" } } } } },
+    ]);
+    const hit = matchInspectorTool(rows, { itemId: "tc-1", toolName: "Bash" });
+    expect(hit?.lens).toBe("events");
+    expect(hit?.row.tag).toBe("item.started");
+    expect(hit?.row.summary).toContain("Bash");
+  });
+
+  it("falls back to the native protocol line when Events has no tool item", () => {
+    const rows = toRows([
+      { kind: "native", at: "1", data: { at: "1", dir: "in", source: "acp", msg: { method: "session/update", params: { update: { sessionUpdate: "tool_call", title: "Read" } } } } },
+    ]);
+    const hit = matchInspectorTool(rows, { toolName: "Read" });
+    expect(hit?.lens).toBe("raw");
+    expect(hit?.row.kind).toBe("native");
   });
 });
