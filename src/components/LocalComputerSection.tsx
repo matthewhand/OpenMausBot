@@ -304,6 +304,18 @@ export function LocalComputerSection() {
             <RefreshCw size={12} /> Re-check
           </button>
           {ready && !perBot && (
+            <button
+              type="button"
+              onClick={() => {
+                setWatchError(null);
+                setWatching(true);
+              }}
+              className="flex items-center gap-1.5 rounded-lg border border-hairline/40 px-2.5 py-1 text-[12.5px] text-ink hover:bg-control"
+            >
+              <Monitor size={12} /> Watch screen
+            </button>
+          )}
+          {ready && !perBot && loopbackViewerUsable(window.location.hostname) && (
             <a
               href={status?.viewer_url ?? c?.view}
               target="_blank"

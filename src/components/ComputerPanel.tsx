@@ -46,6 +46,8 @@ import {
   localComputerSelectable,
 } from "@/lib/local-computer";
 import { vpsComputerNeedsReplacement, type VpsComputerStatus } from "@/lib/vps-computer";
+import { canOpenExternalUrl } from "@/lib/loopback-viewer";
+import { frameSrc } from "@/lib/frame-src";
 
 async function api(path: string, init?: RequestInit): Promise<any> {
   const res = await fetch(path, { headers: { "content-type": "application/json" }, ...init });
@@ -573,14 +575,14 @@ export function ComputerPanel({
     (lastScreenMessage ? { png: lastScreenMessage.png!, mime: lastScreenMessage.mime ?? "image/png" } : null);
   const previewSrc =
     phase === "vm"
-      ? vmFrame
+      ? frameSrc(vmFrame)
       : phase === "local" && !isLinux
-      ? localFrame
-      : phase === "ready" || phase === "starting"
-        ? cloudFrame && `data:${cloudFrame.mime};base64,${cloudFrame.png}`
-        : null;
+        ? frameSrc(localFrame)
+        : phase === "ready" || phase === "starting"
+          ? frameSrc(cloudFrame?.png, cloudFrame?.mime ?? "image/png")
+          : null;
   const previewOpensDesktop = Boolean(
-    frameSrc &&
+    previewSrc &&
       ((phase === "vm" && vmViewerUrl) || phase === "ready"),
   );
 
@@ -678,6 +680,11 @@ export function ComputerPanel({
         viewerUrl = result.joinUrl?.constructor === String ? String(result.joinUrl) : null;
       }
       if (!viewerUrl) throw new Error("The computer did not return a live desktop link");
+      if (!canOpenExternalUrl(viewerUrl, window.location.hostname)) {
+        throw new Error(
+          "That desktop URL is only reachable from this machine. Use the in-panel live preview, or open the app on the host.",
+        );
+      }
 
       if (window.ogb?.desktopViewer) {
         const opened = await window.ogb.desktopViewer.open(viewerUrl, `${bot.name}'s live desktop`, bot.id);
@@ -919,7 +926,7 @@ export function ComputerPanel({
             {cloudBackend === "vps" && (phase === "ready" || phase === "starting") && <span className="text-[11px]">self-hosted VPS</span>}
         </div>
         <div className="flex aspect-[16/10] w-full items-center justify-center overflow-hidden rounded-xl bg-card">
-          {frameSrc && previewOpensDesktop ? (
+          {previewSrc && previewOpensDesktop ? (
             <button
               type="button"
               onClick={() => void openDesktop()}
@@ -929,7 +936,7 @@ export function ComputerPanel({
               title="Open live desktop"
             >
               <img
-                src={frameSrc}
+                src={previewSrc}
                 alt={`${bot.name}'s screen`}
                 className="h-full w-full object-contain transition group-hover:brightness-75 group-focus-visible:brightness-75"
               />
@@ -938,9 +945,9 @@ export function ComputerPanel({
                 Open
               </span>
             </button>
-          ) : frameSrc ? (
+          ) : previewSrc ? (
             <img
-              src={frameSrc}
+              src={previewSrc}
               alt={`${bot.name}'s screen`}
               className="h-full w-full object-contain"
               title={phase === "vm" ? "Watch-only preview" : undefined}
