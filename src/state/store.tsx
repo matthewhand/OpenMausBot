@@ -25,6 +25,7 @@ import { showNotification, type NotificationTarget } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
 import { createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
+import { loadHideInterBotChannels, saveHideInterBotChannels } from "@/lib/sidebar-groups";
 import { openLiveEvents } from "@/lib/live-events";
 
 export type { MausColor } from "@/lib/mascot";
@@ -432,6 +433,9 @@ export interface AppState {
     nonce: number;
     kind: Exclude<MausMotion, "none">;
   } | null;
+  /** When true, auto-created bot⇄bot pair rooms stay out of the sidebar
+   * and command palette so only custom channels are listed. */
+  hideInterBotChannels: boolean;
   /** 1:1 queue-fallback lines waiting for drain; keyed by threadId.
    * Each entry is identified by the server queueId, not by text. */
   pendingQueued: Record<string, Array<{ queueId: string; text: string }>>;
@@ -600,6 +604,7 @@ export type Action =
   | { type: "focusMessage"; threadId: string; messageId: string }
   | { type: "focusMessageConsumed"; nonce: number }
   | { type: "toggleAppSettings"; open?: boolean; section?: AppSettingsSection }
+  | { type: "setHideInterBotChannels"; enabled: boolean }
   | {
       type: "updateBot";
       botId: string;
@@ -1085,6 +1090,9 @@ export function reducer(state: AppState, action: Action): AppState {
         pluginsOpen: open ? false : state.pluginsOpen,
       };
     }
+    case "setHideInterBotChannels":
+      saveHideInterBotChannels(action.enabled);
+      return { ...state, hideInterBotChannels: action.enabled };
     case "updateBot": {
       const mascotChanged =
         Object.prototype.hasOwnProperty.call(action.patch, "color") ||
@@ -1279,6 +1287,7 @@ export const initialState: AppState = {
   connected: false,
   error: null,
   mascotMotion: null,
+  hideInterBotChannels: loadHideInterBotChannels(),
   pendingQueued: {},
   consumedQueueIds: {},
 };

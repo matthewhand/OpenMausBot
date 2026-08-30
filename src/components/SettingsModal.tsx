@@ -29,7 +29,7 @@ const SECTIONS: Array<{
   icon: typeof User;
   keywords: string[];
 }> = [
-  { id: "general", label: "General", icon: User, keywords: ["profile", "name", "email", "skin", "theme", "appearance", "analytics", "updates", "tools", "tool calls"] },
+  { id: "general", label: "General", icon: User, keywords: ["profile", "name", "email", "skin", "theme", "appearance", "analytics", "updates", "tools", "tool calls", "channels", "inter-bot", "bot-to-bot"] },
   { id: "experimental", label: "Experimental", icon: FlaskConical, keywords: ["early", "preview", "teach", "skill", "browser", "profiles"] },
   { id: "connections", label: "Connections", icon: KeyRound, keywords: ["keys", "api", "composio", "box", "xai", "vps"] },
   { id: "engines", label: "Engines", icon: Terminal, keywords: ["models", "claude", "grok", "providers", "cli"] },
@@ -142,6 +142,36 @@ function AnalyticsRow() {
       >
         <span className={cnKnob(on)} />
       </button>
+    </Card>
+  );
+}
+
+function HideInterBotChannelsRow() {
+  const { state, dispatch } = useStore();
+  const hide = state.hideInterBotChannels;
+  return (
+    <Card
+      title="Inter-bot channels"
+      subtitle="Pair chats bots open with each other. Hidden by default so the sidebar only lists rooms you created. Exchanges still show as chips in the transcript."
+    >
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-[14px] font-medium text-ink">Hide from sidebar</div>
+          <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
+            Show them again from this switch or from the Inter-bot heading in the sidebar.
+          </div>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={hide}
+          aria-label="Hide inter-bot channels from sidebar"
+          onClick={() => dispatch({ type: "setHideInterBotChannels", enabled: !hide })}
+          className={cnSwitch(hide)}
+        >
+          <span className={cnKnob(hide)} />
+        </button>
+      </div>
     </Card>
   );
 }
@@ -615,6 +645,7 @@ export function SettingsModal() {
                 <Card title="Profile" subtitle="Shown in the sidebar. Saved as you go.">
                   <ProfileFields />
                 </Card>
+                <HideInterBotChannelsRow />
                 <Card title="Skin" subtitle="Applies instantly and is remembered on this machine.">
                   <SkinPicker />
                 </Card>

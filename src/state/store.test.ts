@@ -693,3 +693,12 @@ describe("messageAdded leaf adoption", () => {
     expect(next.bots[0].messages.map((m) => m.id)).toContain("shot");
   });
 });
+
+describe("hide inter-bot channels", () => {
+  it("records the sidebar hide toggle", () => {
+    const shown = reducer(initialState, { type: "setHideInterBotChannels", enabled: false });
+    expect(shown.hideInterBotChannels).toBe(false);
+    const hidden = reducer(shown, { type: "setHideInterBotChannels", enabled: true });
+    expect(hidden.hideInterBotChannels).toBe(true);
+  });
+});

@@ -82,7 +82,10 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
   if (!open) return null;
 
   const bots = rankByName(state.bots.filter((b) => !b.hidden), q);
-  const rooms = rankByName(state.groups, q);
+  const rooms = rankByName(
+    state.hideInterBotChannels ? state.groups.filter((g) => !g.dm) : state.groups,
+    q,
+  );
   const entries: PaletteEntry[] = [
     ...bots.map((bot): PaletteEntry => ({ kind: "bot", bot })),
     ...rooms.map((group): PaletteEntry => ({ kind: "room", group })),

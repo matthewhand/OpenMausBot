@@ -11,6 +11,8 @@ import {
   ClipboardCopy,
   Copy,
   Crown,
+  Eye,
+  EyeOff,
   FolderMinus,
   FolderPlus,
   Library,
@@ -50,6 +52,7 @@ import {
   saveSidebarDensity,
   type SidebarDensity,
 } from "@/lib/sidebar-preferences";
+import { partitionChannelGroups } from "@/lib/sidebar-groups";
 import { phoneSettingsAction, SidebarPhoneButton } from "./SidebarPhoneButton";
 
 /** "Milind Soni" → "MS", "milind" → "M", "you@x.dev" → "Y", unset → "?" */
@@ -466,14 +469,32 @@ function NewRoomPanel({ onClose }: { onClose: () => void }) {
 
 /** Labeled divider between sidebar sections. Same typographic register as
  * EngineGroupLabel so the sidebar reads as one system. */
-function SectionDivider({ name }: { name: string }) {
+function SectionDivider({ name, action }: { name: string; action?: React.ReactNode }) {
   return (
     <div className="flex items-center gap-2 px-3 pb-1 pt-3 first:pt-0" data-section={name}>
       <span className="text-[10px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
         {name}
       </span>
       <span className="h-px flex-1 bg-hairline/40" />
+      {action}
     </div>
+  );
+}
+
+function HideInterBotToggle({ hide }: { hide: boolean }) {
+  const { dispatch } = useStore();
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={hide}
+      aria-label={hide ? "Show inter-bot channels" : "Hide inter-bot channels"}
+      title={hide ? "Show inter-bot channels" : "Hide inter-bot channels"}
+      onClick={() => dispatch({ type: "setHideInterBotChannels", enabled: !hide })}
+      className="flex size-6 shrink-0 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-ink"
+    >
+      {hide ? <EyeOff size={12} /> : <Eye size={12} />}
+    </button>
   );
 }
 
@@ -1235,9 +1256,14 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const visibleBots = matchingBots
     .filter((bot) => !bot.chiefOfStaff && !bot.section)
     .sort((a, b) => Number(b.pinned ?? false) - Number(a.pinned ?? false));
-  const visibleGroups = state.groups.filter((g) => !q || g.name.toLowerCase().includes(q));
-  const sectionedGroups = visibleGroups.filter((g) => g.section);
-  const unsectionedGroups = visibleGroups.filter((g) => !g.section);
+  const channels = partitionChannelGroups(state.groups, {
+    query: q,
+    hideInterBot: state.hideInterBotChannels,
+  });
+  const visibleGroups = channels.visible;
+  const sectionedGroups = channels.sectionedCustom;
+  const unsectionedGroups = channels.unsectionedCustom;
+  const interBotGroups = state.hideInterBotChannels ? [] : channels.interBot;
   // sections keep first-appearance order within the current list; a section
   // whose members all moved away (or fell out of the filter) simply vanishes
   const sectionNames: string[] = [];
@@ -1453,6 +1479,28 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
           {unsectionedGroups.map((g) => (
             <GroupListItem key={g.id} group={g} density={density} onMenu={setRoomMenu} />
           ))}
+          {interBotGroups.length > 0 && density !== "icons" && (
+            <SectionDivider
+              name="Inter-bot"
+              action={<HideInterBotToggle hide={false} />}
+            />
+          )}
+          {interBotGroups.map((g) => (
+            <GroupListItem key={g.id} group={g} density={density} onMenu={setRoomMenu} />
+          ))}
+          {channels.hiddenInterBotCount > 0 && density !== "icons" && (
+            <button
+              type="button"
+              onClick={() => dispatch({ type: "setHideInterBotChannels", enabled: false })}
+              className="mt-1 flex w-full items-center gap-2 rounded-lg px-3 py-1.5 text-left text-[12px] text-ink-secondary hover:bg-raised/50 hover:text-ink"
+            >
+              <EyeOff size={13} className="shrink-0" />
+              <span>
+                {channels.hiddenInterBotCount} inter-bot{" "}
+                {channels.hiddenInterBotCount === 1 ? "channel" : "channels"} hidden
+              </span>
+            </button>
+          )}
           {visibleBots.length > 0 && density !== "icons" && <SectionDivider name="Bots" />}
           {visibleBots.map((b) => (
             <BotListItem
