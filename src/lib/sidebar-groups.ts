@@ -1,6 +1,7 @@
 /** Auto-created bot⇄bot pair rooms (`Group.dm`) vs rooms the user created. */
 
 export const HIDE_INTERBOT_CHANNELS_KEY = "omb-hide-interbot-channels";
+export const HIDE_SIDEBAR_BOTS_KEY = "omb-hide-sidebar-bots";
 
 export function isInterBotChannel(group: { dm?: boolean }): boolean {
   return Boolean(group.dm);
@@ -28,6 +29,29 @@ export function saveHideInterBotChannels(
   try {
     const target = storage === undefined ? (globalThis.localStorage ?? null) : storage;
     target?.setItem(HIDE_INTERBOT_CHANNELS_KEY, String(hide));
+  } catch {
+    // Private browsing and locked-down webviews may reject localStorage.
+  }
+}
+
+/** Unset means show: unlike inter-bot rooms, bots are the default list. */
+export function parseHideSidebarBots(value: string | null): boolean {
+  return value === "true";
+}
+
+export function loadHideSidebarBots(storage?: Pick<Storage, "getItem"> | null): boolean {
+  try {
+    const target = storage === undefined ? (globalThis.localStorage ?? null) : storage;
+    return parseHideSidebarBots(target?.getItem(HIDE_SIDEBAR_BOTS_KEY) ?? null);
+  } catch {
+    return false;
+  }
+}
+
+export function saveHideSidebarBots(hide: boolean, storage?: Pick<Storage, "setItem"> | null): void {
+  try {
+    const target = storage === undefined ? (globalThis.localStorage ?? null) : storage;
+    target?.setItem(HIDE_SIDEBAR_BOTS_KEY, String(hide));
   } catch {
     // Private browsing and locked-down webviews may reject localStorage.
   }

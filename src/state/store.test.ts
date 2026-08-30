@@ -702,3 +702,12 @@ describe("hide inter-bot channels", () => {
     expect(hidden.hideInterBotChannels).toBe(true);
   });
 });
+
+describe("hide sidebar bots", () => {
+  it("records the specialist-bot hide toggle", () => {
+    const shown = reducer(initialState, { type: "setHideSidebarBots", enabled: false });
+    expect(shown.hideSidebarBots).toBe(false);
+    const hidden = reducer(shown, { type: "setHideSidebarBots", enabled: true });
+    expect(hidden.hideSidebarBots).toBe(true);
+  });
+});

@@ -2,11 +2,15 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   HIDE_INTERBOT_CHANNELS_KEY,
+  HIDE_SIDEBAR_BOTS_KEY,
   isInterBotChannel,
   loadHideInterBotChannels,
+  loadHideSidebarBots,
   parseHideInterBotChannels,
+  parseHideSidebarBots,
   partitionChannelGroups,
   saveHideInterBotChannels,
+  saveHideSidebarBots,
 } from "./sidebar-groups";
 
 const custom = {
@@ -40,6 +44,12 @@ describe("hide inter-bot channels", () => {
     expect(parseHideInterBotChannels("false")).toBe(false);
   });
 
+  it("shows specialist bots until hide is turned on", () => {
+    expect(parseHideSidebarBots(null)).toBe(false);
+    expect(parseHideSidebarBots("false")).toBe(false);
+    expect(parseHideSidebarBots("true")).toBe(true);
+  });
+
   it("loads and saves without making storage availability a launch dependency", () => {
     const setItem = vi.fn();
     saveHideInterBotChannels(false, { setItem });
@@ -53,6 +63,21 @@ describe("hide inter-bot channels", () => {
         },
       }),
     ).toBe(true);
+  });
+
+  it("loads and saves the sidebar bots hide key without requiring storage", () => {
+    const setItem = vi.fn();
+    saveHideSidebarBots(true, { setItem });
+    expect(setItem).toHaveBeenCalledWith(HIDE_SIDEBAR_BOTS_KEY, "true");
+    expect(loadHideSidebarBots({ getItem: () => "true" })).toBe(true);
+    expect(loadHideSidebarBots({ getItem: () => null })).toBe(false);
+    expect(
+      loadHideSidebarBots({
+        getItem: () => {
+          throw new Error("blocked");
+        },
+      }),
+    ).toBe(false);
   });
 
   it("lists only custom rooms when hide is on, including those filed under a context", () => {

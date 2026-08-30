@@ -481,6 +481,23 @@ function SectionDivider({ name, action }: { name: string; action?: React.ReactNo
   );
 }
 
+function HideSidebarBotsToggle({ hide }: { hide: boolean }) {
+  const { dispatch } = useStore();
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={hide}
+      aria-label={hide ? "Show bots" : "Hide bots"}
+      title={hide ? "Show bots" : "Hide bots"}
+      onClick={() => dispatch({ type: "setHideSidebarBots", enabled: !hide })}
+      className="flex size-6 shrink-0 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-ink"
+    >
+      {hide ? <EyeOff size={12} /> : <Eye size={12} />}
+    </button>
+  );
+}
+
 function HideInterBotToggle({ hide }: { hide: boolean }) {
   const { dispatch } = useStore();
   return (
@@ -1248,12 +1265,18 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
         (b.title ?? "").toLowerCase().includes(q) ||
         preview(b).toLowerCase().includes(q),
     );
-  const unsectionedChief = matchingBots.find((bot) => bot.chiefOfStaff && !bot.section);
-  const sectionChiefs = matchingBots.filter((bot) => bot.chiefOfStaff && bot.section);
-  const sectionedBots = matchingBots
+  const hiddenSidebarBotCount = state.hideSidebarBots
+    ? matchingBots.filter((bot) => !bot.chiefOfStaff).length
+    : 0;
+  const listedBots = state.hideSidebarBots
+    ? matchingBots.filter((bot) => bot.chiefOfStaff)
+    : matchingBots;
+  const unsectionedChief = listedBots.find((bot) => bot.chiefOfStaff && !bot.section);
+  const sectionChiefs = listedBots.filter((bot) => bot.chiefOfStaff && bot.section);
+  const sectionedBots = listedBots
     .filter((bot) => !bot.chiefOfStaff && bot.section)
     .sort((a, b) => Number(b.pinned ?? false) - Number(a.pinned ?? false));
-  const visibleBots = matchingBots
+  const visibleBots = listedBots
     .filter((bot) => !bot.chiefOfStaff && !bot.section)
     .sort((a, b) => Number(b.pinned ?? false) - Number(a.pinned ?? false));
   const channels = partitionChannelGroups(state.groups, {
@@ -1501,7 +1524,12 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
               </span>
             </button>
           )}
-          {visibleBots.length > 0 && density !== "icons" && <SectionDivider name="Bots" />}
+          {visibleBots.length > 0 && density !== "icons" && (
+            <SectionDivider
+              name="Bots"
+              action={<HideSidebarBotsToggle hide={false} />}
+            />
+          )}
           {visibleBots.map((b) => (
             <BotListItem
               key={b.id}
@@ -1512,6 +1540,18 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
               archiveDisabled={activeBotCount <= 1}
             />
           ))}
+          {hiddenSidebarBotCount > 0 && density !== "icons" && (
+            <button
+              type="button"
+              onClick={() => dispatch({ type: "setHideSidebarBots", enabled: false })}
+              className="mt-1 flex w-full items-center gap-2 rounded-lg px-3 py-1.5 text-left text-[12px] text-ink-secondary hover:bg-raised/50 hover:text-ink"
+            >
+              <EyeOff size={13} className="shrink-0" />
+              <span>
+                {hiddenSidebarBotCount} {hiddenSidebarBotCount === 1 ? "bot" : "bots"} hidden
+              </span>
+            </button>
+          )}
           {sectionNames.map((name) => (
             <Fragment key={name}>
               {density !== "icons" && <SectionDivider name={name} />}

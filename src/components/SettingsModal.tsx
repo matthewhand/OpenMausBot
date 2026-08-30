@@ -29,7 +29,7 @@ const SECTIONS: Array<{
   icon: typeof User;
   keywords: string[];
 }> = [
-  { id: "general", label: "General", icon: User, keywords: ["profile", "name", "email", "skin", "theme", "appearance", "analytics", "updates", "tools", "tool calls", "channels", "inter-bot", "bot-to-bot"] },
+  { id: "general", label: "General", icon: User, keywords: ["profile", "name", "email", "skin", "theme", "appearance", "analytics", "updates", "tools", "tool calls", "channels", "inter-bot", "bot-to-bot", "bots", "sidebar bots", "specialist"] },
   { id: "experimental", label: "Experimental", icon: FlaskConical, keywords: ["early", "preview", "teach", "skill", "browser", "profiles"] },
   { id: "connections", label: "Connections", icon: KeyRound, keywords: ["keys", "api", "composio", "box", "xai", "vps"] },
   { id: "engines", label: "Engines", icon: Terminal, keywords: ["models", "claude", "grok", "providers", "cli"] },
@@ -142,6 +142,31 @@ function AnalyticsRow() {
       >
         <span className={cnKnob(on)} />
       </button>
+    </Card>
+  );
+}
+
+function HideSidebarBotsRow() {
+  const { state, dispatch } = useStore();
+  const hide = state.hideSidebarBots;
+  return (
+    <Card
+      title="Sidebar bots"
+      subtitle="Hide specialist bots from the sidebar the same way inter-bot channels hide. Chief of Staff stays visible."
+    >
+      <div className="flex items-center justify-between gap-4">
+        <span className="text-[13px] text-ink">Hide bots from sidebar</span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={hide}
+          aria-label="Hide bots from sidebar"
+          onClick={() => dispatch({ type: "setHideSidebarBots", enabled: !hide })}
+          className={cnSwitch(hide)}
+        >
+          <span className={cnKnob(hide)} />
+        </button>
+      </div>
     </Card>
   );
 }
@@ -646,6 +671,7 @@ export function SettingsModal() {
                   <ProfileFields />
                 </Card>
                 <HideInterBotChannelsRow />
+                <HideSidebarBotsRow />
                 <Card title="Skin" subtitle="Applies instantly and is remembered on this machine.">
                   <SkinPicker />
                 </Card>

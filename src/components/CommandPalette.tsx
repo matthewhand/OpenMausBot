@@ -81,7 +81,10 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
 
   if (!open) return null;
 
-  const bots = rankByName(state.bots.filter((b) => !b.hidden), q);
+  const bots = rankByName(
+    state.bots.filter((b) => !b.hidden && (!state.hideSidebarBots || b.chiefOfStaff)),
+    q,
+  );
   const rooms = rankByName(
     state.hideInterBotChannels ? state.groups.filter((g) => !g.dm) : state.groups,
     q,
