@@ -42,7 +42,7 @@ describe("sidecar presents OMB_AUTH_TOKEN, not the phone bearer", () => {
     sidecar = createServer(
       createProxyHandler({
         harnessPort,
-        authenticate: (t) => t === PHONE,
+        authenticate: (t) => (t === PHONE ? { cloudDesktopAccess: true } : null),
         redeem: () => ({ error: "no" }),
         serverName: () => "Test computer",
       }),
@@ -69,7 +69,7 @@ describe("sidecar presents OMB_AUTH_TOKEN, not the phone bearer", () => {
     sidecar = createServer(
       createProxyHandler({
         harnessPort,
-        authenticate: (t) => t === PHONE,
+        authenticate: (t) => (t === PHONE ? { cloudDesktopAccess: true } : null),
         redeem: () => ({ error: "no" }),
         serverName: () => "Test computer",
       }),

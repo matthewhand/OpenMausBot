@@ -26,6 +26,7 @@ import { useStore, type Bot } from "@/state/store";
 import type { Routine } from "@/lib/routines";
 import { ApiKeyRow } from "./ApiKeys";
 import { cn } from "@/lib/cn";
+import { lanAuthHeaders } from "@/lib/lan-auth";
 import { usePageVisible } from "@/lib/page-visible";
 import { CloudBackendPicker } from "./CloudBackendPicker";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
