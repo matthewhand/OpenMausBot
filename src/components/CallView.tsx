@@ -8,6 +8,9 @@
 // or Escape instead, which is honest and cannot feed back. (Full-duplex
 // barge-in needs AEC on the capture path — a follow-up, not a footnote.)
 //
+// The LAN/browser UI has no Swift helper, so capture falls back to the
+// Web Speech API. Same half-duplex rule; Chrome/Edge need a secure origin.
+//
 // Turn-taking uses a small silence endpointer in the native helper. Apple's
 // buffer-backed recognizer does not finalize on silence by itself: the helper
 // has to end the audio stream, which then produces the final transcript.
@@ -22,6 +25,15 @@ import { Loader2, Phone, PhoneOff, X } from "lucide-react";
 
 import { useStore, visibleMessages, type Bot } from "@/state/store";
 import { currentCall, deferCallCleanup, endCall, startCall, useOnCall } from "@/lib/call";
+import {
+  callSpeechAvailable,
+  onSpeechEnd,
+  onSpeechTranscript,
+  primeBrowserMic,
+  speechEndUserMessage,
+  speechStart,
+  speechStop,
+} from "@/lib/speech-capture";
 import { speaker } from "@/lib/tts";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
@@ -71,9 +83,9 @@ export function CallTargetButton({
   onStart: () => void;
 }) {
   const { state, dispatch } = useStore();
-  const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
+  const { ready: capabilitiesReady } = useDesktopCapabilities();
   const active = useOnCall() === targetId;
-  const supported = capabilities.dictation.available && Boolean(window.ogb?.speechStart);
+  const supported = callSpeechAvailable();
   const configured = Boolean(state.config?.tts?.configured);
   const everyTargetHasVoice = voices.length > 0 && voices.every((voice) => Boolean(voice));
   const voiceReady =
@@ -89,7 +101,7 @@ export function CallTargetButton({
     : !capabilitiesReady
       ? "Checking call availability"
       : !supported
-        ? "Calls currently need the macOS desktop app"
+        ? "Calls currently need Chrome, Edge, or the macOS desktop app"
         : !configured
           ? "Set up a voice in an agent profile to make calls"
           : !voiceReady
@@ -98,17 +110,15 @@ export function CallTargetButton({
 
   const reason = !capabilitiesReady
     ? "Checking whether this device can make calls."
-    : !capabilities.dictation.available
-      ? "Calls require OpenMausBot for macOS because speech recognition runs on-device."
-      : !window.ogb?.speechStart
-        ? "The speech service is unavailable in this app build. Restart or update OpenMausBot."
-        : !configured
-          ? "Add an ElevenLabs API key — or switch to the built-in Mac voices — so the bot can speak during calls."
-          : !voiceReady
-            ? voices.length > 1
-              ? "Give every channel member a voice before starting a channel call."
-              : "Choose a voice before starting a call."
-            : "";
+    : !supported
+      ? "Calls need Chrome or Edge speech recognition, or the macOS desktop app."
+      : !configured
+        ? "Add an ElevenLabs API key — or switch to the built-in Mac voices — so the bot can speak during calls."
+        : !voiceReady
+          ? voices.length > 1
+            ? "Give every channel member a voice before starting a channel call."
+            : "Choose a voice before starting a call."
+          : "";
 
   useEffect(() => {
     if (!helpOpen) return;
@@ -139,7 +149,7 @@ export function CallTargetButton({
             return;
           }
           onStart();
-          startCall(targetId);
+          void primeBrowserMic().finally(() => startCall(targetId));
         }}
         aria-expanded={unavailable ? helpOpen : undefined}
         aria-controls={unavailable ? helpId : undefined}
@@ -242,7 +252,7 @@ function Call({ bot }: { bot: Bot }) {
   }, []);
 
   const hush = useCallback(() => {
-    void window.ogb?.speechStop();
+    void speechStop();
   }, []);
 
   const listen = useCallback(() => {
@@ -250,7 +260,7 @@ function Call({ bot }: { bot: Bot }) {
     move("listening");
     setHeard("");
     setNote(null);
-    void window.ogb?.speechStart({ endpointMs: CALL_ENDPOINT_MS }).catch(() => {
+    void speechStart({ endpointMs: CALL_ENDPOINT_MS }).catch(() => {
       if (alive.current && currentCall() === bot.id) {
         setNote("The microphone couldn't start. Check Microphone and Speech Recognition access.");
       }
@@ -298,9 +308,7 @@ function Call({ bot }: { bot: Bot }) {
 
   // ── the microphone ───────────────────────────────────────────────────
   useEffect(() => {
-    const bridge = window.ogb;
-    if (!bridge) return;
-    const offTranscript = bridge.onSpeechTranscript((line) => {
+    const offTranscript = onSpeechTranscript((line) => {
       if (!alive.current || currentCall() !== bot.id || phaseRef.current !== "listening") return;
       if (line.error) {
         setNote("Dictation stopped unexpectedly. Check Microphone and Speech Recognition access.");
@@ -370,18 +378,11 @@ function Call({ bot }: { bot: Bot }) {
       move("sending");
       dispatch({ type: "send", botId: bot.id, text: said, threadId: bot.threadId });
     });
-    const offEnd = bridge.onSpeechEnd(({ code, reason }) => {
+    const offEnd = onSpeechEnd(({ code, reason }) => {
       if (!alive.current || currentCall() !== bot.id) return;
-      if (code === 2) {
-        setNote("Calls need macOS dictation, which isn't available here yet.");
-        return;
-      }
-      if (code === 1) {
-        setNote(
-          reason === "helper-build-failed"
-            ? "The dictation helper couldn't be built. Install Apple's Command Line Tools and try again."
-            : "Dictation needs Microphone + Speech Recognition access in System Settings.",
-        );
+      const failure = speechEndUserMessage(code, reason);
+      if (failure) {
+        setNote(failure);
         return;
       }
       // the helper exits after every final result; if we are still meant
@@ -393,7 +394,7 @@ function Call({ bot }: { bot: Bot }) {
     return () => {
       offTranscript();
       offEnd();
-      void window.ogb?.speechStop();
+      void speechStop();
     };
     // busy/approval are intentionally initial snapshots. Their live changes
     // are handled below without tearing down native event listeners.
