@@ -95,8 +95,10 @@ describe("screenshot / API Bearer contract", () => {
   it("ComputerPanel screenshot polls go through lanAuthRequestInit, not raw fetch", () => {
     const src = readFileSync(join(srcRoot, "components/ComputerPanel.tsx"), "utf8");
     expect(src).toContain("lanAuthRequestInit");
+    expect(src).toContain("`/api/bots/${bot.id}/computer/screenshot`");
     expect(src).toContain('api("/api/local-computer/screenshot"');
     expect(src).not.toMatch(/fetch\(\s*["'`]\/api\/local-computer\/screenshot/);
+    expect(src).not.toMatch(/fetch\(\s*`\/api\/bots\/\$\{bot\.id\}\/computer\/screenshot/);
   });
 
   it("store api() attaches the same LAN Bearer helper", () => {
