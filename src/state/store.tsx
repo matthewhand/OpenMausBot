@@ -18,6 +18,7 @@ import type { MausColor, MausMotion } from "@/lib/mascot";
 import type { Routine, RoutineInput, RoutineRun } from "@/lib/routines";
 import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib/webhooks";
 import { currentCall } from "@/lib/call";
+import { lanAuthRequestInit } from "@/lib/lan-auth";
 import { showNotification } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
 
@@ -877,10 +878,7 @@ export const initialState: AppState = {
 
 // ── API client ─────────────────────────────────────────────────────────
 export async function api(path: string, init?: RequestInit): Promise<any> {
-  const res = await fetch(path, {
-    headers: { "content-type": "application/json" },
-    ...init,
-  });
+  const res = await fetch(path, lanAuthRequestInit(init));
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error ?? `${res.status} ${res.statusText}`);
   return body;
