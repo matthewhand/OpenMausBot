@@ -11,6 +11,7 @@ import {
   Square,
   Trash2,
 } from "lucide-react";
+import { lanAuthRequestInit } from "@/lib/lan-auth";
 import { Card, CommandLine } from "./SettingsPrimitives";
 import { cn } from "@/lib/cn";
 
@@ -106,7 +107,7 @@ export function LocalComputerSection() {
   const [refreshKey, setRefreshKey] = useState(0);
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
-    const response = await fetch("/api/local-computer", { signal });
+    const response = await fetch("/api/local-computer", lanAuthRequestInit({ signal }));
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error ?? `Status request failed (${response.status})`);
     setStatus(body as Status);
@@ -142,11 +143,10 @@ export function LocalComputerSection() {
   }, [refresh, refreshKey]);
 
   const post = async (action: Exclude<Action, "recreate">) => {
-    const response = await fetch(`/api/local-computer/${action}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: "{}",
-    });
+    const response = await fetch(
+      `/api/local-computer/${action}`,
+      lanAuthRequestInit({ method: "POST", body: "{}" }),
+    );
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error ?? `${action} failed`);
     setStatus(body as Status);
