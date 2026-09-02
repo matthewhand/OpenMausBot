@@ -25,9 +25,30 @@ const sessionResponseSchema = z.object({
       max_accounts_per_toolkit: z.number().optional(),
       require_explicit_selection: z.boolean().optional(),
     }).optional(),
+    /** toolkit slug → the project's own auth config the Session uses for it */
+    auth_configs: z.record(z.string(), z.string()).optional(),
   }).optional(),
 });
 type SessionResponse = z.infer<typeof sessionResponseSchema>;
+
+// A project's own auth configs (bring-your-own OAuth app, API-key toolkits
+// such as twitter that Composio does not manage). A Session only uses one
+// when it was created with the config's id under `auth_configs`.
+const authConfigItemSchema = z.object({
+  id: z.string().optional(),
+  status: z.string().nullable().optional(),
+  is_composio_managed: z.boolean().optional(),
+  is_enabled_for_tool_router: z.boolean().nullable().optional(),
+  last_updated_at: z.string().nullable().optional(),
+  toolkit: z.object({ slug: z.string().optional() }).optional(),
+});
+const authConfigsPageSchema = z.object({
+  items: z.array(authConfigItemSchema).optional(),
+  next_cursor: z.string().nullable().optional(),
+});
+/** toolkit slug (lowercase) → auth config id */
+type AuthConfigMap = Record<string, string>;
+const MAX_AUTH_CONFIG_PAGES = 20;
 
 export interface ConnectedAccountSummary {
   id: string;
@@ -88,6 +109,16 @@ const MULTI_ACCOUNT_CONFIG = {
   max_accounts_per_toolkit: 5,
   require_explicit_selection: true,
 } as const;
+
+interface SessionCreateRequest {
+  user_id: string;
+  manage_connections: { enable: boolean; enable_wait_for_connections: boolean; enable_connection_removal: boolean };
+  multi_account: typeof MULTI_ACCOUNT_CONFIG;
+  /** toolkit slug → the project's own auth config id; named only when the
+   * project has its own configs, since a Session cannot be edited afterwards
+   * and an empty map would pin "no custom auth" for the Session's lifetime */
+  auth_configs?: AuthConfigMap;
+}
 const MAX_CONNECTED_ACCOUNT_PAGES = 100;
 const ACCOUNT_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const printableAliasSchema = z.string().min(1).max(64).refine((value) => {
@@ -113,15 +144,52 @@ interface IntegrationContext {
   threadId: string;
 }
 
-function brokerAccess(): { url: string; token: string } | null {
-  const url = process.env.OMB_COMPOSIO_BROKER_URL?.trim().replace(/\/$/, "");
-  const token = process.env.OMB_COMPOSIO_BROKER_TOKEN?.trim();
-  if (!url || !token) return null;
-  const parsed = new URL(url);
-  if (parsed.protocol !== "https:" && parsed.hostname !== "127.0.0.1" && parsed.hostname !== "localhost") {
+let managedBrokerAccess: { url: string; token: string } | null | undefined;
+
+const managedBrokerMessageSchema = z.record(z.string(), z.unknown());
+const managedBrokerToken = /^[0-9a-f]{64}$/;
+
+function normalizeManagedBrokerUrl(value: string): string {
+  const url = new URL(value);
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error("The connected-apps service URL must not include credentials, a query, or a fragment");
+  }
+  const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
     throw new Error("The connected-apps service must use HTTPS");
   }
-  return { url, token };
+  return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+}
+
+export function applyManagedBrokerMessage(message: unknown): boolean {
+  const parsed = managedBrokerMessageSchema.safeParse(message);
+  if (
+    !parsed.success ||
+    parsed.data.type !== "openmausbot:managed-composio" ||
+    !Object.hasOwn(parsed.data, "access")
+  ) {
+    return false;
+  }
+  setManagedBrokerAccess(parsed.data.access);
+  return true;
+}
+
+export function setManagedBrokerAccess(access: unknown): void {
+  if (access === null) {
+    managedBrokerAccess = null;
+    return;
+  }
+  const parsed = z.object({ url: z.string().url(), token: z.string().regex(managedBrokerToken) }).strict().parse(access);
+  managedBrokerAccess = { url: normalizeManagedBrokerUrl(parsed.url), token: parsed.token };
+}
+
+function brokerAccess(): { url: string; token: string } | null {
+  if (managedBrokerAccess !== undefined) return managedBrokerAccess;
+  const url = process.env.OMB_COMPOSIO_BROKER_URL?.trim();
+  const token = process.env.OMB_COMPOSIO_BROKER_TOKEN?.trim();
+  if (!url || !token) return null;
+  if (!managedBrokerToken.test(token)) throw new Error("The connected-apps service token is invalid");
+  return { url: normalizeManagedBrokerUrl(url), token };
 }
 
 export function connectionMode(cfg: AppConfig): "managed" | "self-hosted" | "unavailable" {
@@ -131,6 +199,20 @@ export function connectionMode(cfg: AppConfig): "managed" | "self-hosted" | "una
 
 export function configured(cfg: AppConfig): boolean {
   return connectionMode(cfg) !== "unavailable";
+}
+
+/** Three answers, not two. The desktop shell sets OMB_CREDENTIAL_STORE to
+ * "unavailable" when it could not read credentials.bin this launch; without
+ * that signal an unreadable store is indistinguishable from a user who never
+ * connected anything, and the UI wipes a list it should have kept. */
+export type ConnectorAvailability = "configured" | "unconfigured" | "unreadable";
+
+export function connectorAvailability(
+  cfg: AppConfig,
+  storeState: string | undefined = process.env.OMB_CREDENTIAL_STORE,
+): ConnectorAvailability {
+  if (configured(cfg)) return "configured";
+  return storeState === "unavailable" ? "unreadable" : "unconfigured";
 }
 
 async function brokerRequest(path: string, init?: RequestInit): Promise<Response> {
@@ -198,6 +280,10 @@ function supportsMultiAccount(session: SessionResponse): boolean {
  *  what we have (single-account behavior) instead of recreating a Session and
  *  rewriting config.json on every request. */
 const multiAccountUpgradeAttempted = new Set<string>();
+/** Session id + auth-config map pairs this boot already created a Session
+ *  for. Same idea: if Composio does not echo `auth_configs`, recreating the
+ *  Session on every check would loop without changing anything. */
+const authConfigUpgradeAttempted = new Set<string>();
 
 function inputError(message: string, status = 400) {
   return Object.assign(new Error(message), { status });
@@ -228,19 +314,77 @@ async function getProjectSession(apiKey: string, sessionId: string): Promise<Ses
   return parseSessionResponse(sessionResponseSchema.parse(await res.json()));
 }
 
+/** The project's own (non-Composio-managed) auth configs, one per toolkit.
+ *  Disabled configs and ones switched off for Sessions are skipped; when a
+ *  toolkit has several, the most recently updated wins. Ordinary Session
+ *  preparation treats a denied list as "none"; an explicit auth retry surfaces
+ *  the denial so it cannot replace a usable Session with an incomplete one. */
+export async function listCustomAuthConfigs(apiKey: string): Promise<AuthConfigMap> {
+  const chosen = new Map<string, { id: string; updated: string }>();
+  let cursor: string | undefined;
+  for (let page = 0; page < MAX_AUTH_CONFIG_PAGES; page++) {
+    const params = new URLSearchParams({ is_composio_managed: "false", limit: "100" });
+    if (cursor) params.set("cursor", cursor);
+    const res = await fetch(`${apiBase()}/auth_configs?${params}`, {
+      headers: projectHeaders(apiKey),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) throw new Error(await responseError(res, `Composio auth configs: HTTP ${res.status}`));
+    const body = authConfigsPageSchema.parse(await res.json());
+    for (const item of body.items ?? []) {
+      const slug = item.toolkit?.slug?.toLowerCase();
+      if (!slug || !item.id || item.is_composio_managed === true) continue;
+      if (item.is_enabled_for_tool_router === false) continue;
+      if (item.status && /^(disabled|inactive|expired|deleted)$/i.test(item.status)) continue;
+      const updated = item.last_updated_at ?? "";
+      const current = chosen.get(slug);
+      if (!current || updated > current.updated) chosen.set(slug, { id: item.id, updated });
+    }
+    const next = body.next_cursor ?? undefined;
+    if (!next || next === cursor) break;
+    cursor = next;
+  }
+  return Object.fromEntries([...chosen].sort(([a], [b]) => a.localeCompare(b)).map(([slug, { id }]) => [slug, id]));
+}
+
+/** True when the Session already routes every wanted toolkit through the
+ *  project's own auth config. Extra configs on the Session are fine; a
+ *  missing or different one means the Session predates the config. */
+function sessionCoversAuthConfigs(session: SessionResponse, wanted: AuthConfigMap): boolean {
+  const have = session.config?.auth_configs ?? {};
+  const haveLower = Object.fromEntries(Object.entries(have).map(([slug, id]) => [slug.toLowerCase(), id]));
+  return Object.entries(wanted).every(([slug, id]) => haveLower[slug] === id);
+}
+
+function authConfigsKey(sessionId: string, wanted: AuthConfigMap): string {
+  return `${sessionId}:${JSON.stringify(wanted)}`;
+}
+
 /** Validate a project key and return one reusable Session for this install. */
 export async function prepareProjectSession(
   apiKey: string,
   current?: { apiKey?: string; userId?: string; sessionId?: string },
+  knownAuthConfigs?: AuthConfigMap,
 ): Promise<{ apiKey: string; userId: string; sessionId: string }> {
   const trimmed = apiKey.trim();
   if (!trimmed) throw new Error("Enter a Composio project API key");
   if (!trimmed.startsWith("ak_")) throw new Error("Composio project API keys start with ak_");
 
+  // The project's own auth configs must be named at creation — a Session
+  // cannot be edited later — so they are read before deciding whether the
+  // current Session is still the right one (issue #509: a twitter auth
+  // config created after the Session existed was never used).
+  const authConfigs = knownAuthConfigs
+    ?? await listCustomAuthConfigs(trimmed).catch((): AuthConfigMap => ({}));
   let priorUserId = current?.userId;
   if (trimmed === current?.apiKey && current.sessionId) {
     const existing = await getProjectSession(trimmed, current.sessionId);
-    if (existing && supportsMultiAccount(existing)) {
+    if (
+      existing
+      && supportsMultiAccount(existing)
+      && (sessionCoversAuthConfigs(existing, authConfigs)
+        || authConfigUpgradeAttempted.has(authConfigsKey(existing.session_id, authConfigs)))
+    ) {
       return {
         apiKey: trimmed,
         userId: existing.config?.user_id ?? current.userId ?? `openmausbot_${randomUUID()}`,
@@ -254,22 +398,27 @@ export async function prepareProjectSession(
   }
 
   const userId = priorUserId ?? `openmausbot_${randomUUID()}`;
+  const sessionRequest: SessionCreateRequest = {
+    user_id: userId,
+    manage_connections: {
+      enable: true,
+      enable_wait_for_connections: true,
+      enable_connection_removal: true,
+    },
+    multi_account: MULTI_ACCOUNT_CONFIG,
+  };
+  if (Object.keys(authConfigs).length) sessionRequest.auth_configs = authConfigs;
   const res = await fetch(`${apiBase()}/tool_router/session`, {
     method: "POST",
     headers: projectHeaders(trimmed, true),
-    body: JSON.stringify({
-      user_id: userId,
-      manage_connections: {
-        enable: true,
-        enable_wait_for_connections: true,
-        enable_connection_removal: true,
-      },
-      multi_account: MULTI_ACCOUNT_CONFIG,
-    }),
+    body: JSON.stringify(sessionRequest),
     signal: AbortSignal.timeout(30_000),
   });
   if (!res.ok) throw new Error(await responseError(res, `Composio rejected this key (HTTP ${res.status})`));
   const session = parseSessionResponse(sessionResponseSchema.parse(await res.json()));
+  // If Composio does not echo the configs back, a later check would ask for
+  // the same creation again — remember this attempt so it happens once.
+  authConfigUpgradeAttempted.add(authConfigsKey(session.session_id, authConfigs));
   return { apiKey: trimmed, userId, sessionId: session.session_id };
 }
 
@@ -293,6 +442,34 @@ async function ensureProjectSession(cfg: AppConfig): Promise<SessionResponse> {
   if (!created) throw new Error("Composio Session disappeared after creation");
   return created;
 }
+
+/** Replace the current Session with a freshly created one — the only way to
+ *  pick up an auth config the user added after the Session was made. The
+ *  Composio user id is kept, so every existing connection survives. */
+async function recreateProjectSession(
+  cfg: AppConfig,
+  userId: string,
+  authConfigs: AuthConfigMap,
+): Promise<SessionResponse> {
+  const composio = cfg.composio;
+  if (!composio?.apiKey) throw new Error("No Composio project key configured");
+  const prepared = await prepareProjectSession(
+    composio.apiKey,
+    { apiKey: composio.apiKey, userId },
+    authConfigs,
+  );
+  multiAccountUpgradeAttempted.add(prepared.sessionId);
+  composio.userId = prepared.userId;
+  composio.sessionId = prepared.sessionId;
+  saveConfig({ composio: { userId: prepared.userId, sessionId: prepared.sessionId } });
+  const created = await getProjectSession(composio.apiKey, prepared.sessionId);
+  if (!created) throw new Error("Composio Session disappeared after creation");
+  return created;
+}
+
+/** Composio's wording when a toolkit has no managed auth and the Session was
+ *  not told which of the project's own auth configs to use. */
+const NEEDS_AUTH_CONFIG = /does not manage auth|auth[_ ]?config/i;
 
 export async function mcpIntegration(
   cfg: AppConfig,
@@ -399,7 +576,10 @@ async function listSessionToolkits(
   const seenCursors = new Set<string>();
   let cursor: string | undefined;
   for (let page = 0; page < MAX_CONNECTED_ACCOUNT_PAGES; page += 1) {
-    const params = new URLSearchParams({ limit: "50" });
+    // The unfiltered endpoint contains the entire Composio marketplace and is
+    // cursor-paginated in 50-item pages. The Connected tab only needs the
+    // user's connected toolkits, so avoid scanning hundreds of unrelated apps.
+    const params = new URLSearchParams({ limit: "50", is_connected: "true" });
     if (cursor) params.set("cursor", cursor);
     const response = await fetch(
       `${apiBase()}/tool_router/session/${encodeURIComponent(sessionId)}/toolkits?${params}`,
@@ -656,13 +836,36 @@ export async function authorizeService(cfg: AppConfig, slug: string, requestedAl
   }
   const linkRequest: AccountLinkRequest = { toolkit: slug };
   if (alias) linkRequest.alias = alias;
-  const res = await fetch(`${apiBase()}/tool_router/session/${encodeURIComponent(session.session_id)}/link`, {
-    method: "POST",
-    headers: projectHeaders(cfg.composio.apiKey, true),
-    body: JSON.stringify(linkRequest),
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!res.ok) throw new Error(await responseError(res, `Composio authorization: HTTP ${res.status}`));
+  const apiKey = cfg.composio.apiKey;
+  const link = (sessionId: string) =>
+    fetch(`${apiBase()}/tool_router/session/${encodeURIComponent(sessionId)}/link`, {
+      method: "POST",
+      headers: projectHeaders(apiKey, true),
+      body: JSON.stringify(linkRequest),
+      signal: AbortSignal.timeout(30_000),
+    });
+  let res = await link(session.session_id);
+  if (!res.ok) {
+    const message = await responseError(res, `Composio authorization: HTTP ${res.status}`);
+    if (!NEEDS_AUTH_CONFIG.test(message)) throw new Error(message);
+    // The toolkit needs one of the project's own auth configs. The Session
+    // names those only at creation, so an auth config the user created after
+    // the Session existed is invisible to it: rebuild the Session once and
+    // retry. If the project has no config for this toolkit, say what to do
+    // instead of echoing Composio's "auth_config_override" hint.
+    const slugLower = slug.toLowerCase();
+    const authConfigs = await listCustomAuthConfigs(apiKey);
+    const covered = Object.keys(authConfigs).some((key) => key.toLowerCase() === slugLower);
+    if (!covered) {
+      throw inputError(
+        `${slug} has no Composio-managed sign-in. In your Composio project, create an auth config for "${slug}" `
+          + "(Auth Configs → Create) with your own app credentials, then click Connect again.",
+      );
+    }
+    const fresh = await recreateProjectSession(cfg, userId, authConfigs);
+    res = await link(fresh.session_id);
+    if (!res.ok) throw new Error(await responseError(res, `Composio authorization: HTTP ${res.status}`));
+  }
   const body = linkResponseSchema.parse(await res.json());
   return { url: trustedAuthUrl(body.redirect_url, slug) };
 }
@@ -673,6 +876,8 @@ export interface ToolkitCard {
   label: string;
   blurb: string;
   logo: string | null;
+  /** Toolkits such as public search need no user authorization. */
+  noAuth?: boolean;
   /** used for the client-side favicon fallback when logo is null/broken */
   domain: string | null;
 }
@@ -735,6 +940,7 @@ export async function listToolkits(cfg: AppConfig): Promise<{ cards: ToolkitCard
             label: t.name ?? t.slug ?? "",
             blurb: (t.meta?.description ?? t.description ?? "").slice(0, 90),
             logo: t.meta?.logo ?? t.logo ?? null,
+            noAuth: t.no_auth === true,
             domain: null,
           }));
           toolkitCache = { at: Date.now(), cards };

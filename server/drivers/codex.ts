@@ -61,6 +61,7 @@ function mountMcpServer(
   env: Record<string, string | undefined>,
   name: string,
   server: StdioMcpServer,
+  preApproved = true,
 ): void {
   Object.assign(env, server.env);
   const prefix = `mcp_servers.${name}`;
@@ -70,8 +71,12 @@ function mountMcpServer(
     // Values stay in the child environment; argv contains names only so
     // credentials never appear in process listings or diagnostics.
     "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(server.env))}`,
-    "-c", `${prefix}.default_tools_approval_mode="auto"`,
   );
+  // Harness-owned servers are pre-quieted; a user-configured server keeps
+  // codex's on-request policy so its tool calls become approval cards.
+  if (preApproved) {
+    appServerArgs.push("-c", `${prefix}.default_tools_approval_mode="auto"`);
+  }
 }
 
 export const CodexDriver: ProviderDriver<CodexConfig> = {
@@ -178,6 +183,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           // Driver stdio MCP server. Codex sees the same computer tool surface.
           mountMcpServer(appServerArgs, env, "computer", turn.integrations.localComputer);
         }
+        if (turn.integrations?.browser) {
+          mountMcpServer(appServerArgs, env, "browser", turn.integrations.browser);
+        }
+        for (const [name, server] of Object.entries(turn.integrations?.custom ?? {})) {
+          mountMcpServer(appServerArgs, env, name, server, false);
+        }
         if (turn.integrations?.phone) {
           const bridge = turn.integrations.phone;
           Object.assign(env, bridge.env);
@@ -203,7 +214,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         sawStreamDelta: false,
         // codex reports token usage as a running THREAD total; the harness
         // wants this turn's figure, so the last report is banked on settle
-        usage: undefined as { input: number; output: number } | undefined,
+        usage: undefined as { input: number; output: number; cachedInput?: number } | undefined,
       };
 
       const asks = new Map<string, (behavior: "allow" | "deny" | "answer", message?: string, source?: "user" | "timeout" | "system") => void>();
@@ -386,6 +397,22 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                 state.sawStreamDelta = false;
                 emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text: item.text });
               }
+            } else if (item.type === "imageGeneration" && item.status !== "failed") {
+              // Current Codex app-server (the same schema consumed by T3
+              // Code) returns the generated raster as base64 `result` and
+              // may also expose a local `savedPath`. Use bytes, never the
+              // provider-owned path: the harness will validate and copy
+              // them into its private attachment store.
+              if (typeof item.result === "string" && item.result.trim()) {
+                emit({
+                  ...base(threadId, turnId),
+                  type: "item.completed",
+                  itemType: "assistant_image",
+                  itemId: item.id,
+                  data: item.result,
+                  alt: typeof item.revisedPrompt === "string" ? item.revisedPrompt : undefined,
+                });
+              }
             } else if (["commandExecution", "fileChange", "mcpToolCall", "webSearch"].includes(item.type)) {
               emit({
                 ...base(threadId, turnId),
@@ -404,7 +431,18 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             // `total` is the thread so far — a fresh app-server per turn
             // makes that this turn's figure too
             const turnUsage = p.tokenUsage?.last ?? p.tokenUsage?.total;
-            if (turnUsage) state.usage = { input: turnUsage.inputTokens ?? 0, output: turnUsage.outputTokens ?? 0 };
+            // codex's inputTokens already includes cachedInputTokens; the
+            // cached share is carried alongside so the UI can say how much
+            // of a turn was context re-read rather than new text
+            if (turnUsage) {
+              state.usage = {
+                input: turnUsage.inputTokens ?? 0,
+                output: turnUsage.outputTokens ?? 0,
+                ...(typeof turnUsage.cachedInputTokens === "number"
+                  ? { cachedInput: turnUsage.cachedInputTokens }
+                  : {}),
+              };
+            }
             const t = p.tokenUsage?.total;
             if (t) {
               emit({
@@ -412,6 +450,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                 type: "thread.token-usage.updated",
                 input: t.inputTokens ?? 0,
                 output: t.outputTokens ?? 0,
+                ...(typeof t.cachedInputTokens === "number"
+                  ? { cachedInput: t.cachedInputTokens }
+                  : {}),
               });
             }
             break;
@@ -449,7 +490,20 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           } catch {
             continue;
           }
-          appendNative(threadId, { dir: "in", source: "codex.app-server", msg });
+          const loggedMessage = msg.method === "item/completed" && msg.params?.item?.type === "imageGeneration"
+            ? {
+                ...msg,
+                params: {
+                  ...msg.params,
+                  item: {
+                    ...msg.params.item,
+                    result: `[generated image omitted · ${String(msg.params.item.result ?? "").length} base64 chars]`,
+                    savedPath: undefined,
+                  },
+                },
+              }
+            : msg;
+          appendNative(threadId, { dir: "in", source: "codex.app-server", msg: loggedMessage });
           if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
             const pend = rpcPending.get(msg.id);
             if (pend) {
@@ -617,7 +671,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         localComputerMcp: true,
         composioMcp: true,
         agentsMcp: true,
+      customMcp: true,
         phoneMcp: true,
+        browserMcp: true,
         images: true,
         effortLevels: ["low", "medium", "high", "xhigh", "max"],
       },

@@ -73,6 +73,10 @@ struct NeedsYouIsland: View {
     @State private var shown: ChatUpdate?
     @State private var dismissedCardIds = Set<String>()
     @State private var answering = false
+    // The comet face is the costliest draw in the app. It earns a beat of
+    // motion when the island appears; an approval left unattended overnight
+    // must not keep a 30fps orbit running until morning.
+    @State private var attentionLive = true
 
     private var expanded: Bool { shown != nil }
 
@@ -90,9 +94,14 @@ struct NeedsYouIsland: View {
                         // The hardware island covers the first 37pt of the
                         // square; the face sits clear of it, centred.
                         Button { open(shown.chat) } label: {
-                            ChatAvatarView(chat: shown.chat, size: 120, state: MausState.forChat(shown.chat, in: session.state), comets: true)
+                            ChatAvatarView(chat: shown.chat, size: 120, state: MausState.forChat(shown.chat, in: session.state), animated: attentionLive, comets: attentionLive)
                         }
                         .buttonStyle(.plain)
+                        .task(id: shown.chat.id) {
+                            attentionLive = true
+                            try? await Task.sleep(for: .seconds(30))
+                            attentionLive = false
+                        }
                         .padding(.top, IslandGeometry.size.height + 14)
 
                         VStack(spacing: 4) {
@@ -108,27 +117,45 @@ struct NeedsYouIsland: View {
                         }
 
                         if let card = shown.card, card.isPending {
-                            HStack(spacing: 8) {
-                                ForEach(card.options, id: \.self) { option in
+                            Group {
+                                if card.skillRequest != nil {
                                     Button {
-                                        answering = true
-                                        Task {
-                                            await session.answer(chat: shown.chat, card: card, choice: option)
-                                            answering = false
-                                            dismiss()
-                                        }
+                                        open(shown.chat)
+                                        dismiss()
                                     } label: {
-                                        Text(option)
-                                            .font(.system(size: 15, weight: .semibold))
-                                            .foregroundStyle(CardStyle.isRefusal(option) ? .white : .white)
+                                        Label("Open chat to review", systemImage: "doc.text.magnifyingglass")
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .foregroundStyle(.white)
                                             .frame(maxWidth: .infinity)
                                             .frame(height: 40)
-                                            .background(
-                                                Capsule().fill(CardStyle.isRefusal(option) ? Color.white.opacity(0.16) : MausPalette.color(shown.chat.color))
-                                            )
+                                            .background(Capsule().fill(MausPalette.color(shown.chat.color)))
                                     }
                                     .buttonStyle(.plain)
-                                    .disabled(answering)
+                                } else {
+                                    HStack(spacing: 8) {
+                                        ForEach(card.options, id: \.self) { option in
+                                            Button {
+                                                Haptics.selection()
+                                                answering = true
+                                                Task {
+                                                    await session.answer(chat: shown.chat, card: card, choice: option)
+                                                    answering = false
+                                                    dismiss()
+                                                }
+                                            } label: {
+                                                Text(option)
+                                                    .font(.system(size: 15, weight: .semibold))
+                                                    .foregroundStyle(.white)
+                                                    .frame(maxWidth: .infinity)
+                                                    .frame(height: 40)
+                                                    .background(
+                                                        Capsule().fill(CardStyle.isRefusal(option) ? Color.white.opacity(0.16) : MausPalette.color(shown.chat.color))
+                                                    )
+                                            }
+                                            .buttonStyle(.plain)
+                                            .disabled(answering)
+                                        }
+                                    }
                                 }
                             }
                             .padding(.horizontal, 20)

@@ -122,6 +122,13 @@ export function pasteAttachment(text: string): PasteAttachment {
   return { kind: "paste", id, text, size: byteLength(text), lines: countLines(text) };
 }
 
+/** Move a pasted attachment into the editable composer draft without
+ * running the text back through the paste threshold. */
+export function appendPastedText(text: string, pasted: string): string {
+  if (!text) return pasted;
+  return `${text}${text.endsWith("\n") ? "" : "\n\n"}${pasted}`;
+}
+
 export const INLINE_DROP_LIMIT = 512 * 1024;
 
 export type DroppedFile = Pick<File, "name" | "size" | "type" | "text">;
@@ -216,20 +223,76 @@ export function escapeAttribute(value: string): string {
     .replaceAll("\n", "&#10;");
 }
 
-/** Split a stored user message into its display text and the images it
- * attached, for transcript rendering. The tag never shows in the bubble. */
-export function splitAttachedImages(text: string): { display: string; images: string[] } {
-  const images: string[] = [];
-  const display = text.replace(/<attached-image\s+path="([^"]*)"\s*\/?>(?:\s*\n)?/g, (_match, raw: string) => {
-    const path = raw
-      .replaceAll("&quot;", '"')
-      .replaceAll("&lt;", "<")
-      .replaceAll("&gt;", ">")
-      .replaceAll("&amp;", "&");
-    if (path) images.push(path);
-    return "";
+export type TranscriptFileAttachment = {
+  path: string;
+  name: string;
+};
+
+export type TranscriptAttachments = {
+  display: string;
+  images: string[];
+  files: TranscriptFileAttachment[];
+};
+
+/** Decode only entities emitted by escapeAttribute. A second encoded pass
+ * stays encoded, rather than turning attacker-controlled text into markup. */
+function decodeAttachmentAttribute(value: string): string {
+  return value.replace(/&(quot|lt|gt|amp);|&#(9|10|13);/g, (entity, named: string | undefined, numeric: string | undefined) => {
+    if (numeric === "9") return "\t";
+    if (numeric === "10") return "\n";
+    if (numeric === "13") return "\r";
+    if (named === "quot") return '"';
+    if (named === "lt") return "<";
+    if (named === "gt") return ">";
+    if (named === "amp") return "&";
+    return entity;
   });
-  return { display: display.trim(), images };
+}
+
+/** Keep transcript-provided names compact and visually honest. File chips
+ * are deliberately not links, but control and bidi characters can still
+ * make an untrusted name misleading. */
+function transcriptFileName(path: string, suppliedName?: string): string {
+  const decoded = suppliedName ? decodeAttachmentAttribute(suppliedName) : attachmentBasename(path);
+  const clean = (value: string) => Array.from(value, (character) => {
+    const code = character.codePointAt(0) ?? 0;
+    const control = code <= 31 || (code >= 127 && code <= 159);
+    const bidiControl = (code >= 0x202a && code <= 0x202e) || (code >= 0x2066 && code <= 0x2069);
+    return control || bidiControl ? " " : character;
+  }).join("").replace(/\s+/g, " ").trim();
+  const safe = clean(attachmentBasename(decoded));
+  const fallback = clean(attachmentBasename(path));
+  return Array.from(safe || fallback || "Attached file").slice(0, 180).join("");
+}
+
+/** Split a stored user message into its display text and attachments for
+ * transcript rendering. Prompt-only tags never show in the bubble. */
+export function splitTranscriptAttachments(text: string): TranscriptAttachments {
+  const images: string[] = [];
+  const files: TranscriptFileAttachment[] = [];
+  const display = text.replace(
+    /^[\t ]*<attached-(image|file)\b((?:[\t ]+[A-Za-z_:][\w:.-]*="[^"\r\n]*")*)[\t ]*\/>[\t ]*(?:\r?\n)?/gm,
+    (match, kind: "image" | "file", rawAttributes: string) => {
+      const attributes = new Map<string, string>();
+      for (const attribute of rawAttributes.matchAll(/\s+([A-Za-z_:][\w:.-]*)="([^"]*)"/g)) {
+        if (!attributes.has(attribute[1]!)) attributes.set(attribute[1]!, attribute[2]!);
+      }
+      const rawPath = attributes.get("path");
+      if (rawPath === undefined) return match;
+      const path = decodeAttachmentAttribute(rawPath);
+      if (!path) return match;
+      if (kind === "image") images.push(path);
+      else files.push({ path, name: transcriptFileName(path, attributes.get("name")) });
+      return "";
+    },
+  );
+  return { display: display.trim(), images, files };
+}
+
+/** Kept for callers outside the desktop bundle that used the old helper. */
+export function splitAttachedImages(text: string): { display: string; images: string[] } {
+  const { display, images } = splitTranscriptAttachments(text);
+  return { display, images };
 }
 
 /** The bare filename a saved attachment path ends in — what the serving
@@ -237,4 +300,57 @@ export function splitAttachedImages(text: string): { display: string; images: st
 export function attachmentBasename(path: string): string {
   const parts = path.split(/[\\/]/);
   return parts[parts.length - 1] ?? "";
+}
+
+/** The renderer never loads a transcript-provided URL directly. Only names
+ * the attachment server itself can have generated become same-origin image
+ * URLs; malformed and executable-image paths render nothing, while a string
+ * that looks remote can at most resolve to a local generated filename. */
+export function attachmentImageUrl(path: string): string | null {
+  const name = attachmentBasename(path);
+  if (!/^[A-Za-z0-9-]+\.(png|jpg|gif|webp)$/.test(name)) return null;
+  return `/api/attachments/${encodeURIComponent(name)}`;
+}
+
+/** One intake path for files arriving by drop OR by the composer's attach
+ * button, so a picked file and a dropped one can never behave differently.
+ * The image uploader is injected: the caller owns the network, this owns
+ * the ordering and the sentence the user reads when something is refused. */
+export async function intakeFiles<T extends DroppedFile & { type: string }>(
+  _files: readonly T[],
+  _opts: {
+    allowImages: boolean;
+    getPath: (file: T) => string;
+    uploadImage: (file: T) => Promise<Attachment | null>;
+  },
+): Promise<{ attachments: Attachment[]; notice: string | null }> {
+  const files = [..._files];
+  const { allowImages, getPath, uploadImage } = _opts;
+  const attachments: Attachment[] = [];
+  const rejectedNames: string[] = [];
+  const imageErrors: string[] = [];
+  // Finish each selected file in sequence so the chips retain the order in
+  // which the user chose or dropped them.
+  for (const file of files) {
+    if (allowImages && isImageFile(file)) {
+      try {
+        const attachment = await uploadImage(file);
+        if (attachment) attachments.push(attachment);
+      } catch (err) {
+        imageErrors.push(`${file.name}: ${err instanceof Error ? err.message : "upload failed"}`);
+      }
+      continue;
+    }
+    const result = await attachmentsFromDroppedFiles([file], getPath);
+    attachments.push(...result.attachments);
+    rejectedNames.push(...result.rejectedNames);
+  }
+  const pathless = rejectedNames.length
+    ? `${rejectedNames.join(", ")} — that file has no path on disk. Save it first, then attach it from Finder.`
+    : null;
+  const failed = imageErrors.length ? imageErrors.join("; ") : null;
+  return {
+    attachments,
+    notice: pathless && failed ? `${pathless} (${failed})` : (pathless ?? failed),
+  };
 }

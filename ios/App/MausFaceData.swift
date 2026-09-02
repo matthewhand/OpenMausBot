@@ -5,6 +5,15 @@
 import CoreGraphics
 
 enum MausState: String, CaseIterable {
+    /// States whose motion carries information — a turn in progress. Faces in
+    /// lists animate only for these; a resting bot earns a resting face.
+    var showsActivity: Bool {
+        switch self {
+        case .listening, .thinking, .searching, .working: return true
+        default: return false
+        }
+    }
+
     case sleeping = "sleeping"
     case waking = "waking"
     case idle = "idle"
@@ -63,7 +72,6 @@ enum MausFaceData {
     static let faceBox: CGFloat = 228.541
     static let faceCentre = CGPoint(x: 120, y: 122.5)
     static let mouthStroke: CGFloat = 7.5
-    static let anchor = (x: CGFloat(87.04), y: CGFloat(98.65), scale: CGFloat(0.84))
     static let gazeTravel = CGPoint(x: 13.2, y: 8.4)
     static let expressionCount = 25
     static let pointsPerRing = 48

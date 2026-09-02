@@ -13,19 +13,26 @@
 //
 // Model ids in the picker are `provider/modelId` composites (e.g.
 // `ollama-cloud/glm-5.2`); `set_model` splits that into pi's separate
-// `{provider, modelId}` fields. The live catalog is probed from
-// `get_available_models` and every entry is flagged `custom` because pi is a
-// custom-only (BYOK) engine — the model picker's Local pane only lists
-// `custom` options for custom-only engines.
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+// `{provider, modelId}` fields. Live local hosts (oMLX / Ollama / EXO /
+// LM Studio / Unsloth) land as `host::model` inject ids the same way the
+// other engines do: mergeLocalInject lists them in Custom, and a pick
+// upserts ~/.pi/agent/models.json so pi can reach the host. The live
+// catalog is probed from `get_available_models` and every entry is flagged
+// `custom` because pi is a custom-only (BYOK) engine — the model picker's
+// Local pane only lists `custom` options for custom-only engines.
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { PROVIDER_CREDENTIAL_ENV, stripWorkspaceCredentialEnv } from "../config.ts";
+import { computerProxyEnv } from "../container-computer.ts";
 import { augmentedPath } from "../env-path.ts";
 import { describeSpawnFailure, killCliTree, spawnCli } from "../procs.ts";
+import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 
 import type {
   DriverCreateInput,
+  EffortLevel,
   ModelCatalog,
   ProviderDriver,
   ProviderInstance,
@@ -34,11 +41,61 @@ import type {
   RuntimeEventListener,
   SendTurnInput,
 } from "../contracts.ts";
-import { newEventId, newId } from "../contracts.ts";
+import { EFFORT_LEVELS, newEventId, newId } from "../contracts.ts";
+import {
+  decodeInjectId,
+  encodeInjectId,
+  hostApiKey,
+  localHost,
+  mergeLocalInject,
+} from "./local-inject.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "piAgent";
 const PI_ARGS = ["--mode", "rpc", "--no-session"];
+const NODE_ENV_FLAG = { ELECTRON_RUN_AS_NODE: "1" };
+
+/** Harness effort → pi thinking level (`set_thinking_level`). The sets match
+ * one-for-one except for the name of the lowest rung: the harness calls it
+ * "none", pi calls it "off". Exported for the test. */
+export function piThinkingLevel(effort: EffortLevel): (typeof EFFORT_LEVELS)[number] | "off" {
+  return effort === "none" ? "off" : effort;
+}
+
+/** Mirror of the Claude driver's integration → stdio MCP mount: every entry is
+ * a JSON-RPC 2.0 stdio server the pi-mcp-extension consumes. Returns null when
+ * there is nothing to mount (the common case). */
+export function buildMcpServers(turn: SendTurnInput): Record<string, unknown> | null {
+  const servers: Record<string, unknown> = {};
+  if (turn.integrations?.composio) servers.composio = { ...turn.integrations.composio };
+  if (turn.integrations?.computer) {
+    servers.computer = {
+      command: process.execPath,
+      args: [SPAWNED_PROXIES.computer],
+      env: { ...NODE_ENV_FLAG, ...computerProxyEnv(turn.integrations.computer) },
+    };
+  } else if (turn.integrations?.localComputer) {
+    const local = turn.integrations.localComputer;
+    servers.computer = {
+      command: local.command,
+      args: local.args,
+      env: local.env,
+      // Host control carries scope so the extension gates every call behind
+      // a permission card; isolated computers deliberately omit it.
+      ...(local.scope ? { scope: local.scope } : {}),
+    };
+  }
+  if (turn.integrations?.agents) servers.agents = { ...turn.integrations.agents };
+  if (turn.integrations?.phone) servers.phone = { ...turn.integrations.phone };
+  if (turn.integrations?.dweb) {
+    servers.dweb = {
+      command: process.execPath,
+      args: [SPAWNED_PROXIES.dweb],
+      env: { ...NODE_ENV_FLAG, DWEB_URL: turn.integrations.dweb.url },
+    };
+  }
+  return Object.keys(servers).length ? servers : null;
+}
 
 /** A pi `get_available_models` response payload, parsed at its I/O boundary. */
 interface PiModelEntry {
@@ -57,7 +114,7 @@ interface PiModelsResponse {
  *  Every option is `custom` (pi is BYOK) and id is the `provider/modelId`
  *  composite the picker and `set_model` both use. Exported for the test. */
 export function parsePiCatalog(stdout: string, fallbackDefault = ""): ModelCatalog {
-  const options: Array<{ id: string; label: string; custom: true }> = [];
+  const options: Array<{ id: string; label: string; custom: true; provider: string }> = [];
   let def = fallbackDefault;
   for (const line of stdout.split("\n")) {
     if (!line.trim()) continue;
@@ -72,12 +129,141 @@ export function parsePiCatalog(stdout: string, fallbackDefault = ""): ModelCatal
     for (const m of res.data?.models ?? []) {
       if (!m?.provider || !m?.id) continue;
       const id = `${m.provider}/${m.id}`;
-      options.push({ id, label: m.name ?? m.id, custom: true });
+      options.push({ id, label: m.name ?? m.id, custom: true, provider: m.provider });
     }
     break;
   }
   if (!def && options.length) def = options[0]!.id;
   return { default: def, options };
+}
+
+/** Split a picker id into pi's `{provider, modelId}`. Accepts both the
+ *  native `provider/modelId` composite and a live-host `host::model`
+ *  inject id. */
+export function splitPiModel(id: string): { provider: string; modelId: string } | null {
+  const inject = decodeInjectId(id);
+  if (inject) return { provider: inject.host, modelId: inject.model };
+  if (!id.includes("/")) return null;
+  const [provider, ...rest] = id.split("/");
+  if (!provider || !rest.length) return null;
+  return { provider, modelId: rest.join("/") };
+}
+
+/** Prefer live `host::model` inject rows over the same model already
+ *  listed as `host/model` from ~/.pi/agent/models.json, so Custom does
+ *  not show duplicates. */
+export function preferPiInjectRows(catalog: ModelCatalog): ModelCatalog {
+  const injectIds = new Set(
+    catalog.options.filter((option) => decodeInjectId(option.id)).map((option) => option.id),
+  );
+  if (!injectIds.size) return catalog;
+  const options = catalog.options.filter((option) => {
+    if (decodeInjectId(option.id)) return true;
+    const slash = option.id.indexOf("/");
+    if (slash <= 0) return true;
+    return !injectIds.has(encodeInjectId(option.id.slice(0, slash), option.id.slice(slash + 1)));
+  });
+  let def = catalog.default;
+  if (def && !options.some((option) => option.id === def)) {
+    const slash = def.indexOf("/");
+    const mapped = slash > 0 ? encodeInjectId(def.slice(0, slash), def.slice(slash + 1)) : "";
+    def = injectIds.has(mapped) ? mapped : (options[0]?.id ?? "");
+  }
+  return { default: def, options };
+}
+
+export async function applyPiLocalCatalog(
+  catalog: ModelCatalog,
+  env: Record<string, string | undefined> = process.env,
+  fetchImpl: typeof fetch = fetch,
+): Promise<ModelCatalog> {
+  return preferPiInjectRows(await mergeLocalInject(catalog, env, fetchImpl));
+}
+
+function piAgentDir(env: Record<string, string | undefined>): string {
+  return join(env.HOME || env.USERPROFILE || homedir(), ".pi", "agent");
+}
+
+/** Upsert a live local host into ~/.pi/agent/models.json so `set_model`
+ *  can reach it. Existing providers and models are kept. Returns the
+ *  `{provider, modelId}` pair pi's RPC expects, or null when the picker
+ *  id is not a model at all. */
+export function ensurePiInjectModel(
+  modelId: string,
+  env: Record<string, string | undefined> = process.env,
+): { provider: string; modelId: string } | null {
+  const split = splitPiModel(modelId);
+  if (!split) return null;
+  const inject = decodeInjectId(modelId);
+  if (!inject) return split;
+  const host = localHost(inject.host);
+  if (!host) return split;
+
+  const dir = piAgentDir(env);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, "models.json");
+  let root: Record<string, unknown> = { providers: {} };
+  if (existsSync(path)) {
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        root = parsed as Record<string, unknown>;
+      } else {
+        // Malformed — do not destroy the file; still return the split so
+        // set_model can try.
+        return split;
+      }
+    } catch {
+      return split;
+    }
+  }
+
+  const providers =
+    root.providers && typeof root.providers === "object" && !Array.isArray(root.providers)
+      ? { ...(root.providers as Record<string, unknown>) }
+      : {};
+  const previous = providers[inject.host];
+  const existing: Record<string, unknown> =
+    previous && typeof previous === "object" && !Array.isArray(previous)
+      ? { ...(previous as Record<string, unknown>) }
+      : {
+          baseUrl: host.baseUrl,
+          api: "openai-completions",
+          apiKey: hostApiKey(host, env),
+          compat: { supportsDeveloperRole: false, supportsReasoningEffort: true },
+          models: [] as Array<Record<string, unknown>>,
+        };
+  existing.baseUrl = host.baseUrl;
+  existing.api = typeof existing.api === "string" && existing.api ? existing.api : "openai-completions";
+  existing.apiKey = hostApiKey(host, env);
+  if (!existing.compat) {
+    existing.compat = { supportsDeveloperRole: false, supportsReasoningEffort: true };
+  }
+  const models: Array<Record<string, unknown>> = Array.isArray(existing.models)
+    ? existing.models.filter(
+        (row): row is Record<string, unknown> => Boolean(row) && typeof row === "object" && !Array.isArray(row),
+      )
+    : [];
+  if (!models.some((row) => row.id === inject.model)) {
+    models.push({
+      id: inject.model,
+      name: inject.model,
+      reasoning: true,
+      input: ["text"],
+      contextWindow: 131072,
+      maxTokens: 16384,
+    });
+  }
+  existing.models = models;
+  providers[inject.host] = existing;
+  root.providers = providers;
+  writeFileSync(path, `${JSON.stringify(root, null, 2)}\n`, { mode: 0o600 });
+  try {
+    chmodSync(path, 0o600);
+  } catch {
+    // Windows ignores POSIX modes; keep the inject even if chmod is unsupported.
+  }
+  return split;
 }
 
 /** The pi-side default model, read from ~/.pi/agent/settings.json so the
@@ -148,14 +334,22 @@ export async function fetchPiModels(
 
 export interface PiConfig {
   cli: string;
+  /** Full-auto: never ask before an action. Host control is unavailable in
+   * this mode — the same knob as Claude's `bypassPermissions` and the ACP
+   * engines' `fullAuto`. */
+  fullAuto: boolean;
 }
 
 function decodeConfig(raw: unknown): PiConfig {
-  if (raw === null || raw === undefined) return { cli: "pi" };
+  if (raw === null || raw === undefined) return { cli: "pi", fullAuto: false };
   if (typeof raw !== "object") throw new Error("pi config must be an object");
-  const obj = raw as { cli?: unknown };
+  const obj = raw as { cli?: unknown; fullAuto?: unknown };
   if (obj.cli !== undefined && typeof obj.cli !== "string") throw new Error("pi config `cli` must be a string");
-  return { cli: obj.cli && obj.cli.trim() ? obj.cli.trim() : "pi" };
+  if (obj.fullAuto !== undefined && typeof obj.fullAuto !== "boolean") throw new Error("pi config `fullAuto` must be a boolean");
+  return {
+    cli: obj.cli && obj.cli.trim() ? obj.cli.trim() : "pi",
+    fullAuto: obj.fullAuto === true,
+  };
 }
 
 const EMPTY: ModelCatalog = { default: "", options: [] };
@@ -174,7 +368,7 @@ interface PiEvent {
   toolName?: string;
   isError?: boolean;
   // turn_end / message_end
-  message?: { stopReason?: string; usage?: { input?: number; output?: number } };
+  message?: { stopReason?: string; errorMessage?: string; usage?: { input?: number; output?: number } };
   usage?: { input?: number; output?: number };
   // extension_ui_request
   id?: string;
@@ -216,11 +410,18 @@ export const PiDriver: ProviderDriver<PiConfig> = {
     const catalogEnv = piEnvironment({ ...process.env, ...input.environment });
     let models = EMPTY;
     const refreshModels = async () => {
+      let base = models;
       try {
         const resolved = await fetchPiModels(config.cli, catalogEnv);
-        if (resolved.options.length) models = resolved;
+        if (resolved.options.length) base = resolved;
       } catch {
         // Keep the last usable catalog when the probe fails.
+      }
+      try {
+        const next = await applyPiLocalCatalog(base, catalogEnv);
+        if (next.options.length) models = next;
+      } catch {
+        if (base.options.length) models = base;
       }
     };
     await refreshModels();
@@ -249,15 +450,71 @@ export const PiDriver: ProviderDriver<PiConfig> = {
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
+      // Host control always routes through the permission card; full-auto must
+      // never get unapproved hands on the user's machine (same guard as the
+      // Claude and ACP drivers).
+      const controlsHost = turn.integrations?.localComputer?.scope === "local-computer";
+      if (controlsHost && config.fullAuto) {
+        throw new Error("local computer control requires the interactive approval broker");
+      }
       const turnId = newId();
       const pending = new Map<string, (decision: { behavior: "allow" | "deny" | "answer"; message?: string }) => void>();
       let settled = false;
 
-      const child = spawnCli(config.cli, PI_ARGS, {
-        stdio: ["pipe", "pipe", "pipe"],
-        cwd: turn.cwd,
-        env: piEnvironment({ ...process.env, ...input.environment }),
-      });
+      // Write ~/.pi/agent/models.json before creating any credential-bearing
+      // MCP temp files. If model setup fails, there is nothing sensitive to
+      // clean up yet.
+      if (typeof turn.model === "string" && turn.model) {
+        ensurePiInjectModel(turn.model, { ...process.env, ...input.environment });
+      }
+
+      // integrations → stdio MCP servers for the pi-mcp-extension. The config
+      // carries credentials (box token, composio key, comms token), so it goes
+      // into a 0600 temp file removed when the turn settles — never on argv.
+      const mcpServers = buildMcpServers(turn);
+      let mcpTempDir: string | null = null;
+      if (mcpServers) {
+        mcpTempDir = mkdtempSync(join(tmpdir(), "omb-pi-mcp-"));
+        try {
+          writeFileSync(join(mcpTempDir, "mcp.json"), JSON.stringify({ mcpServers }), { mode: 0o600 });
+        } catch (err) {
+          // A failed write must not leave the temp dir behind — a partial file
+          // could still hold the box token / composio key / comms token.
+          try {
+            rmSync(mcpTempDir, { recursive: true, force: true });
+          } catch {
+            /* best effort */
+          }
+          throw err;
+        }
+      }
+      const childArgs = mcpServers ? [...PI_ARGS, "-e", SPAWNED_PROXIES.piMcpExtension] : PI_ARGS;
+
+      // spawnCli can throw synchronously (unresolvable CLI); if it does, the
+      // 0600 temp file with the box token / composio key / comms token must
+      // not be left on disk — settle() never runs because no child existed.
+      const child = (() => {
+        try {
+          return spawnCli(config.cli, childArgs, {
+            stdio: ["pipe", "pipe", "pipe"],
+            cwd: turn.cwd,
+            env: piEnvironment({
+              ...process.env,
+              ...input.environment,
+              ...(mcpServers && mcpTempDir ? { OMB_MCP_CONFIG: join(mcpTempDir, "mcp.json") } : {}),
+            }),
+          });
+        } catch (err) {
+          if (mcpTempDir) {
+            try {
+              rmSync(mcpTempDir, { recursive: true, force: true });
+            } catch {
+              /* best effort */
+            }
+          }
+          throw err;
+        }
+      })();
       let buf = "";
       let assistantText = "";
       // resolve one-shot RPC responses (new_session / switch_session / set_model)
@@ -312,6 +569,13 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           killCliTree(child);
         } catch {
           /* already gone */
+        }
+        if (mcpTempDir) {
+          try {
+            rmSync(mcpTempDir, { recursive: true, force: true });
+          } catch {
+            /* best effort */
+          }
         }
         active.delete(threadId);
       };
@@ -383,6 +647,15 @@ export const PiDriver: ProviderDriver<PiConfig> = {
               flushAssistantText();
               const reqId = evt.id ?? newId();
               const isQuestion = evt.method === "input";
+              // Register BEFORE emitting: the harness may auto-approve from
+              // inside its synchronous request.opened listener. Emitting first
+              // made respondToRequest see no pending ask, return unavailable,
+              // then fall back to a human card on every "Always allow" call.
+              pending.set(reqId, (decision) => {
+                if (decision.behavior === "deny") send({ type: "extension_ui_response", id: reqId, cancelled: true });
+                else if (isQuestion) send({ type: "extension_ui_response", id: reqId, value: decision.message ?? "" });
+                else send({ type: "extension_ui_response", id: reqId, confirmed: true });
+              });
               emit({
                 ...base(threadId, turnId),
                 requestId: reqId,
@@ -390,11 +663,6 @@ export const PiDriver: ProviderDriver<PiConfig> = {
                 requestType: isQuestion ? "question" : "permission",
                 tool: String(evt.title ?? "pi"),
                 summary: String(evt.title ?? "pi wants confirmation"),
-              });
-              pending.set(reqId, (decision) => {
-                if (decision.behavior === "deny") send({ type: "extension_ui_response", id: reqId, cancelled: true });
-                else if (isQuestion) send({ type: "extension_ui_response", id: reqId, value: decision.message ?? "" });
-                else send({ type: "extension_ui_response", id: reqId, confirmed: true });
               });
             }
             return;
@@ -406,7 +674,16 @@ export const PiDriver: ProviderDriver<PiConfig> = {
             // answer — settling now would drop the final reply.
             if (sr === "toolUse" || sr === "tool_use" || sr === "tool_calls") return;
             const usage = evt.usage ?? evt.message?.usage;
-            settle(true, sr === "cancelled" ? "cancelled" : "end_turn", usage);
+            if (sr === "error" || sr === "failed") {
+              emit({
+                ...base(threadId, turnId),
+                type: "runtime.error",
+                message: String(evt.message?.errorMessage ?? "pi turn failed").slice(0, 2_000),
+              });
+              settle(false, "failed", usage);
+              return;
+            }
+            settle(true, sr === "cancelled" || sr === "aborted" ? "cancelled" : "end_turn", usage);
             return;
           }
           default:
@@ -466,15 +743,27 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         // accepts a prompt without an explicit session.
       }
 
-      // pin the chosen model (composite id → provider + modelId)
-      if (typeof turn.model === "string" && turn.model.includes("/")) {
-        const [provider, ...rest] = turn.model.split("/");
+      // pin the chosen model (composite id or host::model inject → provider + modelId)
+      const chosen = typeof turn.model === "string" ? splitPiModel(turn.model) : null;
+      if (chosen) {
         try {
           const modelPromise = awaitResponse("set_model");
-          send({ type: "set_model", provider, modelId: rest.join("/") });
+          send({ type: "set_model", provider: chosen.provider, modelId: chosen.modelId });
           await modelPromise;
         } catch {
           /* keep going on the default model */
+        }
+      }
+
+      // pin reasoning effort after the model (the supported level set is
+      // model-dependent); a rejection keeps the engine default
+      if (turn.effort) {
+        try {
+          const levelPromise = awaitResponse("set_thinking_level");
+          send({ type: "set_thinking_level", level: piThinkingLevel(turn.effort) });
+          await levelPromise;
+        } catch {
+          /* keep going on the engine default */
         }
       }
 
@@ -536,12 +825,25 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         capabilities: {
           // model is set per turn via set_model before prompt
           sessionModelSwitch: "in-session",
-          // pi's own tools are first-party; the harness MCP integrations are
-          // not mounted in this driver yet.
-          agentsMcp: false,
-          computerMcp: false,
-          composioMcp: false,
-          images: false,
+          // Integrations arrive as stdio MCP servers mounted by the
+          // pi-mcp-extension (pi core has no MCP client of its own).
+          agentsMcp: true,
+          computerMcp: true,
+          composioMcp: true,
+          phoneMcp: true,
+          // Host control (the user's real Mac) rides the pi-native permission
+          // card (`ctx.ui.confirm` → extension_ui_request) gated in the
+          // extension, so it is offered exactly when the other engines offer
+          // it: enabled unless the bot is in full-auto.
+          localComputerMcp: !config.fullAuto,
+          // Images ride the ordinary prompt as <attached-image path> refs the
+          // agent opens with its read tool — no native image blocks needed,
+          // same as every other CLI engine.
+          images: true,
+          // Reasoning effort pins pi's thinking level per turn (none → off).
+          // xhigh/max only land on models that expose them; pi rejects an
+          // unsupported level and the turn keeps the engine default.
+          effortLevels: EFFORT_LEVELS,
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.stop(),

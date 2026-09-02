@@ -1,9 +1,15 @@
-// Voice, wired to config. Routes to either ElevenLabs or an OpenAI-compatible
-// provider based on config.provider. Defaults to ElevenLabs for backward
-// compatibility with existing configs that have no provider field.
+// Voice, wired to config. Three engines live behind this file: ElevenLabs
+// (elevenlabs.ts, needs a key), OpenAI-compatible servers such as Kokoro
+// (openai-compatible.ts, needs a base URL; key optional), and the Mac's
+// built-in voices (system-voices.ts, no key). This file reads
+// ~/.openmausbot/config.json, picks the engine, and decides whether there
+// is a voice at all.
 import type { AppConfig } from "../config.ts";
 import * as elevenlabs from "./elevenlabs.ts";
 import * as openaiCompatible from "./openai-compatible.ts";
+import * as systemVoices from "./system-voices.ts";
+
+export type VoiceProvider = "elevenlabs" | "openai-compatible" | "system";
 
 export class NoVoiceConfigured extends Error {
   // a plain field rather than a constructor parameter property: the harness
@@ -27,25 +33,44 @@ export class NoVoiceConfigured extends Error {
   }
 }
 
-function getProvider(cfg: AppConfig): "elevenlabs" | "openai-compatible" {
-  // Default to elevenlabs for backward compatibility with existing configs
-  return cfg.tts?.provider ?? "elevenlabs";
+export function voiceProvider(cfg: AppConfig): VoiceProvider {
+  const provider = cfg.tts?.provider;
+  if (provider === "system" || provider === "openai-compatible") return provider;
+  return "elevenlabs";
+}
+
+function getProvider(cfg: AppConfig): VoiceProvider {
+  return voiceProvider(cfg);
+}
+
+/** The system provider needs no credential — it is only ever offered where
+ * the platform actually has it, so "configured" means "this engine can
+ * speak", not "a key is on file". */
+export function providerConfigured(cfg: AppConfig): boolean {
+  const provider = voiceProvider(cfg);
+  if (provider === "system") return systemVoices.systemVoicesAvailable();
+  if (provider === "openai-compatible") return Boolean(cfg.tts?.baseUrl);
+  return Boolean(cfg.tts?.key);
 }
 
 export function voiceConfigured(cfg: AppConfig): boolean {
-  const provider = getProvider(cfg);
+  const provider = voiceProvider(cfg);
+  if (provider === "system") {
+    return systemVoices.systemVoicesAvailable() && Boolean(cfg.tts?.voice);
+  }
   if (provider === "openai-compatible") {
-    // OpenAI-compatible needs baseUrl and voice; key is optional
     return Boolean(cfg.tts?.baseUrl && cfg.tts?.voice);
   }
-  // ElevenLabs needs key and voice
   return Boolean(cfg.tts?.key && cfg.tts?.voice);
 }
 
 /** A per-bot voice is a complete choice too; it should not be blocked just
  * because the app-wide fallback has not been selected yet. */
 export function voiceReady(cfg: AppConfig, voiceId?: string): boolean {
-  const provider = getProvider(cfg);
+  const provider = voiceProvider(cfg);
+  if (provider === "system") {
+    return systemVoices.systemVoicesAvailable() && Boolean(voiceId || cfg.tts?.voice);
+  }
   if (provider === "openai-compatible") {
     return Boolean(cfg.tts?.baseUrl && (voiceId || cfg.tts?.voice));
   }
@@ -58,7 +83,7 @@ export function describeVoice(cfg: AppConfig) {
   const provider = getProvider(cfg);
   return {
     provider,
-    configured: provider === "openai-compatible" ? Boolean(cfg.tts?.baseUrl) : Boolean(cfg.tts?.key),
+    configured: providerConfigured(cfg),
     ready: voiceConfigured(cfg),
     voice: cfg.tts?.voice ?? "",
     baseUrl: cfg.tts?.baseUrl ?? "",
@@ -66,7 +91,12 @@ export function describeVoice(cfg: AppConfig) {
   };
 }
 
-export function verifyKey(key: string, provider: "elevenlabs" | "openai-compatible", baseUrl?: string, model?: string) {
+export function verifyKey(
+  key: string,
+  provider: "elevenlabs" | "openai-compatible" = "elevenlabs",
+  baseUrl?: string,
+  model?: string,
+) {
   if (provider === "openai-compatible") {
     if (!baseUrl) {
       return Promise.resolve({ ok: false, message: "Base URL is required for OpenAI-compatible servers." } as const);
@@ -76,8 +106,9 @@ export function verifyKey(key: string, provider: "elevenlabs" | "openai-compatib
   return elevenlabs.verifyKey(key);
 }
 
-export async function listVoices(cfg: AppConfig): Promise<elevenlabs.Voice[]> {
-  const provider = getProvider(cfg);
+export async function listVoices(cfg: AppConfig, run?: systemVoices.Runner): Promise<elevenlabs.Voice[]> {
+  const provider = voiceProvider(cfg);
+  if (provider === "system") return systemVoices.listSystemVoices(run);
   if (provider === "openai-compatible") {
     const baseUrl = cfg.tts?.baseUrl;
     if (!baseUrl) return [];
@@ -90,8 +121,17 @@ export async function listVoices(cfg: AppConfig): Promise<elevenlabs.Voice[]> {
 
 /** Synthesize one utterance. Throws NoVoiceConfigured when there is nothing
  * to speak with, which the route turns into a 409 the client can explain. */
-export function speak(cfg: AppConfig, text: string, voiceId?: string) {
-  const provider = getProvider(cfg);
+export function speak(cfg: AppConfig, text: string, voiceId?: string, run?: systemVoices.Runner) {
+  const provider = voiceProvider(cfg);
+
+  if (provider === "system") {
+    const voice = voiceId || cfg.tts?.voice;
+    // An injected runner is the cross-platform test seam for `/usr/bin/say`;
+    // production calls omit it and remain strictly Darwin-gated.
+    if (!systemVoices.systemVoicesAvailable() && !run) throw new NoVoiceConfigured("key");
+    if (!voice) throw new NoVoiceConfigured("voice");
+    return systemVoices.synthesizeSystem(text, voice, run);
+  }
 
   if (provider === "openai-compatible") {
     const baseUrl = cfg.tts?.baseUrl;
@@ -101,7 +141,6 @@ export function speak(cfg: AppConfig, text: string, voiceId?: string) {
     return openaiCompatible.synthesize(text, voice, baseUrl, cfg.tts?.key, cfg.tts?.model);
   }
 
-  // ElevenLabs: check key first, then voice (matches the original behavior)
   const key = cfg.tts?.key;
   if (!key) throw new NoVoiceConfigured("key", provider);
   const voice = voiceId || cfg.tts?.voice;

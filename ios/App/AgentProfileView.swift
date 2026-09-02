@@ -43,6 +43,10 @@ struct AgentProfileView: View {
     private var voiceConfigured: Bool { config?.isTTSConfigured == true }
     private var hasWorkspaceDefaultVoice: Bool { config?.hasWorkspaceDefaultVoice == true }
     private var selectedVoiceCanSpeak: Bool { config?.canSpeak(agentVoice: voice) == true }
+    /// Which engine's words to use. An unloaded status is ElevenLabs for the
+    /// same reason a missing `provider` is: that is the server's own fallback,
+    /// and the copy that shipped.
+    private var usesSystemVoices: Bool { config?.voiceProvider == .system }
 
     var body: some View {
         NavigationStack {
@@ -50,7 +54,7 @@ struct AgentProfileView: View {
                 Section {
                     HStack {
                         Spacer()
-                        BotAvatarView(bot: current, size: 112, state: .happy)
+                        BotAvatarView(bot: current, size: 112, state: .happy, animated: true)
                         Spacer()
                     }
                     .listRowBackground(Color.clear)
@@ -76,7 +80,7 @@ struct AgentProfileView: View {
                 } header: {
                     Text("Avatar")
                 } footer: {
-                    Text("PNG, JPEG, GIF, or WebP, up to 10 MB. Images are stored on your paired computer and loaded with this phone's pairing token.")
+                    Text("PNG, JPEG, GIF, or WebP, up to 10 MB. Images are stored on your paired computer and loaded with this device's pairing token.")
                 }
 
                 Section {
@@ -90,8 +94,8 @@ struct AgentProfileView: View {
                     Text("Generate an avatar")
                 } footer: {
                     Text(imageGenerationReady
-                         ? "Generation uses the shared image provider configured on your computer. No provider key is sent to or stored on this phone."
-                         : "To generate images, configure the shared image provider in OpenMausBot on your computer. Provider keys cannot be added from a phone.")
+                         ? "Generation uses the shared image provider configured on your computer. No provider key is sent to or stored on this device."
+                         : "To generate images, configure the shared image provider in OpenMausBot on your computer. Provider keys cannot be added from this device.")
                 }
 
                 Section("Identity") {
@@ -134,6 +138,9 @@ struct AgentProfileView: View {
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                         }
+                    } else if usesSystemVoices {
+                        Label("Built-in Mac voices are unavailable", systemImage: "speaker.slash")
+                            .foregroundStyle(.secondary)
                     } else {
                         Label("ElevenLabs is not configured", systemImage: "speaker.slash")
                             .foregroundStyle(.secondary)
@@ -142,9 +149,22 @@ struct AgentProfileView: View {
                     Text("Voice")
                 } footer: {
                     if !voiceConfigured {
-                        Text("Add the shared ElevenLabs key in this agent's profile on the computer. The key is never returned to iOS.")
+                        // Under the built-in engine "not configured" is not a
+                        // missing credential — there is none — so the remedy
+                        // cannot be a key. `providerConfigured` in
+                        // `server/tts/index.ts` is reporting that this
+                        // computer has no built-in voices to speak with.
+                        if usesSystemVoices {
+                            Text("Built-in Mac voices need no key, and this computer has none available. Switch the voice engine to ElevenLabs in this agent's profile on the computer to keep using voice.")
+                        } else {
+                            Text("Add the shared ElevenLabs key in this agent's profile on the computer. The key is never returned to iOS.")
+                        }
                     } else if !hasWorkspaceDefaultVoice {
-                        Text("No workspace default voice is selected. Choose an agent-specific voice above; synthesis still uses the shared ElevenLabs key on your computer.")
+                        if usesSystemVoices {
+                            Text("No workspace default voice is selected. Choose an agent-specific voice above; synthesis still uses the built-in Mac voices on your computer.")
+                        } else {
+                            Text("No workspace default voice is selected. Choose an agent-specific voice above; synthesis still uses the shared ElevenLabs key on your computer.")
+                        }
                     } else {
                         Text("The voice choice belongs to this agent. Workspace default uses the shared voice selected on your computer.")
                     }
@@ -239,24 +259,45 @@ struct AgentProfileView: View {
     private func generateImage() async {
         busy = true
         defer { busy = false }
-        let intendedCrop = crop == .mascot ? AvatarCrop.circle : crop
+        // What the selector said when the request went out. The desktop
+        // compares the same way (`latestCrop === cropAtStart` in
+        // `src/components/BotProfileAvatarCard.tsx`) so a selector moved
+        // mid-flight still wins over the server's pick.
+        let cropAtStart = crop
         guard let generated = await session.generateAvatar(
             prompt: String(prompt.trimmingCharacters(in: .whitespacesAndNewlines).prefix(400)),
             for: current
         ) else { return }
-        // Generation chooses a safe default crop server-side. The selector is
-        // the user's explicit choice, so persist it immediately against the
-        // returned attachment rather than leaving UI and server out of sync.
-        let shapePatch = BotProfilePatch(avatarCrop: intendedCrop)
-        if let updated = await session.updateProfile(shapePatch, for: generated) {
-            crop = updated.avatarCrop ?? intendedCrop
+
+        // `AvatarCrop.afterGenerating` is the shared decision: the server's
+        // pick unless the selector moved while the request was in flight, in
+        // which case that newer explicit choice wins.
+        let resolved = AvatarCrop.afterGenerating(
+            cropAtStart: cropAtStart,
+            latestCrop: crop,
+            serverCrop: generated.avatarCrop
+        )
+
+        guard crop != cropAtStart else {
+            crop = resolved
             baseline.crop = crop
-        } else {
-            // Generation itself succeeded. Reflect its authoritative fallback
-            // rather than claiming the requested crop was persisted.
-            crop = generated.avatarCrop ?? .mascot
-            baseline.crop = crop
+            return
         }
+
+        // The user moved the selector while the image was generating: an
+        // explicit choice made after the request, so persist it against the
+        // returned attachment rather than leaving UI and server out of sync.
+        if let updated = await session.updateProfile(BotProfilePatch(avatarCrop: resolved), for: generated) {
+            crop = updated.avatarCrop ?? resolved
+        } else {
+            // Generation itself succeeded. Reflect its authoritative result
+            // rather than claiming the requested crop was persisted. A `nil`
+            // crop here matches `afterGenerating`'s own fallback: `.circle`,
+            // not `.mascot`, which would throw away the picture just
+            // generated.
+            crop = generated.avatarCrop ?? .circle
+        }
+        baseline.crop = crop
     }
 
     private func previewVoice() async {

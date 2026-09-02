@@ -16,6 +16,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { LICENSE_FILES } from "./cua-linux-release.mjs";
+import {
+  CLOUDFLARED_ASSETS,
+  CLOUDFLARED_VERSION,
+  executableTarget,
+} from "./prepare-cloudflared.mjs";
 
 const require = createRequire(import.meta.url);
 const { validateDriverCandidate } = require("../electron/cua-linux.cjs");
@@ -45,6 +50,33 @@ function requireExecutable(file) {
     accessSync(file, constants.X_OK);
   } catch {
     fail(`not executable: ${file}`);
+  }
+}
+
+// electron-updater picks its installer from resources/package-type: present
+// and reading "deb" routes to DebUpdater, absent falls back to AppImageUpdater.
+// electron/updater.mjs reads the same marker to decide whether the update is
+// applied in place or handed to the system package manager. If packaging ever
+// puts the marker in both artifacts (or neither), that routing silently
+// inverts, so pin it here where both trees are already extracted.
+function requirePackageType(resources, label, expected) {
+  const marker = path.join(resources, "package-type");
+  const found = statSync(marker, { throwIfNoEntry: false })?.isFile()
+    ? readFileSync(marker, "utf8").trim()
+    : null;
+  if (found !== expected) {
+    fail(
+      `${label} package-type marker is ${JSON.stringify(found)}, expected ${JSON.stringify(expected)}`,
+    );
+  }
+}
+
+function requireUpdaterTarget(resources, label) {
+  const updateFile = path.join(resources, "app-update.yml");
+  requireFile(updateFile);
+  const update = readFileSync(updateFile, "utf8");
+  if (!/^owner: milind-soni$/m.test(update) || !/^repo: OpenMausBot$/m.test(update)) {
+    fail(`${label} app-update.yml does not point at milind-soni/OpenMausBot`);
   }
 }
 
@@ -320,6 +352,50 @@ function verifyCuaResources(resources, label, {
   return expectedHashes;
 }
 
+function verifyCloudflaredResources(resources, label, { directoryMode = 0o755 } = {}) {
+  const cloudflaredRoot = path.join(resources, "cloudflared");
+  const executable = path.join(cloudflaredRoot, "cloudflared");
+  requireDirectoryMode(cloudflaredRoot, directoryMode);
+  requireExactEntries(cloudflaredRoot, ["cloudflared"]);
+  requireContained(resources, cloudflaredRoot);
+  requireRegularMode(executable, 0o755);
+  requireContained(cloudflaredRoot, executable);
+
+  const expectedHash = CLOUDFLARED_ASSETS["linux-x64"].binarySha256;
+  const actualHash = sha256(executable);
+  if (actualHash !== expectedHash) {
+    fail(`${label} has the wrong hash for cloudflared: ${actualHash}`);
+  }
+  if (executableTarget(readFileSync(executable)) !== "linux-x64") {
+    fail(`${label} cloudflared does not contain the reviewed Linux x64 executable`);
+  }
+  const version = execFileSync(executable, ["version"], {
+    encoding: "utf8",
+    timeout: 5_000,
+  }).trim();
+  if (!version.startsWith(`cloudflared version ${CLOUDFLARED_VERSION} `)) {
+    fail(`${label} cloudflared version is ${JSON.stringify(version)}`);
+  }
+
+  const licenses = path.join(resources, "licenses");
+  requireDirectoryMode(licenses, directoryMode);
+  for (const name of ["cloudflared-LICENSE.txt", "cloudflared-README.md"]) {
+    requireRegularMode(path.join(licenses, name), 0o644);
+    requireContained(licenses, path.join(licenses, name));
+  }
+  if (sha256(path.join(licenses, "cloudflared-LICENSE.txt")) !== sha256(path.join(root, "LICENSE"))) {
+    fail(`${label} cloudflared license text differs from the reviewed Apache 2.0 text`);
+  }
+  if (
+    sha256(path.join(licenses, "cloudflared-README.md")) !==
+    sha256(path.join(root, "third_party", "cloudflared", "README.md"))
+  ) {
+    fail(`${label} cloudflared release provenance differs from the reviewed record`);
+  }
+
+  return actualHash;
+}
+
 const appImage = exactlyOne(".AppImage");
 const deb = exactlyOne(".deb");
 const unpacked = path.join(releaseDir, "linux-unpacked");
@@ -338,6 +414,8 @@ for (const forbidden of ["speech-helper", "cua-driver", "cua-sdk"]) {
   }
 }
 const unpackedCuaHashes = verifyCuaResources(resources, "linux-unpacked");
+const unpackedCloudflaredHash = verifyCloudflaredResources(resources, "linux-unpacked");
+requireUpdaterTarget(resources, "linux-unpacked");
 
 const fields = execFileSync(
   "dpkg-deb",
@@ -360,7 +438,14 @@ try {
   const debAppRoot = path.join(extracted, "opt", "OpenMausBot");
   requireDirectoryMode(debAppRoot, 0o755);
   const debResources = path.join(debAppRoot, "resources");
+  // Routes the in-app updater to the package-manager hand-off.
+  requirePackageType(debResources, "DEB", "deb");
+  requireUpdaterTarget(debResources, "DEB");
   const debHashes = verifyCuaResources(debResources, "DEB");
+  const debCloudflaredHash = verifyCloudflaredResources(debResources, "DEB");
+  if (debCloudflaredHash !== unpackedCloudflaredHash) {
+    fail(`DEB and linux-unpacked cloudflared hashes differ`);
+  }
   for (const [unpackedFile, expected] of unpackedCuaHashes) {
     const packaged = path.join(debResources, "cua-linux-x64", path.basename(unpackedFile));
     if (debHashes.get(packaged) !== expected) fail(`DEB and linux-unpacked CUA hashes differ`);
@@ -419,6 +504,9 @@ try {
     );
   }
   const appImageResources = path.join(squashRoot, "resources");
+  // No marker: the AppImage keeps the in-place restart-to-update path.
+  requirePackageType(appImageResources, "AppImage", null);
+  requireUpdaterTarget(appImageResources, "AppImage");
   // Depending on the pinned appimagetool runtime, SquashFS directories are
   // emitted as root:root 0755 or 0775. Require one mode consistently across
   // the reviewed resource tree. The app never executes through that path:
@@ -429,6 +517,12 @@ try {
     directoryMode: appImageDirectoryMode,
     validateRuntimePath: false,
   });
+  const appImageCloudflaredHash = verifyCloudflaredResources(appImageResources, "AppImage", {
+    directoryMode: appImageDirectoryMode,
+  });
+  if (appImageCloudflaredHash !== unpackedCloudflaredHash) {
+    fail(`AppImage and linux-unpacked cloudflared hashes differ`);
+  }
   for (const [unpackedFile, expected] of unpackedCuaHashes) {
     const packaged = path.join(appImageResources, "cua-linux-x64", path.basename(unpackedFile));
     if (appImageHashes.get(packaged) !== expected) fail(`AppImage and linux-unpacked CUA hashes differ`);

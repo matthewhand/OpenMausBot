@@ -1,7 +1,7 @@
 // Compact model picker: providers live on a Cloud/Local rail. Ready engines
 // show a short suggested list with search and an explicit all-models view;
 // engines that need setup show one focused action instead of a disabled wall.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Check, ChevronDown, ChevronLeft, ChevronRight, Search } from "lucide-react";
 import { useStore, type Bot, type InstanceInfo, type ModelSelection } from "@/state/store";
 import { filterCustomModels, partitionCustomModels, suggestedModels } from "@/lib/custom-models";
@@ -17,6 +17,10 @@ const COMPACT_MODEL_COUNT = 5;
 
 function modelLabel(instance: InstanceInfo | undefined, model: string): string {
   return instance?.models.options.find((option) => option.id === model)?.label ?? model;
+}
+
+function modelProvider(instance: InstanceInfo | undefined, model: string): string | undefined {
+  return instance?.models.options.find((option) => option.id === model)?.provider;
 }
 
 function engineStatus(instance: InstanceInfo): string {
@@ -47,6 +51,14 @@ function ModelRow({
     >
       <span className="flex min-w-0 items-center gap-2">
         <span className="truncate">{option.label}</span>
+        {option.provider && (
+          <span
+            className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary"
+            title={`Provider: ${option.provider}`}
+          >
+            {option.provider}
+          </span>
+        )}
         {option.id === defaultId && (
           <span className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary">Default</span>
         )}
@@ -91,7 +103,19 @@ function ModelSearch({
   );
 }
 
-export function ModelPicker({ bot, className }: { bot: Bot; className?: string }) {
+export function ModelPicker({
+  bot,
+  className,
+  contained = false,
+  label,
+}: {
+  bot: Bot;
+  className?: string;
+  /** Expand the menu in-flow under the trigger so it cannot overflow a
+   * narrow parent (the Agent profile sidebar). */
+  contained?: boolean;
+  label?: ReactNode;
+}) {
   const { state, dispatch, refreshInstances } = useStore();
   const [open, setOpen] = useState(false);
   const [railId, setRailId] = useState<string | null>(null);
@@ -193,45 +217,74 @@ export function ModelPicker({ bot, className }: { bot: Bot; className?: string }
     />
   );
 
-  return (
-    <div ref={rootRef} className={cn("relative", className)}>
-      <button
-        type="button"
-        onClick={() => {
-          setRailId(selection.instanceId);
-          setOpen((wasOpen) => {
-            const next = !wasOpen;
-            if (next) openFor(state.instances.find((instance) => instance.instanceId === selection.instanceId));
-            return next;
-          });
-        }}
-        aria-expanded={open}
-        aria-haspopup="dialog"
-        className={cn(
-          "flex items-center gap-1.5 rounded-full border border-hairline/40 bg-control/60 py-1 pl-2 pr-2.5 text-[13px] text-ink hover:bg-raised-hover",
-          // in a narrow chat header fold to a rounded square with just the
-          // provider mark; the model name rides the tooltip (a bot with no
-          // resolved engine keeps its label — the mark is what would hide it)
-          active && COMPACT_SQUARE,
+  const trigger = (
+    <button
+      type="button"
+      onClick={() => {
+        setRailId(selection.instanceId);
+        setOpen((wasOpen) => {
+          const next = !wasOpen;
+          if (next) openFor(state.instances.find((instance) => instance.instanceId === selection.instanceId));
+          return next;
+        });
+      }}
+      aria-expanded={open}
+      aria-haspopup="dialog"
+      className={cn(
+        "flex items-center gap-1.5 rounded-full border border-hairline/40 bg-control/60 py-1 pl-2 pr-2.5 text-[13px] text-ink hover:bg-raised-hover",
+        // in a narrow chat header fold to a rounded square with just the
+        // provider mark; the model name rides the tooltip (a bot with no
+        // resolved engine keeps its label — the mark is what would hide it)
+        !contained && active && COMPACT_SQUARE,
+      )}
+      title={
+        active
+          ? `${active.displayName} · ${modelLabel(active, selection.model)}${
+              modelProvider(active, selection.model) ? ` · ${modelProvider(active, selection.model)}` : ""
+            }`
+          : selection.model
+      }
+    >
+      {active && <ProviderMark driverKind={active.driverKind} size={14} />}
+      <span className={cn("max-w-[160px] truncate", !contained && active && "@max-4xl/chathead:hidden")}>
+        {modelLabel(active, selection.model)}
+        {active && modelProvider(active, selection.model) && (
+          <span className="text-ink-secondary"> · {modelProvider(active, selection.model)}</span>
         )}
-        title={active ? `${active.displayName} · ${modelLabel(active, selection.model)}` : selection.model}
-      >
-        {active && <ProviderMark driverKind={active.driverKind} size={14} />}
-        <span className={cn("max-w-[160px] truncate", active && "@max-4xl/chathead:hidden")}>
-          {modelLabel(active, selection.model)}
-        </span>
-        <ChevronDown
-          size={14}
-          className={cn("text-ink-secondary transition-transform", open && "rotate-180", active && "@max-4xl/chathead:hidden")}
-        />
-      </button>
+      </span>
+      <ChevronDown
+        size={14}
+        className={cn(
+          "text-ink-secondary transition-transform",
+          open && "rotate-180",
+          !contained && active && "@max-4xl/chathead:hidden",
+        )}
+      />
+    </button>
+  );
+
+  return (
+    <div ref={rootRef} className={cn(contained ? "w-full" : "relative", className)}>
+      {contained ? (
+        <div className="flex items-center justify-between gap-4">
+          {label}
+          {trigger}
+        </div>
+      ) : (
+        trigger
+      )}
 
       {open && (
         <div
           data-model-picker-content
           role="dialog"
           aria-label="Choose model"
-          className="absolute right-0 top-full z-30 mt-2 flex max-h-[min(480px,calc(100dvh-7rem))] w-[380px] overflow-hidden rounded-2xl border border-hairline/50 bg-card shadow-2xl shadow-black/50"
+          className={cn(
+            "flex overflow-hidden rounded-2xl border border-hairline/50 bg-card",
+            contained
+              ? "relative mt-3 w-full max-h-[min(420px,50dvh)]"
+              : "absolute right-0 top-full z-30 mt-2 w-[380px] max-h-[min(480px,calc(100dvh-7rem))] shadow-2xl shadow-black/50",
+          )}
         >
           <div className="flex w-14 shrink-0 flex-col gap-1 overflow-y-auto border-r border-hairline/40 bg-panel p-2">
             {(() => {

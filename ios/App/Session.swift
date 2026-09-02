@@ -32,14 +32,21 @@ final class Session: ObservableObject {
 
     @Published private(set) var state = CompanionState()
     @Published private(set) var connection: Connection?
+    @Published private(set) var connections: [Connection] = []
     @Published private(set) var status: Status = .unpaired
     /// Transient, user-facing failures from an action they just took.
     @Published var actionError: String?
     /// One exact message the next opened chat should reveal.
     @Published private(set) var focusedMessageId: String?
     @Published private(set) var notificationAuthorization: UNAuthorizationStatus = .notDetermined
+    /// Distinguishes a real `.notDetermined` result from the in-memory value
+    /// used while notification settings are still loading at launch.
+    @Published private(set) var notificationAuthorizationResolved = false
     /// A short-lived desktop handoff waiting for PairingView to present it.
     @Published private(set) var pairingInvite: PairingInvite?
+    /// Pairing can be opened while another computer remains connected. The
+    /// working session is only replaced after the new credential commits.
+    @Published private(set) var pairingRequested = false
 
     /// A notification response that should be pushed by the roster's
     /// NavigationStack after the exact detached task has been activated.
@@ -55,6 +62,9 @@ final class Session: ObservableObject {
     /// and persisted — when a stream goes live.
     private var rotation = CandidateRotation(hosts: [])
     private var streamTask: Task<Void, Never>?
+    /// Best-effort authenticated route refresh started by the latest live SSE
+    /// hello. Kept separate so endpoint discovery never stalls event delivery.
+    private var endpointRefreshTask: Task<Void, Never>?
     /// Identifies the task currently stored in `streamTask`. A cancelled task
     /// can finish after its replacement starts; its cleanup must not clear
     /// the replacement's handle.
@@ -78,6 +88,14 @@ final class Session: ObservableObject {
     /// for the same attachment path.
     private var avatarFetches: [String: (id: UUID, task: Task<Data?, Never>)] = [:]
     private var avatarCacheGeneration = 0
+    /// Only one downloaded document preview is retained. A replacement is
+    /// written completely before the previous directory is removed, so a
+    /// failed download cannot invalidate the file currently on screen.
+    private var filePreviewDirectory: URL?
+    /// An ambiguous network failure may happen after the server accepted a
+    /// message. Reusing this id for the exact same retained draft makes Retry
+    /// idempotent instead of sending the attachment twice.
+    private var attachmentSendIDs: [AttachmentDraftKey: String] = [:]
     /// A saved connection exists, but its token could not be read yet. Keeps
     /// "the keychain is locked" from being mistaken for "not paired".
     private var restorePending = false
@@ -86,21 +104,49 @@ final class Session: ObservableObject {
     /// paired client can be rebuilt after unlock.
     private var pendingNotification: NotificationTarget?
 
-    private static let connectionKey = "companion.connection"
+    private struct AttachmentDraftKey: Hashable {
+        let destination: MessageDestination
+        let text: String
+        let attachmentIDs: [UUID]
+    }
 
+    private var registry = CompanionConnectionRegistry()
     // MARK: - Pairing
 
     init() {
+        Self.removeStaleFilePreviews()
         _ = NotificationCoordinator.shared
         NotificationCoordinator.shared.responseHandler = { [weak self] target in
             Task { @MainActor in await self?.openNotification(target) }
         }
 #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains("-store-preview"),
+        let arguments = ProcessInfo.processInfo.arguments
+        if (arguments.contains("-store-preview") || arguments.contains("-computer-switcher-preview")),
            let url = Bundle.main.url(forResource: "StorePreview", withExtension: "json"),
            let data = try? Data(contentsOf: url),
            let fleet = try? JSONDecoder().decode(Fleet.self, from: data) {
-            connection = Connection(name: "Preview Mac", host: "preview.tailnet.ts.net", port: 8810)
+            let preview = Connection(
+                id: "preview-current",
+                name: "Milind’s MacBook Pro",
+                host: "preview.tailnet.ts.net",
+                port: 8810
+            )
+            connection = preview
+            if arguments.contains("-computer-switcher-preview") {
+                let other = Connection(
+                    id: "preview-other",
+                    name: "MacBook Air",
+                    host: "air.tailnet.ts.net",
+                    port: 8810
+                )
+                registry = CompanionConnectionRegistry(
+                    connections: [preview, other],
+                    activeConnectionID: preview.id
+                )
+                connections = registry.connections
+            } else {
+                connections = [preview]
+            }
             state.hydrate(fleet)
             status = .live
             return
@@ -110,7 +156,8 @@ final class Session: ObservableObject {
         Task { await refreshNotificationAuthorization() }
     }
 
-    /// Rebuild the last connection at launch.
+    /// Rebuild the selected connection at launch, migrating the previous
+    /// single-computer record the first time a multi-computer build runs.
     ///
     /// Three outcomes, and keeping them apart is the whole point. No saved
     /// connection: stay unpaired. A saved connection whose token reads back:
@@ -121,9 +168,26 @@ final class Session: ObservableObject {
     /// only the first should ever send someone back to the pairing screen.
     private func restore() {
         restorePending = false
-        guard let data = UserDefaults.standard.data(forKey: Self.connectionKey),
-              let saved = try? JSONDecoder().decode(Connection.self, from: data)
-        else { return }
+        registry = OpenMausSharedConnectionStore.loadRegistry()
+        connections = registry.connections
+        // The Share extension can target any saved computer, not only the
+        // one active at launch. Move every inactive pre-extension token into
+        // the shared Keychain group now; the active token is read below so
+        // its locked/error state can still drive the visible connection UI.
+        for saved in registry.connections where saved.id != registry.activeConnectionID {
+            _ = try? Keychain.token(for: saved.id)
+        }
+        restoreSelectedConnection()
+    }
+
+    /// Find the first selected pairing whose Keychain token still exists.
+    /// A missing token is a genuinely unusable saved record; a locked
+    /// Keychain is temporary and must leave the record untouched.
+    private func restoreSelectedConnection() {
+        guard let saved = registry.activeConnection else {
+            clearActiveConnection()
+            return
+        }
 
         let stored: String?
         do {
@@ -137,47 +201,103 @@ final class Session: ObservableObject {
             restorePending = true
             status = .offline(
                 (error as? KeychainError)?.isLocked == true
-                    ? "Unlock this phone to reach your computer."
+                    ? "Unlock this device to reach your computer."
                     : error.localizedDescription
             )
             return
         }
-        guard let stored else { return } // no token: genuinely not paired
+        guard let stored else {
+            registry.remove(id: saved.id)
+            persistRegistry()
+            connections = registry.connections
+            restoreSelectedConnection()
+            return
+        }
 
-        connection = saved
-        token = stored
-        // `orderedHosts` puts the stored host first, so the address that
-        // worked last time is the one dialed first this time.
-        rotation = CandidateRotation(hosts: saved.orderedHosts)
-        client = CompanionClient(connection: saved, token: stored)
-        status = .connecting
+        configureActiveConnection(saved, token: stored)
     }
 
     /// Redeem a one-time pairing credential. On success the device token goes
     /// to the keychain and the connection to defaults — deliberately apart,
     /// so the thing that gets backed up is never the credential.
-    func pair(with connection: Connection, credential: String, deviceName: String) async throws {
-        let paired = try await CompanionClient.pair(
-            connection: connection,
+    func pair(
+        with connection: Connection,
+        credential: String,
+        deviceName: String,
+        pairRequestId: String
+    ) async throws {
+        var invited = connection
+        // QR invites already carry this policy. Manual entry reaches the
+        // session as a parsed Connection, so establish the same consent
+        // boundary here before any health probe or credential redemption.
+        if invited.allowedRouteKinds == nil {
+            invited.establishRoutePolicyFromInvite()
+        }
+        let outcome = try await CompanionClient.pairFirstReachable(
+            connection: invited,
             credential: credential,
-            deviceName: deviceName
+            deviceName: deviceName,
+            pairRequestId: pairRequestId
         )
+        let paired = outcome.response
         // prefer the name the computer calls itself over the Bonjour label
-        var stored = connection
+        var stored = outcome.connection
         if !paired.serverName.isEmpty { stored.name = paired.serverName }
-        // The computer knows every address it answers on, and what it says at
-        // redeem time beats whatever the invite carried. Then the host that
-        // just redeemed the code leads: it demonstrably works from here.
-        if let hosts = paired.hosts, !hosts.isEmpty { stored.hosts = hosts }
-        stored.promote(stored.host)
+        // The computer knows every address it answers on, but redemption may
+        // not widen the explicit route consent carried by the invite.
+        stored.applyPairingAdvertisement(hosts: paired.hosts, endpoints: paired.endpoints)
+        let winner = outcome.connection.activeEndpoint ?? CompanionEndpoint.direct(
+            host: outcome.connection.host,
+            port: outcome.connection.port,
+            priority: 10_000
+        )
+        if let winner { stored.promote(winner) }
+        if stored.endpoints?.isEmpty != false {
+            stored.hosts = Array(stored.orderedHosts.prefix(8))
+        }
+        if let existing = registry.matchingConnection(for: stored) {
+            stored.id = existing.id
+        }
 
         try Keychain.save(paired.token, for: stored.id)
-        UserDefaults.standard.set(try? JSONEncoder().encode(stored), forKey: Self.connectionKey)
+        let firstPairing = registry.connections.isEmpty
+        var updatedRegistry = registry
+        updatedRegistry.upsert(stored)
+        // Write the first-pair education marker before making the connection
+        // restorable. If the process stops between these writes, an orphan
+        // marker is harmless while unpaired; the reverse order could restore
+        // a pairing which permanently skipped this step.
+        // RootView may not have received iOS's notification status yet, and
+        // the app may be relaunched before that asynchronous lookup finishes.
+        CompanionPairingCommitSequence.persist {
+            if firstPairing {
+                UserDefaults.standard.set(
+                    true,
+                    forKey: CompanionOnboardingPreferences.pendingNotificationOnboardingKey
+                )
+            }
+        } saveConnection: {
+            OpenMausSharedConnectionStore.saveRegistry(updatedRegistry)
+        }
 
+        stopActiveRuntime()
+        pairingInvite = CompanionPairingInvitePolicy.nextInvite(
+            current: pairingInvite,
+            after: .pairingSucceeded
+        )
+        pairingRequested = false
+        registry = updatedRegistry
+        connections = registry.connections
         self.connection = stored
         self.token = paired.token
-        self.rotation = CandidateRotation(hosts: stored.orderedHosts)
-        self.client = CompanionClient(connection: stored, token: paired.token)
+        let liveRoutes = winner.map { route in
+            [route] + stored.orderedEndpoints.filter { $0.url != route.url }
+        } ?? stored.orderedEndpoints
+        self.rotation = CandidateRotation(endpoints: liveRoutes)
+        self.client = CompanionClient(
+            connection: winner.map(stored.dialing) ?? stored,
+            token: paired.token
+        )
         self.state = CompanionState()
         // A fresh pairing settles any restore that was still waiting on the
         // keychain — the token is in hand, so there is nothing left to retry.
@@ -186,28 +306,73 @@ final class Session: ObservableObject {
     }
 
     func receivePairingURL(_ url: URL) {
-        guard status == .unpaired else {
-            actionError = "This phone is already paired. Unpair it in Settings before connecting it to another computer."
-            return
-        }
         guard let invite = PairingInvite.parse(url) else {
             actionError = "That pairing invitation is not valid. Start pairing again on your computer."
             return
         }
-        pairingInvite = invite
+        pairingInvite = CompanionPairingInvitePolicy.nextInvite(
+            current: pairingInvite,
+            after: .received(invite)
+        )
+        pairingRequested = true
+    }
+
+    func beginPairing() {
+        pairingRequested = true
+    }
+
+    func endPairing() {
+        pairingRequested = false
+        consumePairingInvite()
     }
 
     func consumePairingInvite() {
-        pairingInvite = nil
+        pairingInvite = CompanionPairingInvitePolicy.nextInvite(
+            current: pairingInvite,
+            after: .consumed
+        )
     }
 
-    func signOut() {
-        streamTask?.cancel()
-        streamTask = nil
-        restorePending = false
-        pendingNotification = nil
-        if let id = connection?.id { Keychain.remove(id) }
-        UserDefaults.standard.removeObject(forKey: Self.connectionKey)
+    func switchComputer(to id: String) {
+        guard let saved = registry.connection(id: id) else { return }
+        if connection?.id == id {
+            restartStream()
+            connect()
+            return
+        }
+
+        let stored: String?
+        do {
+            stored = try Keychain.token(for: id)
+        } catch {
+            actionError = (error as? KeychainError)?.isLocked == true
+                ? "Unlock this device, then try switching computers again."
+                : error.localizedDescription
+            return
+        }
+        guard let stored else {
+            actionError = "This saved connection is no longer available on this device. Remove it and pair again."
+            return
+        }
+
+        stopActiveRuntime()
+        registry.select(id: id)
+        persistRegistry()
+        connections = registry.connections
+        configureActiveConnection(saved, token: stored)
+        connect()
+    }
+
+    func forgetConnection(id: String) {
+        guard registry.connection(id: id) != nil else { return }
+        let wasActive = registry.activeConnectionID == id
+        if wasActive { stopActiveRuntime() }
+        Keychain.remove(id)
+        registry.remove(id: id)
+        persistRegistry()
+        connections = registry.connections
+        guard wasActive else { return }
+
         connection = nil
         client = nil
         token = nil
@@ -215,7 +380,89 @@ final class Session: ObservableObject {
         state = CompanionState()
         resetAvatarCache()
         NotificationCoordinator.shared.setBadge(0)
+        restoreSelectedConnection()
+        if connection != nil { connect() }
+        if connections.isEmpty {
+            UserDefaults.standard.removeObject(
+                forKey: CompanionOnboardingPreferences.pendingNotificationOnboardingKey
+            )
+        }
+    }
+
+    /// Compatibility for the existing revoked-pairing and detail actions:
+    /// sign out now means remove only the selected computer.
+    func signOut() {
+        guard let id = connection?.id ?? registry.activeConnectionID else {
+            clearActiveConnection()
+            return
+        }
+        forgetConnection(id: id)
+    }
+
+    private func clearActiveConnection() {
+        streamTask?.cancel()
+        streamTask = nil
+        endpointRefreshTask?.cancel()
+        endpointRefreshTask = nil
+        restorePending = false
+        pendingNotification = nil
+        pairingInvite = CompanionPairingInvitePolicy.nextInvite(
+            current: pairingInvite,
+            after: .signedOut
+        )
+        pairingRequested = false
+        connection = nil
+        client = nil
+        token = nil
+        rotation = CandidateRotation(hosts: [])
+        state = CompanionState()
+        resetAvatarCache()
+        clearFilePreview()
+        attachmentSendIDs.removeAll()
+        NotificationCoordinator.shared.setBadge(0)
         status = .unpaired
+    }
+
+    private func configureActiveConnection(_ saved: Connection, token stored: String) {
+        connection = saved
+        token = stored
+        // New connections honor the desktop's transport policy. Automatic
+        // walking is credential-safe: protected routes stay protected, while
+        // a legacy/local route is only tried when it was the exact saved route.
+        rotation = CandidateRotation(endpoints: saved.orderedEndpoints)
+        let first = rotation.currentEndpoint.map(saved.dialing) ?? saved
+        client = CompanionClient(connection: first, token: stored)
+        status = .connecting
+    }
+
+    private func stopActiveRuntime() {
+        streamGeneration += 1
+        streamTask?.cancel()
+        streamTask = nil
+        endpointRefreshTask?.cancel()
+        endpointRefreshTask = nil
+        restorePending = false
+        endLinger()
+        pendingNotification = nil
+        screenWatchers = 0
+        client = nil
+        token = nil
+        state = CompanionState()
+        resetAvatarCache()
+        clearFilePreview()
+        attachmentSendIDs.removeAll()
+        NotificationCoordinator.shared.setBadge(0)
+    }
+
+    private func persistRegistry() {
+        OpenMausSharedConnectionStore.saveRegistry(registry)
+    }
+
+    private func persistActiveConnection(_ updated: Connection) {
+        registry.upsert(updated, makeActive: false)
+        connection = updated
+        connections = registry.connections
+        persistRegistry()
     }
 
     // MARK: - Lifecycle
@@ -297,10 +544,13 @@ final class Session: ObservableObject {
     func disconnect() {
         streamTask?.cancel()
         streamTask = nil
+        endpointRefreshTask?.cancel()
+        endpointRefreshTask = nil
         endLinger()
     }
 
     private var lingerTask: UIBackgroundTaskIdentifier = .invalid
+    private var lingerSleep: Task<Void, Never>?
 
     /// Leaving the screen: keep the stream alive for the grace period iOS
     /// allows (~30 s) rather than cutting it at once, so an approval that
@@ -309,18 +559,27 @@ final class Session: ObservableObject {
     /// the cursor is written down at a known point.
     func linger() {
         guard streamTask != nil, lingerTask == .invalid else { disconnect(); return }
-        lingerTask = UIApplication.shared.beginBackgroundTask(withName: "companion.linger") { [weak self] in
+        // A previous request can leave a sleeper behind when iOS refuses the
+        // background assertion. Never let it outlive the assertion it belongs
+        // to or disconnect a later linger window.
+        lingerSleep?.cancel()
+        lingerSleep = nil
+        let task = UIApplication.shared.beginBackgroundTask(withName: "companion.linger") { [weak self] in
             // time is up before our own timer — the system wants us gone now
             self?.disconnect()
         }
-        Task { [weak self] in
+        guard task != .invalid else { disconnect(); return }
+        lingerTask = task
+        lingerSleep = Task { [weak self] in
             try? await Task.sleep(for: .seconds(25))
-            guard let self, self.lingerTask != .invalid else { return }
+            guard !Task.isCancelled, let self, self.lingerTask != .invalid else { return }
             self.disconnect()
         }
     }
 
     private func endLinger() {
+        lingerSleep?.cancel()
+        lingerSleep = nil
         guard lingerTask != .invalid else { return }
         UIApplication.shared.endBackgroundTask(lingerTask)
         lingerTask = .invalid
@@ -354,9 +613,11 @@ final class Session: ObservableObject {
                             state.resetCursor(cursor)
                         }
                         status = .live
-                        // this candidate carried a live stream — dial it
-                        // first from now on, including next launch
-                        promoteWorkingHost()
+                        // Remember what actually carried the stream for
+                        // display and legacy ordering. Typed routes retain
+                        // their explicit security priority next launch.
+                        rememberWorkingRoute()
+                        refreshConnectionMetadata(using: client)
                         continue
                     }
                     state.apply(frame)
@@ -408,32 +669,81 @@ final class Session: ObservableObject {
     /// A 401 never reaches here: the unauthorized path returns above, which
     /// is what keeps a token problem from masquerading as an address walk.
     private func failureMessage(for error: Error) -> String {
-        guard let urlError = error as? URLError, let connection else {
-            return error.localizedDescription
-        }
-        let failed = rotation.current.isEmpty ? connection.host : rotation.current
+        guard let connection else { return error.localizedDescription }
+        let failed = rotation.currentEndpoint ?? connection.activeEndpoint ??
+            CompanionEndpoint.direct(host: connection.host, port: connection.port, priority: 10_000)
         var next: String?
-        if ConnectionAdvice.shouldTryAnotherHost(urlError.code), rotation.count > 1 {
-            let candidate = rotation.advance()
-            if let token {
-                client = CompanionClient(connection: connection.dialing(candidate), token: token)
-            }
-            next = candidate
-            log.info("advancing to candidate host \(candidate, privacy: .public)")
+        if let candidate = rotation.advanceEndpoint(after: error), let token {
+            client = CompanionClient(connection: connection.dialing(candidate), token: token)
+            next = candidate.displayAddress
+            log.info("advancing to companion route \(candidate.url, privacy: .public)")
         }
-        return ConnectionAdvice.message(for: urlError.code, host: failed, port: connection.port, tryingNext: next)
+        if let urlError = error as? URLError {
+            return ConnectionAdvice.message(
+                for: urlError.code,
+                host: failed?.displayAddress ?? connection.host,
+                port: failed?.port ?? connection.port,
+                tryingNext: next
+            )
+        }
+        if let apiError = error as? APIError,
+           case let .status(code, _) = apiError,
+           ConnectionAdvice.shouldTryAnotherRoute(after: error) {
+            return ConnectionAdvice.message(
+                forGatewayStatus: code,
+                host: failed?.displayAddress ?? connection.host,
+                tryingNext: next
+            )
+        }
+        return error.localizedDescription
     }
 
-    /// The candidate that just carried a live stream dials first from now on.
-    /// Persisted, so the next launch starts from the address that works
-    /// rather than re-walking the list from a stale front-runner.
-    private func promoteWorkingHost() {
-        let winner = rotation.current
-        guard !winner.isEmpty, var updated = connection,
-              updated.host != Connection.urlHost(winner) else { return }
+    /// Persist the route that carried a live stream. Legacy host lists promote
+    /// it for the next launch; typed lists keep their explicit policy order.
+    private func rememberWorkingRoute() {
+        guard let winner = rotation.currentEndpoint, var updated = connection,
+              updated.activeEndpoint?.url != winner.url else { return }
         updated.promote(winner)
-        connection = updated
-        UserDefaults.standard.set(try? JSONEncoder().encode(updated), forKey: Self.connectionKey)
+        persistActiveConnection(updated)
+    }
+
+    /// Learn routes enabled after this phone originally paired. The endpoint
+    /// response is authenticated with the existing device token and is a
+    /// replacement snapshot, but failure is deliberately non-fatal: older
+    /// sidecars return 404 and a transient refresh error must not tear down a
+    /// perfectly healthy event stream.
+    private func refreshConnectionMetadata(using sourceClient: CompanionClient) {
+        guard let connectionID = connection?.id else { return }
+        let workingEndpoint = rotation.currentEndpoint ?? sourceClient.connection.activeEndpoint
+        endpointRefreshTask?.cancel()
+        endpointRefreshTask = Task { [weak self] in
+            do {
+                let metadata = try await sourceClient.connectionMetadata()
+                try Task.checkCancellation()
+                guard let self,
+                      self.connection?.id == connectionID,
+                      self.client?.connection.baseURL == sourceClient.connection.baseURL,
+                      var updated = self.connection
+                else { return }
+
+                updated.reconcile(metadata)
+                self.persistActiveConnection(updated)
+
+                // Keep the currently live route first until this stream ends.
+                // CandidateRotation applies the same no-downgrade policy used
+                // by pairing, while the saved connection uses advertised
+                // security priorities on the next launch.
+                let liveRoutes = workingEndpoint.map { route in
+                    [route] + updated.orderedEndpoints.filter { $0.url != route.url }
+                } ?? updated.orderedEndpoints
+                self.rotation = CandidateRotation(endpoints: liveRoutes)
+                log.info("refreshed \(metadata.endpoints.count, privacy: .public) companion routes")
+            } catch is CancellationError {
+                return
+            } catch {
+                log.debug("endpoint refresh unavailable: \(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 
     /// Replace the stored address by hand, keeping the pairing and its token.
@@ -441,12 +751,17 @@ final class Session: ObservableObject {
     @discardableResult
     func updateAddress(_ text: String) -> Bool {
         guard var updated = connection, let parsed = Connection.parse(text) else { return false }
-        updated.port = parsed.port
-        updated.promote(parsed.host)
-        connection = updated
-        UserDefaults.standard.set(try? JSONEncoder().encode(updated), forKey: Self.connectionKey)
-        rotation = CandidateRotation(hosts: updated.orderedHosts)
-        if let token { client = CompanionClient(connection: updated, token: token) }
+        guard let endpoint = parsed.activeEndpoint ?? CompanionEndpoint.direct(
+            host: parsed.host,
+            port: parsed.port,
+            priority: 0
+        ) else { return false }
+        updated.resetRoutePolicy(selecting: endpoint)
+        persistActiveConnection(updated)
+        rotation = CandidateRotation(endpoints: updated.orderedEndpoints)
+        if let token {
+            client = CompanionClient(connection: updated.dialing(endpoint), token: token)
+        }
         // Dial the new address now rather than on the next backoff tick —
         // someone who just typed an address is watching the banner.
         restartStream()
@@ -470,6 +785,198 @@ final class Session: ObservableObject {
         }
     }
 
+    /// Send a composer draft with app-owned attachments. The destination
+    /// includes the exact active thread at tap time, so neither a desktop task
+    /// switch nor an upload delay can move the message elsewhere. Callers only
+    /// clear their draft when this returns true.
+    func send(
+        text: String,
+        attachments: [PendingMessageAttachment],
+        to chat: Chat
+    ) async -> Bool {
+        guard let client else {
+            actionError = "This computer is offline."
+            return false
+        }
+        actionError = nil
+        do {
+            try AttachmentPolicy.validate(attachments)
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty || !attachments.isEmpty else {
+                actionError = "Write a message or attach a file first."
+                return false
+            }
+
+            if attachments.contains(where: { $0.kind == .image }) {
+                let capable: Set<String>
+                do {
+                    capable = try await client.imageCapableInstanceIDs()
+                } catch APIError.status(code: 404, message: _) {
+                    actionError = "Update OpenMausBot on this computer before sending images."
+                    return false
+                }
+                guard imageSupported(by: chat, capableInstances: capable) else {
+                    actionError = imageCompatibilityMessage(for: chat)
+                    return false
+                }
+            }
+
+            let destination: MessageDestination
+            switch chat {
+            case let .bot(bot):
+                destination = .bot(id: bot.id, threadId: bot.threadId)
+            case let .room(room):
+                destination = .room(id: room.id, threadId: room.threadId)
+            }
+            let draftKey = AttachmentDraftKey(
+                destination: destination,
+                text: text,
+                attachmentIDs: attachments.map(\.id)
+            )
+            if attachmentSendIDs.count >= 20, attachmentSendIDs[draftKey] == nil {
+                attachmentSendIDs.removeAll(keepingCapacity: true)
+            }
+            let sendID = attachmentSendIDs[draftKey] ?? UUID().uuidString
+            attachmentSendIDs[draftKey] = sendID
+
+            var uploaded: [SharedAttachmentReference] = []
+            uploaded.reserveCapacity(attachments.count)
+            for attachment in attachments {
+                try Task.checkCancellation()
+                let mime = AttachmentPolicy.normalizedMIME(attachment.mime)
+                switch attachment.kind {
+                case .image:
+                    let path = try await client.uploadImage(
+                        data: attachment.data,
+                        mime: mime,
+                        uploadId: attachment.id.uuidString
+                    )
+                    uploaded.append(SharedAttachmentReference(path: path, kind: .image))
+                case .file:
+                    let file = try await client.uploadFile(
+                        data: attachment.data,
+                        name: attachment.name,
+                        mime: mime,
+                        uploadId: attachment.id.uuidString
+                    )
+                    uploaded.append(SharedAttachmentReference(
+                        path: file.path,
+                        kind: .file,
+                        displayName: file.name
+                    ))
+                }
+            }
+
+            let message = SharedMessageComposer.compose(
+                instruction: text,
+                text: [],
+                urls: [],
+                attachments: uploaded
+            )
+            try await client.send(text: message, to: destination, sendId: sendID)
+            attachmentSendIDs.removeValue(forKey: draftKey)
+            actionError = nil
+            return true
+        } catch is CancellationError {
+            return false
+        } catch let error as APIError where error.isUnauthorized {
+            status = .unauthorized
+            actionError = error.localizedDescription
+            return false
+        } catch {
+            actionError = error.localizedDescription
+            return false
+        }
+    }
+
+    private func imageSupported(by chat: Chat, capableInstances: Set<String>) -> Bool {
+        switch chat {
+        case let .bot(bot):
+            return capableInstances.contains(bot.modelSelection.instanceId)
+        case let .room(room):
+            return !room.memberIds.isEmpty && room.memberIds.allSatisfy { id in
+                guard let bot = state.bot(id) else { return false }
+                return capableInstances.contains(bot.modelSelection.instanceId)
+            }
+        }
+    }
+
+    private func imageCompatibilityMessage(for chat: Chat) -> String {
+        switch chat {
+        case let .bot(bot):
+            return "\(bot.name)'s current model doesn't support images. Choose another model or remove the image."
+        case .room:
+            return "Every bot that may answer in this channel must use a model that supports images."
+        }
+    }
+
+    /// Download one desktop path through its originating transcript message,
+    /// then place it in a private temporary directory for Quick Look.
+    func downloadFile(
+        threadId: String,
+        messageId: String,
+        path: String
+    ) async -> DownloadedFile? {
+        guard let client else {
+            actionError = "This computer is offline."
+            return nil
+        }
+        actionError = nil
+        do {
+            let download = try await client.downloadFile(
+                threadId: threadId,
+                messageId: messageId,
+                path: path
+            )
+            try Task.checkCancellation()
+            let manager = FileManager.default
+            let root = manager.temporaryDirectory
+                .appendingPathComponent("OpenMausBotFilePreviews", isDirectory: true)
+            let nextDirectory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try manager.createDirectory(
+                at: nextDirectory,
+                withIntermediateDirectories: true,
+                attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
+            )
+            let fileURL = nextDirectory.appendingPathComponent(download.filename, isDirectory: false)
+            do {
+                try download.data.write(to: fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+                // A synchronous write cannot be interrupted halfway through.
+                // Check immediately afterwards so a cancelled preview never
+                // leaves its completed temporary copy behind.
+                try Task.checkCancellation()
+            } catch {
+                try? manager.removeItem(at: nextDirectory)
+                throw error
+            }
+            let previous = filePreviewDirectory
+            filePreviewDirectory = nextDirectory
+            if let previous { try? manager.removeItem(at: previous) }
+            actionError = nil
+            return download.stored(at: fileURL)
+        } catch is CancellationError {
+            return nil
+        } catch let error as APIError where error.isUnauthorized {
+            status = .unauthorized
+            actionError = error.localizedDescription
+            return nil
+        } catch {
+            actionError = error.localizedDescription
+            return nil
+        }
+    }
+
+    private func clearFilePreview() {
+        if let filePreviewDirectory { try? FileManager.default.removeItem(at: filePreviewDirectory) }
+        filePreviewDirectory = nil
+    }
+
+    private static func removeStaleFilePreviews() {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenMausBotFilePreviews", isDirectory: true)
+        try? FileManager.default.removeItem(at: root)
+    }
+
     func answer(chat: Chat, card: OptionCard, choice: String, rememberingPermission: Bool = true) async {
         guard let requestId = card.requestId else { return }
         if rememberingPermission, card.shouldRememberPermission(for: choice), case let .bot(bot) = chat {
@@ -479,13 +986,20 @@ final class Session: ObservableObject {
             threadId: chat.threadId,
             requestId: requestId,
             choice: choice,
-            isPermission: card.isPermission
+            isPermission: card.isPermission,
+            reviewedSha256: card.skillRequest?.reviewedSha256
         )
     }
 
     /// The same answer, from something that only has the ids — the Live
     /// Activity's buttons.
-    func answer(threadId: String, requestId: String, choice: String, isPermission: Bool) async {
+    func answer(
+        threadId: String,
+        requestId: String,
+        choice: String,
+        isPermission: Bool,
+        reviewedSha256: String? = nil
+    ) async {
         await perform {
             // Permission cards answer allow/deny; a question answers with
             // the chosen text. The harness tells them apart by `behavior`.
@@ -494,7 +1008,8 @@ final class Session: ObservableObject {
                 try await $0.respond(
                     threadId: threadId,
                     requestId: requestId,
-                    behavior: behavior
+                    behavior: behavior,
+                    reviewedSha256: behavior == "allow" ? reviewedSha256 : nil
                 )
             } else {
                 try await $0.respond(threadId: threadId, requestId: requestId, behavior: "answer", message: choice)
@@ -539,6 +1054,22 @@ final class Session: ObservableObject {
             let room = try await client.createRoom(name: name, memberIds: memberIds)
             state.apply(.room(room))
             return room
+        } catch {
+            actionError = error.localizedDescription
+            return nil
+        }
+    }
+
+    /// Create a sidebar section by assigning its complete starting set in one
+    /// request. The server commits the batch before returning, then these
+    /// folds make the roster move immediately instead of waiting for SSE.
+    @discardableResult
+    func assignSection(name: String, botIds: [String]) async -> [Bot]? {
+        guard let client else { return nil }
+        do {
+            let bots = try await client.assignSection(name: name, botIds: botIds)
+            for bot in bots { state.apply(.bot(bot)) }
+            return bots
         } catch {
             actionError = error.localizedDescription
             return nil
@@ -614,11 +1145,15 @@ final class Session: ObservableObject {
                 return state.bot(bot.id).map(Chat.bot)
             }
             if let groupId = hit.groupId,
-               let room = state.rooms.first(where: { $0.id == groupId }) {
+               var room = state.rooms.first(where: { $0.id == groupId }) {
+                if room.threadId != hit.threadId {
+                    room = try await client.switchTask(groupId: room.id, threadId: hit.threadId)
+                    state.apply(.room(room))
+                }
                 let page = try await client.messages(threadId: hit.threadId, around: hit.messageId)
                 state.merge(page, intoThread: hit.threadId)
                 focusedMessageId = hit.messageId
-                return .room(room)
+                return state.rooms.first(where: { $0.id == groupId }).map(Chat.room)
             }
         } catch { actionError = error.localizedDescription }
         return nil
@@ -651,6 +1186,32 @@ final class Session: ObservableObject {
     func deleteTask(_ task: BotTask, for bot: Bot) async {
         guard let client else { return }
         do { state.apply(.bot(try await client.deleteTask(botId: bot.id, threadId: task.threadId))) }
+        catch { actionError = error.localizedDescription }
+    }
+
+    func createTask(for room: Room, title: String?) async {
+        guard let client else { return }
+        do { state.apply(.room(try await client.createTask(groupId: room.id, title: title))) }
+        catch { actionError = error.localizedDescription }
+    }
+
+    func switchTask(_ task: BotTask, for room: Room) async {
+        guard let client, task.threadId != room.threadId else { return }
+        do { state.apply(.room(try await client.switchTask(groupId: room.id, threadId: task.threadId))) }
+        catch { actionError = error.localizedDescription }
+    }
+
+    func renameTask(_ task: BotTask, for room: Room, title: String) async {
+        guard let client else { return }
+        do {
+            try await client.renameTask(groupId: room.id, threadId: task.threadId, title: title)
+            await refresh()
+        } catch { actionError = error.localizedDescription }
+    }
+
+    func deleteTask(_ task: BotTask, for room: Room) async {
+        guard let client else { return }
+        do { state.apply(.room(try await client.deleteTask(groupId: room.id, threadId: task.threadId))) }
         catch { actionError = error.localizedDescription }
     }
 
@@ -802,7 +1363,7 @@ final class Session: ObservableObject {
                 pendingNotification = target
                 connect()
             } else {
-                actionError = "Pair this phone with your computer to open that task."
+                actionError = "Pair this device with your computer to open that task."
             }
             return
         }
@@ -817,7 +1378,18 @@ final class Session: ObservableObject {
             // A room's approval/question notification carries the asker bot
             // with the ROOM's thread id — open the room rather than asking
             // the bot to switch to a thread it does not own (a 404).
-            if let room = state.rooms.first(where: { $0.threadId == target.threadId }) {
+            if var room = state.rooms.first(where: {
+                $0.threadId == target.threadId || ($0.tasks ?? []).contains(where: { $0.threadId == target.threadId })
+            }) {
+                if room.threadId != target.threadId {
+                    do {
+                        room = try await client.switchTask(groupId: room.id, threadId: target.threadId)
+                        state.apply(.room(room))
+                    } catch {
+                        // A stale notification should still open the channel's
+                        // current task instead of leaving the person nowhere.
+                    }
+                }
                 notificationChat = .room(room)
                 return
             }
@@ -894,6 +1466,7 @@ final class Session: ObservableObject {
 
     func refreshNotificationAuthorization() async {
         notificationAuthorization = await NotificationCoordinator.shared.authorizationStatus()
+        notificationAuthorizationResolved = true
     }
 
     func enableNotifications() async {
@@ -982,6 +1555,15 @@ enum Chat: Identifiable, Hashable {
         return false
     }
 
+    var supportsTasks: Bool {
+        switch self {
+        case .bot: return true
+        // `tasks == nil` means an older paired desktop. Hide the affordance
+        // instead of sending it a route it does not know yet.
+        case let .room(room): return room.dm != true && room.tasks != nil
+        }
+    }
+
     var subtitle: String {
         switch self {
         case let .bot(bot): return bot.title
@@ -1034,16 +1616,20 @@ extension CompanionState {
     /// so the same transcript was being traversed dozens of times per frame
     /// to produce an answer that had not changed. One pass, then sort the
     /// results.
-    var chatSummaries: [ChatSummary] {
+    /// - Parameter activity: how much of a bot's working-out the reader has
+    ///   asked to see. The preview honours it the same way the transcript
+    ///   does; `lastActivity` deliberately does not, because a thread that
+    ///   just ran a tool has still moved and should still rise in the list.
+    func chatSummaries(activity: ActivityDetail = .full) -> [ChatSummary] {
         let bots = self.bots.filter { $0.hidden != true }.map(Chat.bot)
         let rooms = self.rooms.map(Chat.room)
         return (bots + rooms)
             .map { chat in
-                let last = visibleTranscript(forThread: chat.threadId).last
+                let messages = visibleTranscript(forThread: chat.threadId)
                 return ChatSummary(
                     chat: chat,
-                    preview: Self.preview(of: last),
-                    lastActivity: last?.at ?? 0,
+                    preview: rosterPreview(messages, detail: activity),
+                    lastActivity: messages.last?.at ?? 0,
                     pinned: Self.pinned(chat)
                 )
             }
@@ -1059,20 +1645,4 @@ extension CompanionState {
         return false
     }
 
-    /// The one line a roster row shows under the name, from whichever kind of
-    /// message landed last.
-    private static func preview(of last: Message?) -> String {
-        guard let last else { return "" }
-        switch last.kind {
-        case .text: return last.text ?? ""
-        // a pending card's question is the preview; the roster row already
-        // says "waiting on you" beside it
-        case .options:
-            guard let card = last.card else { return "" }
-            return card.isPending && !card.subtitle.isEmpty ? card.subtitle : card.title
-        case .activity: return last.tool?.name ?? ""
-        case .screen: return "Screenshot"
-        case .unknown: return last.text ?? ""
-        }
-    }
 }

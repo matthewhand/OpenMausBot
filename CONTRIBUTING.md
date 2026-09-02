@@ -39,13 +39,21 @@ pnpm package:mac   # DMG + ZIP; requires Swift/Xcode tools
 pnpm package:linux # Ubuntu x64 .deb + AppImage; no Swift required
 ```
 
+`pnpm dev:desktop` downloads and verifies the pinned Cloudflare Tunnel connector for the current
+platform and architecture before Electron starts. Later launches re-verify and reuse the staged
+binary. Packaging continues to use `pnpm build:cloudflared`, which stages every architecture the
+host's desktop package build requires. To stage only the current development target without
+launching Electron, run `node scripts/prepare-cloudflared.mjs --current`.
+
 For Ubuntu installation and real desktop checks, see [`docs/linux-desktop.md`](docs/linux-desktop.md).
 
 ## Ubuntu release checklist
 
 Ubuntu release packages must come from the manual **Package Ubuntu** workflow on an exact release commit or tag,
 not from a developer workstation. The Ubuntu 24.04 runner builds and verifies both formats, launches the unpacked
-app and AppImage, exercises the bundled Cua lifecycle, and produces one release artifact containing:
+app and AppImage, routes `click` and `type_text` through the overlay-free bundled Cua runtime on Xorg, runs the
+fail-closed Wayland CUA smoke,
+and produces one release artifact containing:
 
 - the versioned `.deb` and AppImage;
 - stable `OpenMausBot-amd64.deb` and `OpenMausBot.AppImage` copies used by the latest-download links;
@@ -53,7 +61,7 @@ app and AppImage, exercises the bundled Cua lifecycle, and produces one release 
 
 Before publishing, confirm that `package.json` has the release version and dispatch the workflow against the same
 commit used for the other platforms. Attach all five Ubuntu files to the matching release in the separate
-[`openmausbot-releases`](https://github.com/milind-soni/openmausbot-releases) repository. Then verify the checksum
+[OpenMausBot releases](https://github.com/milind-soni/OpenMausBot/releases). Then verify the checksum
 file and install the `.deb` plus launch the AppImage in a clean Ubuntu 24.04 x86_64 GNOME environment. Never combine
 packages built from different commits under one version.
 
@@ -110,6 +118,74 @@ The SPI in [`server/contracts.ts`](server/contracts.ts) is deliberately small. A
    failed spawn as a failed turn — never a hang, never a crash.
 5. Bring a contract test following the fake-CLI pattern (scripted fake process + `recordEvents`).
 
+## Agent-facing control CLIs
+
+Before claiming a server or conversation change works, use the isolated flow
+in [`docs/verification/README.md`](docs/verification/README.md). For new CLIs
+intended for automation:
+
+- Reuse an existing MCP or API operation; keep the CLI to argument parsing and
+  result formatting.
+- Mutating commands require an explicit target or an isolated launcher. Never
+  silently target the user's live app.
+- Return JSON for success and failure, use non-zero exit codes for failure, and
+  provide `--help`.
+- Errors name the failed action and the next valid step.
+- Commands that delete or overwrite data provide `--dry-run`; test that it
+  leaves state unchanged.
+- Prefer task-level subcommands and add one smoke test for the main workflow.
+
+The verification feature map is intentionally incomplete. Add an entry only
+when the shared control surface can exercise it and a permanent test proves it.
+
+## MCP tool schemas
+
+Tool `inputSchema`s travel through every engine's own MCP-to-provider conversion before a model
+sees them, and those converters are lossy: composition keywords get flattened, dropped, or pruned
+by size-compaction passes (codex only began preserving `oneOf` in mid-2026; others simplify
+harder). A model that never saw your schema's branches guesses shapes forever — that is exactly
+how chat routine proposals failed in the field hours after 0.1.38 shipped (#544).
+
+- **Never use `oneOf`, `anyOf`, `allOf`, `const`, or `format` in a tool `inputSchema`.** Advertise
+  one flat object; put per-variant rules in `description`s. `enum` on plain strings is fine.
+- **Coerce before you reject.** Models stringify nested objects, shorten enum values, and vary
+  case. If an input has one obvious meaning, accept it and normalize on the wire.
+- **Errors must teach.** When you refuse an input, the message states the supported shapes with a
+  literal example the model can copy. "Invalid discriminator value" burns a turn; an example
+  fixes the next call.
+- A schema test should assert the tool surface stays flat
+  (see `server/drivers/agents-proxy.test.ts` — it regexp-guards the serialized schema).
+
+## Adding a language
+
+The renderer's strings live in JSON catalogs under `src/locales/`. English
+(`src/locales/en.json`) is the source of truth (typing still flows from it). A
+language is one file plus a one-line registration, exactly like a provider
+driver:
+
+1. Copy `src/locales/en.json` to `src/locales/<code>.json`. Filenames use a
+   lowercase BCP-47 tag (`de.json`, `pt-br.json`). Translate the values; keys
+   you leave out fall back to English, so partial community packs are fine.
+2. Register it in `src/locales/index.ts`.
+3. Run `pnpm i18n:check`, then select the language in **Settings → General**.
+
+An authenticated local Claude CLI can produce a first draft; it never runs in
+CI and its output still needs human review:
+
+```sh
+# Uses the locally logged-in Claude CLI
+node scripts/generate-locale.mjs it "Italian"
+```
+
+The helper runs the model without repository access, custom instructions, or
+write-capable tools. It accepts only one complete JSON object and tracks the
+English source hash for each reviewed translation. See
+[`docs/localization.md`](docs/localization.md) for the workflow and safety rules.
+
+Only a slice of the UI is extracted so far. Move strings into the catalog
+with `t("…")` as you touch components — never in big sweeps, which conflict
+with everything.
+
 ## Platform rules
 
 - The harness (`server/`) must stay portable Node. Anything macOS-only (TCC, Swift helpers,
@@ -119,8 +195,14 @@ The SPI in [`server/contracts.ts`](server/contracts.ts) is deliberately small. A
   independent capabilities.
 - Test Ubuntu platform claims on a real GNOME session. Xvfb proves packaging and fake-driver orchestration, not
   Wayland portal behavior or real CUA inspection/input delivery.
-- Linux local control must remain explicit: global opt-in plus per-bot **This computer**. Linux Auto, provider
-  full-auto/bypass modes, remembered grants, and cloud approvals must never authorize the user's desktop.
+- Linux local control is enabled only on GNOME/Xorg after explicit opt-in. The owned daemon must start with
+  `--no-overlay`: the decorative full-screen Cua cursor surface is not part of the product contract and must never
+  sit between the person and their desktop. GNOME/Wayland must clear a legacy durable opt-in, report
+  `linux-wayland-seat-safety-blocked`, and never start Cua until it independently passes the real-seat matrix in
+  #345. Xvfb proves the overlay-free arguments, lifecycle, and input routing; it does not waive real-seat evidence.
+  An unrelated app must remain clickable/typeable before any approved action. Global opt-in plus per-bot
+  **This computer** remains mandatory; Linux Auto, full-auto/bypass modes, remembered grants, and cloud approvals
+  must never authorize the user's desktop.
 - Keep CUA discovery shell-free and pin accepted archive, inner-file, manifest, and driver contracts. Packaged Linux
   builds must prefer their reviewed outside-ASAR runtime and fail closed instead of executing ambient PATH code;
   source/dev builds may use the validated explicit/user-local paths. Never add a runtime downloader/self-updater or
@@ -146,6 +228,7 @@ responses or events, no baking them into argv where another local process could 
 ## Before you open the PR
 
 - [ ] `pnpm typecheck` and `pnpm test` pass
+- [ ] Locale changes pass `pnpm i18n:check` and have been reviewed by a speaker
 - [ ] `pnpm check:electron` passes for desktop-shell changes
 - [ ] Ubuntu packaging changes pass `pnpm package:linux` and `node scripts/verify-linux-package.mjs`
 - [ ] New server behavior has a test; driver changes keep the contract tests green

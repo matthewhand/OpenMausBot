@@ -40,8 +40,20 @@ export const CLOUD_DESKTOP_JOIN_ROUTE = {
   path: /^\/api\/bots\/[\w-]+\/computer\/join$/,
 } as const;
 
+/** A POST whose response is file bytes. Keep this exact classifier shared
+ * with the proxy: a `.json` document must not enter the ordinary JSON
+ * scrub/re-serialise path and come back as different bytes. */
+export const MESSAGE_FILE_ROUTE = {
+  method: "POST",
+  path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/file$/,
+} as const;
+
 export function isCloudDesktopJoin(method: string, path: string): boolean {
   return method === CLOUD_DESKTOP_JOIN_ROUTE.method && CLOUD_DESKTOP_JOIN_ROUTE.path.test(path);
+}
+
+export function isMessageFileDownload(method: string, path: string): boolean {
+  return method === MESSAGE_FILE_ROUTE.method && MESSAGE_FILE_ROUTE.path.test(path);
 }
 
 /** Every request the iOS app makes, and nothing else.
@@ -56,10 +68,16 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "GET", path: /^\/api\/config$/ },
   { method: "GET", path: /^\/api\/events$/ },
   { method: "GET", path: /^\/api\/instances$/ },
+  // Sidecar-owned, authenticated endpoint metadata. The proxy terminates it
+  // locally; it never becomes a newly exposed harness route.
+  { method: "GET", path: /^\/api\/companion\/endpoints$/ },
 
   // the fleet, and making a bot
   { method: "GET", path: /^\/api\/bots$/ },
   { method: "POST", path: /^\/api\/bots$/ },
+  // One narrow, atomic organizer write. This can only file visible bots;
+  // unlike the desktop's broad PATCH it cannot alter execution policy.
+  { method: "POST", path: /^\/api\/sidebar-sections$/ },
   { method: "POST", path: /^\/api\/bots\/[\w-]+\/messages$/ },
   { method: "POST", path: /^\/api\/bots\/[\w-]+\/interrupt$/ },
   { method: "POST", path: /^\/api\/bots\/[\w-]+\/read$/ },
@@ -82,10 +100,15 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "POST", path: /^\/api\/groups$/ },
   { method: "POST", path: /^\/api\/groups\/[\w-]+\/messages$/ },
   { method: "POST", path: /^\/api\/groups\/[\w-]+\/read$/ },
+  { method: "POST", path: /^\/api\/groups\/[\w-]+\/tasks$/ },
+  { method: "POST", path: /^\/api\/groups\/[\w-]+\/tasks\/[\w-]+$/ },
+  { method: "PATCH", path: /^\/api\/groups\/[\w-]+\/tasks\/[\w-]+$/ },
+  { method: "DELETE", path: /^\/api\/groups\/[\w-]+\/tasks\/[\w-]+$/ },
 
   // a transcript, its images, and answering an approval
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/messages$/ },
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/image$/ },
+  MESSAGE_FILE_ROUTE,
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/reactions$/ },
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/export$/ },
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/respond$/ },
@@ -95,6 +118,10 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // the harness; GET is a single bare generated filename, never a path.
   { method: "POST", path: /^\/api\/attachments$/ },
   { method: "GET", path: /^\/api\/attachments\/[\w-]+\.(?:png|jpe?g|gif|webp)$/i },
+  // Share-sheet documents are raw, capped at 25 MiB, and stored under a
+  // generated filename by the harness. The display name stays in the query;
+  // only this exact upload route crosses the companion boundary.
+  { method: "POST", path: /^\/api\/files$/ },
 
   // Renderer-neutral voice operations. Neither route reads or writes the
   // workspace ElevenLabs key; the phone receives labels or audio only.
@@ -129,7 +156,7 @@ const EXPLAINED: ReadonlyArray<{ path: RegExp; error: string }> = [
   {
     path: /^\/api\/(companion|devices)(\/|$)/,
     // Losing the phone must not mean losing the ability to lock it out.
-    error: "companion settings are managed on your computer",
+    error: "Phone settings are managed on your computer",
   },
   { path: /^\/api\/config$/, error: "API keys can only be changed on your computer" },
   { path: /^\/api\/local-computer(\/|$)/, error: "the Local VM is set up on your computer" },
@@ -164,7 +191,7 @@ export function denyReason({ path, method, authenticated }: RouteRequest): Denia
   if (method === "GET" && path === "/api/health") return null;
 
   if (!authenticated) {
-    return { status: 401, error: "pair this device from the OpenMausBot companion on your computer" };
+    return { status: 401, error: "pair this device from Phone settings in OpenMausBot on your computer" };
   }
 
   if (ALLOWED.some((route) => route.method === method && route.path.test(path))) return null;

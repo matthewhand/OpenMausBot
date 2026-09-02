@@ -21,6 +21,7 @@ export default defineConfig({
       "electron/**/*.test.mjs",
       "src/**/*.test.ts",
       "companion/**/*.test.ts",
+      "enterprise/**/*.test.ts",
       "scripts/**/*.test.mjs",
     ],
     setupFiles: ["server/testing/setup.ts"],

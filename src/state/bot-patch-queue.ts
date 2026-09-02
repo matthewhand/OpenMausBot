@@ -10,6 +10,7 @@ export type BotUpdatePatch = Partial<
     | "notifications"
     | "computer"
     | "cloudBackend"
+    | "autoStartVps"
     | "color"
     | "mascotExpression"
     | "avatarUrl"
@@ -24,6 +25,8 @@ export type BotUpdatePatch = Partial<
     | "chiefOfStaff"
     | "approvePeerComms"
     | "composio"
+    | "browser"
+    | "browserProfile"
     | "modelSelection"
   >
 > & {

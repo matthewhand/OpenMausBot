@@ -94,11 +94,48 @@ type SkillRecordingPayload = {
     };
   };
 
+  interface DesktopWorkspaceBounds {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }
+
+  interface BrowserSurfaceState {
+    botId: string;
+    open: boolean;
+    url: string;
+    title: string;
+    loading: boolean;
+    canGoBack: boolean;
+    canGoForward?: boolean;
+    visible: boolean;
+    partition?: string | null;
+    profile?: string | null;
+    mode?: "compact" | "expanded" | null;
+    code?: "renderer-gone" | "profile-deleted" | "evicted";
+  }
+
+  interface DesktopWorkspaceState {
+    contextId: string;
+    open: boolean;
+    status: "opening" | "ready" | "error" | "closed";
+    interactive: boolean;
+    code?: "load-failed" | "renderer-gone";
+  }
+
   interface Window {
     ogb?: {
       platform: NodeJS.Platform;
       getCapabilities(): Promise<DesktopCapabilities>;
       onCapabilitiesChanged(cb: (capabilities: DesktopCapabilities) => void): () => void;
+      companionAccount?: {
+        state(): Promise<CompanionAccountState>;
+        requestCode(email: string): Promise<CompanionAccountState>;
+        verifyCode(email: string, code: string): Promise<CompanionAccountState>;
+        retry(): Promise<CompanionAccountState>;
+        signOut(): Promise<CompanionAccountState>;
+      };
       localControl: {
         status(): Promise<LinuxLocalControlStatus>;
         enable(): Promise<LinuxLocalControlStatus>;
@@ -152,16 +189,72 @@ type SkillRecordingPayload = {
       openInstallTerminal?(command: string): Promise<boolean>;
       /** Opens an http(s) link in the user's default browser. */
       openExternal?(url: string): Promise<boolean>;
-      /** Opens a live desktop as a sandboxed modal owned by OpenMausBot. */
+      /** Recolor the native window chrome for a skin; absent on older builds. */
+      applySkin?(skin: string): Promise<boolean>;
+      /** Receives a GitHub package URL opened through openmausbot://install. */
+      onPackageInstall?(cb: (url: string) => void): () => void;
+      /** Updates the native Dock/taskbar unread indicator. */
+      setUnreadCount?(count: number): void;
+      /** Opens a live desktop as a sandboxed window owned by OpenMausBot. */
       desktopViewer?: {
         open(url: string, title: string, contextId: string): Promise<boolean>;
+        /** Closes the live-desktop window, but only when it belongs to this bot. */
+        close(contextId: string): Promise<boolean>;
+        /** The current viewer state, for a panel to initialize from on mount. */
+        currentState(): Promise<{ open: boolean; contextId: string | null }>;
         onState(cb: (state: { open: boolean; contextId: string | null }) => void): () => void;
+      };
+      /** Two Local VM viewers embedded in one app window. URLs are accepted
+       * only by main-process validation and never return over this bridge. */
+      /** The built-in browser surface; absent in a browser tab or an older shell. */
+      browser?: {
+        available(): Promise<boolean>;
+        state(botId: string): Promise<BrowserSurfaceState>;
+        layout(
+          botId: string,
+          bounds: DesktopWorkspaceBounds | null,
+          profile?: string,
+          mode?: "compact" | "expanded",
+          layoutOwner?: string,
+        ): Promise<BrowserSurfaceState>;
+        navigate(botId: string, url: string, profile?: string): Promise<{ url: string; title: string }>;
+        back(botId: string, profile?: string): Promise<{ url: string; title: string }>;
+        forward?(botId: string, profile?: string): Promise<{ url: string; title: string }>;
+        reload?(botId: string, profile?: string): Promise<{ url: string; title: string }>;
+        /** Immediately gates native browser mutations while the durable
+         * server-side human-control snapshot catches up. */
+        setHumanControl?(botId: string, held: boolean, profile?: string): Promise<boolean>;
+        /** Native page focus/input means the person has taken the wheel. */
+        onUserInteraction?(cb: (event: { botId: string; profile: string }) => void): () => void;
+        forgetProfile?(partitionId: string): Promise<{ dropped: number }>;
+        close(botId: string): Promise<boolean>;
+        onState(cb: (state: BrowserSurfaceState) => void): () => void;
+      };
+      desktopWorkspace?: {
+        open(input: {
+          contextId: string;
+          url: string;
+          title: string;
+          bounds: DesktopWorkspaceBounds;
+        }): Promise<DesktopWorkspaceState>;
+        layout(items: Array<{
+          contextId: string;
+          bounds: DesktopWorkspaceBounds;
+          visible: boolean;
+        }>): Promise<boolean>;
+        setInteractive(contextId: string | null): Promise<boolean>;
+        close(contextId?: string): Promise<boolean>;
+        onState(cb: (state: DesktopWorkspaceState) => void): () => void;
       };
       /** Native folder picker; resolves null when the user cancels. */
       pickFolder?(current?: string): Promise<string | null>;
       /** Writes the redacted diagnostics report to a user-chosen file;
        * resolves the path, or null when cancelled. */
       exportDiagnostics?(): Promise<string | null>;
+      /** Asks where to save a bot-created file (inside ~/.openmausbot), copies
+       * it there and reveals it. Resolves the chosen path, or null if the
+       * user cancelled the dialog. */
+      saveFile?(filePath: string): Promise<string | null>;
       /** Save a provider credential through Electron's OS-backed store. */
       setCredential?(
         name: "composioApiKey" | "xaiApiKey" | "boxToken" | "opencodeGoApiKey" | "ttsKey" | "openaiImageApiKey",
@@ -172,7 +265,7 @@ type SkillRecordingPayload = {
       updater?: {
         check(): Promise<void>;
         download(): Promise<void>;
-        /** quit-and-install the downloaded update */
+        /** apply the download: quit-and-install, or copy the command and open a terminal */
         install(): Promise<void>;
         onState(cb: (s: UpdaterState) => void): () => void;
       };
@@ -201,9 +294,29 @@ export interface UpdaterState {
     | "downloading"
     | "downloaded"
     | "installing"
+    /** the command is on the clipboard; the user finishes in a terminal */
+    | "handed-off"
     | "error";
   version?: string;
   percent?: number;
+  message?: string;
+  /**
+   * How the download gets applied. "restart" quits and installs in place;
+   * "handoff" copies the install command and opens a terminal so the user
+   * can finish — Ubuntu .deb (and rpm/pacman) builds use this.
+   */
+  installMode?: "restart" | "handoff";
+  /** hand-off only: the install command, already on the clipboard */
+  command?: string;
+  /** hand-off only: whether a terminal was opened to paste it into */
+  terminalOpened?: boolean;
+}
+
+export interface CompanionAccountState {
+  available: boolean;
+  status: "signed-out" | "connecting" | "ready" | "error";
+  email?: string;
+  endpoint?: string;
   message?: string;
 }
 

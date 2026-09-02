@@ -1,8 +1,9 @@
 // Per-agent voice profile. The key is shared; the voice and autoplay choice
 // belong to the selected bot.
 //
-// TTS itself is ElevenLabs or any OpenAI-compatible speech server — pick the
-// provider below; base URL and model are app-wide settings next to the key.
+// TTS itself is ElevenLabs, any OpenAI-compatible speech server, or the
+// built-in Mac voices — pick the provider below; base URL and model are
+// app-wide settings next to the key.
 //
 // The voice list comes from the harness, which holds the key — the
 // renderer never talks to ElevenLabs itself.
@@ -10,32 +11,41 @@ import { useEffect, useState } from "react";
 import { Check, Loader2, Volume2 } from "lucide-react";
 
 import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
+import { useDesktopCapabilities } from "@/components/DesktopCapabilities";
 import { speaker, SAMPLE } from "@/lib/tts";
 import { cn } from "@/lib/cn";
+import { Switch } from "./SettingsPrimitives";
+
+type TtsProvider = "elevenlabs" | "openai-compatible" | "system";
 
 export function VoiceSettings({
   bot,
   onPatch,
 }: {
-  bot: Bot;
-  onPatch: (patch: Partial<Pick<Bot, "voice" | "speakReplies">>) => void;
+  bot?: Bot;
+  onPatch?: (patch: Partial<Pick<Bot, "voice" | "speakReplies">>) => void;
 }) {
   const { state, dispatch } = useStore();
   const tts = state.config?.tts;
 
-  const [provider, setProvider] = useState<"elevenlabs" | "openai-compatible">(
-    (tts?.provider as "elevenlabs" | "openai-compatible") ?? "elevenlabs",
+  const [provider, setProviderState] = useState<TtsProvider>(
+    (tts?.provider as TtsProvider) ?? "elevenlabs",
   );
   const [key, setKey] = useState("");
   const [baseUrl, setBaseUrl] = useState(tts?.baseUrl ?? "");
   const [model, setModel] = useState(tts?.model ?? "");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [switching, setSwitching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [voices, setVoices] = useState<Array<{ id: string; label: string; description?: string }>>([]);
   const [loadingVoices, setLoadingVoices] = useState(false);
   const [auditioningVoiceId, setAuditioningVoiceId] = useState<string | null>(null);
 
+  const { capabilities } = useDesktopCapabilities();
+  // Built-in voices are offered where the desktop contract says they exist —
+  // never inferred from a user agent.
+  const systemVoicesAvailable = capabilities.host.platform === "darwin";
   const configured = Boolean(tts?.configured);
 
   useEffect(() => {
@@ -55,7 +65,7 @@ export function VoiceSettings({
     setAuditioningVoiceId(target);
     setError(null);
     try {
-      await speaker.speak(SAMPLE, { voiceId: target, botId: bot.id });
+      await speaker.speak(SAMPLE, { voiceId: target, botId: bot?.id });
       if (speaker.state.error) {
         setError(speaker.state.error);
       }
@@ -66,10 +76,9 @@ export function VoiceSettings({
     }
   };
 
-  // Update local provider state when config changes
   useEffect(() => {
     if (tts?.provider) {
-      setProvider(tts.provider as "elevenlabs" | "openai-compatible");
+      setProviderState(tts.provider as TtsProvider);
     }
     if (tts?.baseUrl !== undefined) setBaseUrl(tts.baseUrl);
     if (tts?.model !== undefined) setModel(tts.model);
@@ -93,7 +102,19 @@ export function VoiceSettings({
     return () => {
       alive = false;
     };
-  }, [configured, tts?.baseUrl, tts?.model, tts?.provider]);
+  }, [configured, provider, tts?.baseUrl, tts?.model, tts?.provider]);
+
+  const changeProvider = (next: TtsProvider) => {
+    if (next === provider || switching || (next === "system" && !systemVoicesAvailable)) return;
+    setSwitching(true);
+    setError(null);
+    setProviderState(next);
+    const patch = next === "openai-compatible" ? { provider: next, key: "" } : { provider: next };
+    api("/api/config", { method: "PUT", body: JSON.stringify({ tts: patch }) })
+      .then((status: ConfigStatus) => dispatch({ type: "configStatus", config: status }))
+      .catch((e: Error) => setError(e.message))
+      .finally(() => setSwitching(false));
+  };
 
   const save = (patch: Record<string, unknown>) => {
     setSaving(true);
@@ -112,14 +133,6 @@ export function VoiceSettings({
 
   if (!tts) return null;
 
-  const saveProvider = (newProvider: "elevenlabs" | "openai-compatible") => {
-    setProvider(newProvider);
-    setError(null);
-    void save(newProvider === "openai-compatible" ? { provider: newProvider, key: "" } : { provider: newProvider });
-  };
-
-  // Desktop builds keep credentials in OS storage; the config API is the
-  // fallback everywhere else.
   const saveElevenLabsKey = () => {
     const nextKey = key.trim();
     if (!nextKey) return Promise.resolve();
@@ -161,28 +174,75 @@ export function VoiceSettings({
     void saveElevenLabsKey();
   };
 
-  const selectedVoice = bot.voice ?? "";
+  const selectedVoice = bot?.voice ?? "";
   const ready = configured && Boolean(selectedVoice || tts.voice);
+  const providerBlurb =
+    provider === "system"
+      ? systemVoicesAvailable
+        ? " the voices are the ones already installed on this Mac."
+        : " built-in Mac voices are unavailable here. Switch to ElevenLabs or an OpenAI-compatible server to keep using voice."
+      : provider === "openai-compatible"
+        ? " the OpenAI-compatible speech server is shared by the workspace."
+        : " the ElevenLabs key is shared by the workspace.";
 
   return (
     <div className="rounded-xl bg-card p-4">
       <div className="text-[15px] font-medium text-ink">Voice</div>
       <div className="mt-0.5 text-[13px] text-ink-secondary">
-        Read replies aloud and talk to your bots. Choose your TTS provider below.
+        {bot
+          ? `Give this agent a voice for calls and spoken replies. The voice choice belongs to this agent;${providerBlurb}`
+          : "Read replies aloud and talk to your bots. Choose your TTS provider below."}
       </div>
 
       <div className="mt-4">
         <div className="mb-1.5 text-[13px] text-ink-secondary">Provider</div>
         <select
-          value={provider}
-          onChange={(e) => saveProvider(e.target.value as "elevenlabs" | "openai-compatible")}
+          value={provider === "system" ? "elevenlabs" : provider}
+          onChange={(e) => changeProvider(e.target.value as "elevenlabs" | "openai-compatible")}
           aria-label="TTS Provider"
-          className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none"
+          disabled={switching || provider === "system"}
+          className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none disabled:opacity-50"
         >
           <option value="elevenlabs">ElevenLabs</option>
           <option value="openai-compatible">OpenAI-compatible</option>
         </select>
       </div>
+
+      {(systemVoicesAvailable || provider === "system") && (
+        <div className="mt-4">
+          <div className="mb-2 text-[13px] text-ink-secondary">Voice engine</div>
+          <div className="inline-flex rounded-xl bg-inset p-1" role="radiogroup" aria-label="Voice engine">
+            {([
+              { value: "elevenlabs", label: "ElevenLabs", available: true },
+              { value: "system", label: "Built-in Mac voices", available: systemVoicesAvailable },
+            ] as const).map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                role="radio"
+                aria-checked={option.value === "system" ? provider === "system" : provider !== "system"}
+                disabled={switching || !option.available}
+                title={!option.available ? "Built-in voices are available only on macOS" : undefined}
+                onClick={() => {
+                  if (option.value === "system") {
+                    changeProvider("system");
+                    return;
+                  }
+                  changeProvider(provider === "openai-compatible" ? "openai-compatible" : "elevenlabs");
+                }}
+                className={cn(
+                  "rounded-lg px-3.5 py-1.5 text-[12.5px] transition-colors disabled:opacity-50",
+                  (option.value === "system" ? provider === "system" : provider !== "system")
+                    ? "bg-raised text-ink shadow"
+                    : "text-ink-secondary hover:text-ink",
+                )}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {provider === "elevenlabs" && (
         <div className="mt-4">
@@ -196,16 +256,16 @@ export function VoiceSettings({
               type="password"
               value={key}
               onChange={(e) => setKey(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && key.trim() && saveCredentials()}
+              onKeyDown={(e) => e.key === "Enter" && key.trim() && void saveCredentials()}
               placeholder={configured ? "••••••••  (paste to replace)" : "Paste your ElevenLabs API key"}
               aria-label="ElevenLabs key"
               autoComplete="off"
               className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
             />
             <button
-              onClick={saveCredentials}
+              onClick={() => void saveCredentials()}
               disabled={saving || !key.trim()}
-              className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+              className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-control py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
             >
               {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
             </button>
@@ -289,7 +349,7 @@ export function VoiceSettings({
         </div>
       )}
 
-      {configured && (
+      {configured && bot && onPatch && (
         <div className="mt-4">
           <div className="mb-1.5 text-[13px] text-ink-secondary">Voice</div>
           <div className="flex gap-2">
@@ -329,31 +389,21 @@ export function VoiceSettings({
         </div>
       )}
 
-      <div className="mt-4 flex items-center justify-between gap-4 border-t border-hairline/40 pt-4">
-        <div>
-          <div className="text-[13px] font-medium text-ink">Read replies aloud</div>
-          <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-secondary">
-            Speak this agent's answers as they arrive, even from another chat.
+      {bot && onPatch && (
+        <div className="mt-4 flex items-center justify-between gap-4 border-t border-hairline/40 pt-4">
+          <div>
+            <div className="text-[13px] font-medium text-ink">Read replies aloud</div>
+            <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-secondary">
+              Speak this agent's answers as they arrive, even from another chat.
+            </div>
           </div>
-        </div>
-        <button
-          role="switch"
-          aria-checked={Boolean(bot.speakReplies)}
-          aria-label="Read this bot's replies aloud"
-          onClick={() => onPatch({ speakReplies: !bot.speakReplies })}
-          className={cn(
-            "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors",
-            bot.speakReplies ? "bg-accent" : "bg-control",
-          )}
-        >
-          <span
-            className={cn(
-              "absolute top-[3px] size-5 rounded-full bg-white transition-all",
-              bot.speakReplies ? "left-[21px]" : "left-[3px]",
-            )}
+          <Switch
+            checked={Boolean(bot.speakReplies)}
+            aria-label="Read this bot's replies aloud"
+            onClick={() => onPatch({ speakReplies: !bot.speakReplies })}
           />
-        </button>
-      </div>
+        </div>
+      )}
 
       {error && <div role="alert" className="mt-2 text-[12px] text-danger">{error}</div>}
     </div>

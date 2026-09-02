@@ -1,8 +1,10 @@
-import { app, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, safeStorage, screen, session, shell, systemPreferences, utilityProcess } from "electron";
+import { app, BrowserWindow, WebContentsView, clipboard, desktopCapturer, dialog, ipcMain, Menu, nativeImage, powerSaveBlocker, safeStorage, screen, session, shell, systemPreferences, utilityProcess } from "electron";
 import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { startCua, stopCua, registerCuaIpc, setCuaStateListener } from "./cua.mjs";
 import { createAndroidDeviceController } from "./android-device.mjs";
 import { assemblyAICredential, mintAssemblyAIStreamingToken } from "./assemblyai.mjs";
@@ -15,9 +17,42 @@ import {
 } from "./skill-recorder.mjs";
 import { openBlankTerminal } from "./terminal-launch.mjs";
 import { startUpdater, registerUpdaterIpc } from "./updater.mjs";
-import { buildDiagnosticsReport, decodeLogTail, diagnosticsFileName } from "./diagnostics.mjs";
+import {
+  buildDiagnosticsReport,
+  diagnosticsFileName,
+  formatDesktopCrashRecord,
+  installDesktopCrashListeners,
+  readSafeLogTail,
+} from "./diagnostics.mjs";
 import { migrateWorkspaceCredentials, workspaceCredentialEnv } from "./workspace-credentials.mjs";
 import { activateExistingWindow } from "./single-instance.mjs";
+import { pollServerIdentity } from "./server-boot-probe.mjs";
+import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
+import { windowChromeOptions } from "./window-chrome.mjs";
+import { defaultSaveName, withSavableFile } from "./save-file.mjs";
+import {
+  ensureManagedComposioCredentials,
+  managedComposioAccess,
+  managedComposioChildEnvironment,
+  normalizeManagedComposioBrokerUrl,
+} from "./managed-composio.mjs";
+import {
+  createManagedCompanionTunnel,
+  managedCompanionTunnelAccess,
+  resolveCloudflaredBinary,
+  resolveManagedCompanionGuardian,
+  withManagedCompanionTunnelAccess,
+  withoutManagedCompanionTunnelAccess,
+} from "./managed-companion-tunnel.mjs";
+import { createSecureCredentialState } from "./secure-credential-state.mjs";
+import { isKnownSkin } from "./skin-overlay.cjs";
+import { readSecureCredentials } from "./secure-credentials.mjs";
+import { createControlPlaneClient } from "./control-plane-client.mjs";
+import {
+  companionAccountCleanupPending,
+  createCompanionAccountService,
+  resolveCompanionControlPlaneURL,
+} from "./companion-account-service.mjs";
 import capabilitiesModule from "./capabilities.cjs";
 
 const { desktopCapabilities, nativeDesktopActions } = capabilitiesModule;
@@ -28,6 +63,23 @@ const { createDisplayMediaGuard, invokeDisplayMediaCallback, selectCaptureSource
 );
 const { STAGE_PREFIX: APPIMAGE_CUA_STAGE_PREFIX } = require("./cua-linux-bundle.cjs");
 const { desktopViewerUrl, sameDesktopViewerOrigin } = require("./desktop-viewer.cjs");
+const { createDesktopWorkspaceManager } = require("./desktop-workspace.cjs");
+const { createBrowserSurfaceManager } = require("./browser-surface.cjs");
+const { browserPartition, browserProfilePartition } = require("./browser-snapshot.cjs");
+const { createBrowserHost } = require("./browser-host.cjs");
+const { browserSurfaceSupported } = require("./browser-platform.cjs");
+const { clearBrowserPartitionSession } = require("./browser-partition-cleanup.cjs");
+const {
+  postBrowserConnection,
+  removeBrowserConnectionDescriptor: removeBrowserConnectionDescriptorFile,
+} = require("./browser-connection-sync.cjs");
+const {
+  applyBrowserControlHold,
+  browserLifecycleResult,
+  decodeBrowserLifecycleMessage,
+} = require("./browser-control-sync.cjs");
+const { createCuaConnectionStore: createDescriptorStore } = require("./cua-connection.cjs");
+const { normalizeUnreadCount, parseWindowState, resolveWindowState } = require("./window-state.cjs");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // 127.0.0.1 explicitly — vite binds IPv4; a bare "localhost" here can
@@ -39,10 +91,100 @@ const APP_ICON = path.join(__dirname, "resources/app-icon.png");
 let desktopViewerWindow = null;
 let desktopViewerOwner = null;
 let desktopViewerContextId = null;
+let desktopWorkspaceManager = null;
+let desktopWorkspaceOwner = null;
+// The built-in browser surface (Browser tab of the computer panel): views
+// live in this process; bots reach them through a loopback host whose address
+// and per-boot token are sent privately to the embedded harness.
+let browserSurface = null;
+let browserHost = null;
+const browserSurfaceIsSupported = browserSurfaceSupported(process.platform);
+// Positive server assertions survive renderer reloads and surface recreation.
+// A release is deliberately local-panel-only; see browser-control-sync.cjs.
+const browserControlHolds = new Set();
+const browserConnectionStore = createDescriptorStore({
+  getUserData: () => app.getPath("userData"),
+  fileName: "browser-connection.json",
+});
+let pendingPackageInstallUrl = packageUrlFromCommandLine(process.argv);
+let mainWindow = null;
+let unreadCount = 0;
+let unreadOverlayIcon = null;
+
+function windowStateFile() {
+  return path.join(app.getPath("userData"), "window-state.json");
+}
+
+function readWindowState() {
+  try {
+    return parseWindowState(fs.readFileSync(windowStateFile(), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeWindowState(win) {
+  if (!win || win.isDestroyed()) return;
+  const file = windowStateFile();
+  const temporary = `${file}.${process.pid}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      temporary,
+      JSON.stringify({ bounds: win.getNormalBounds(), maximized: win.isMaximized() }),
+      { mode: 0o600 },
+    );
+    fs.renameSync(temporary, file);
+  } catch (error) {
+    try {
+      fs.rmSync(temporary, { force: true });
+    } catch {}
+    slog(`window state save failed: ${error?.message ?? error}`);
+  }
+}
+
+function installWindowStatePersistence(win) {
+  let timer = null;
+  const flush = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    writeWindowState(win);
+  };
+  const schedule = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(flush, 250);
+    timer.unref?.();
+  };
+  win.on("resize", schedule);
+  win.on("move", schedule);
+  win.on("maximize", schedule);
+  win.on("unmaximize", schedule);
+  win.on("close", flush);
+}
+
+function applyUnreadBadge(win = mainWindow) {
+  const count = normalizeUnreadCount(unreadCount);
+  if (process.platform === "win32") {
+    if (!win || win.isDestroyed()) return;
+    unreadOverlayIcon ??= nativeImage.createFromPath(APP_ICON).resize({ width: 16, height: 16 });
+    win.setOverlayIcon(
+      count > 0 && !unreadOverlayIcon.isEmpty() ? unreadOverlayIcon : null,
+      count > 0 ? `${count} unread conversation${count === 1 ? "" : "s"}` : "No unread conversations",
+    );
+    return;
+  }
+  if (process.platform === "darwin" || process.platform === "linux") app.setBadgeCount(count);
+}
 
 // GNOME groups the window with its installed desktop entry only when both
-// identities match. This must run before Electron becomes ready.
-if (process.platform === "linux") app.setDesktopName("com.openmausbot.app.desktop");
+// identities match. This must run before Electron becomes ready. Ubuntu also
+// uses Chromium's software renderer: the supported machine reproduced two
+// NVIDIA/libGLES GPU-process crashes that left an invisible focused window
+// intercepting input. This app is not graphics-heavy, so reliability wins.
+if (process.platform === "linux") {
+  app.disableHardwareAcceleration();
+  app.setDesktopName("com.openmausbot.app.desktop");
+}
 
 // One instance per user: without this lock a second launch forks a second
 // harness server on a fallback port and splits data dirs in two. The loser
@@ -51,8 +193,34 @@ if (!app.requestSingleInstanceLock()) {
   console.log("[desktop] OpenMausBot is already running — focusing that window");
   process.exit(0);
 }
-app.on("second-instance", () => {
+function deliverPackageInstall(win) {
+  if (!pendingPackageInstallUrl || !win || win.isDestroyed()) return;
+  if (win.webContents.isLoadingMainFrame()) return;
+  win.webContents.send("package:install", pendingPackageInstallUrl);
+  pendingPackageInstallUrl = null;
+}
+
+function queuePackageInstall(rawLink) {
+  const packageUrl = packageUrlFromDeepLink(rawLink);
+  if (!packageUrl) return false;
+  pendingPackageInstallUrl = packageUrl;
   activateExistingWindow(BrowserWindow.getAllWindows());
+  const target = BrowserWindow.getAllWindows().find((win) => !win.isDestroyed());
+  deliverPackageInstall(target);
+  return true;
+}
+
+app.on("open-url", (event, url) => {
+  if (!queuePackageInstall(url)) return;
+  event.preventDefault();
+});
+
+app.on("second-instance", (_event, commandLine) => {
+  const packageUrl = packageUrlFromCommandLine(commandLine);
+  if (packageUrl) pendingPackageInstallUrl = packageUrl;
+  activateExistingWindow(BrowserWindow.getAllWindows());
+  const target = BrowserWindow.getAllWindows().find((win) => !win.isDestroyed());
+  deliverPackageInstall(target);
 });
 
 // Packaged: the harness server ships in Resources (compiled JS, zero deps)
@@ -64,21 +232,40 @@ app.on("second-instance", () => {
 let serverProc = null;
 let serverReady = true;
 let secureCredentials = {};
+let secureCredentialState = null;
 
 const CREDENTIALS_FILE = path.join(app.getPath("userData"), "credentials.bin");
 
+/** Set once per launch: true when the store could not be READ, which is not
+ * the same as the user having saved nothing. Everything downstream — the
+ * server's view of "configured", and whether we may register a fresh
+ * installation — keys off this rather than off an empty object. */
+let credentialStoreUnavailable = false;
+
 async function loadSecureCredentials() {
-  try {
-    if (!fs.existsSync(CREDENTIALS_FILE) || !(await safeStorage.isAsyncEncryptionAvailable())) return {};
-    const decrypted = await safeStorage.decryptStringAsync(fs.readFileSync(CREDENTIALS_FILE));
-    return JSON.parse(decrypted.result);
-  } catch (error) {
-    slog(`credential load failed: ${error?.message ?? error}`);
-    return {};
+  const result = await readSecureCredentials({
+    exists: () => fs.existsSync(CREDENTIALS_FILE),
+    isAvailable: () => safeStorage.isAsyncEncryptionAvailable(),
+    readFile: () => fs.readFileSync(CREDENTIALS_FILE),
+    decrypt: (buffer) => safeStorage.decryptStringAsync(buffer),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  });
+  credentialStoreUnavailable = result.status === "unavailable";
+  if (credentialStoreUnavailable) {
+    // Deliberately loud. A silent {} here is what made a keychain hiccup
+    // look like "your connected apps are gone".
+    slog(`credential store unreadable after retries (${result.error}); saved keys are not loaded this launch`);
   }
+  return result.credentials;
 }
 
 async function saveSecureCredentials(credentials) {
+  // A failed read means we do not know what the existing encrypted document
+  // contains. Never derive a replacement from that incomplete view: boot
+  // migrations must leave plaintext in place so a later launch can retry.
+  if (credentialStoreUnavailable) {
+    throw new Error("The operating-system credential store could not be read this launch");
+  }
   if (!(await safeStorage.isAsyncEncryptionAvailable())) {
     throw new Error("The operating-system credential store is unavailable");
   }
@@ -153,50 +340,9 @@ async function secureWorkspaceConfig() {
 
 function composioBrokerUrl() {
   const configured = process.env.OMB_COMPOSIO_BROKER_URL?.trim();
-  return configured || (app.isPackaged ? DEFAULT_COMPOSIO_BROKER_URL : "");
-}
-
-async function ensureManagedComposioCredentials() {
-  const brokerUrl = composioBrokerUrl();
-  if (!brokerUrl) return;
-  if (/^[0-9a-f]{64}$/.test(secureCredentials.composioBrokerToken ?? "")) {
-    try {
-      const check = await fetch(`${brokerUrl}/v1/me`, {
-        headers: { authorization: `Bearer ${secureCredentials.composioBrokerToken}` },
-        signal: AbortSignal.timeout(8_000),
-      });
-      if (check.ok) return;
-      // Only a definitive auth failure rotates the credential. A transient
-      // outage keeps the existing identity so reconnecting cannot strand
-      // the user's already-authorized accounts under a new installation.
-      if (check.status !== 401) return;
-      delete secureCredentials.composioBrokerToken;
-      delete secureCredentials.composioInstallationId;
-    } catch {
-      return;
-    }
-  }
-  try {
-    const response = await fetch(`${brokerUrl}/v1/installations`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: "{}",
-      signal: AbortSignal.timeout(15_000),
-    });
-    const body = await response.json().catch(() => null);
-    if (!response.ok) throw new Error(body?.error || `HTTP ${response.status}`);
-    if (!/^[0-9a-f]{64}$/.test(body?.token ?? "") || typeof body?.installationId !== "string") {
-      throw new Error("the connected-apps service returned invalid credentials");
-    }
-    secureCredentials.composioBrokerToken = body.token;
-    secureCredentials.composioInstallationId = body.installationId;
-    await saveSecureCredentials(secureCredentials);
-    slog("connected-apps installation registered");
-  } catch (error) {
-    // Never block app startup on a hosted integration. A user running their
-    // own Composio project key still has the local fallback below.
-    slog(`connected-apps registration failed: ${error?.message ?? error}`);
-  }
+  return normalizeManagedComposioBrokerUrl(
+    configured || (app.isPackaged ? DEFAULT_COMPOSIO_BROKER_URL : ""),
+  );
 }
 
 // The packaged app has no terminal: everything about the server child's life
@@ -205,17 +351,39 @@ async function ensureManagedComposioCredentials() {
 // why stdio is piped, not inherited — under a Finder/Explorer launch the
 // parent's stdio leads nowhere and a failed boot is otherwise undiagnosable.
 const LOG_DIR = app.getPath("logs");
+const DESKTOP_CRASH_LOG = path.join(LOG_DIR, "desktop-crashes.log");
+const DESKTOP_CRASH_LOG_MAX_BYTES = 512 * 1024;
 let logStream = null;
+let desktopShutdownStarted = false;
 import {
+  companionAdvertisedHostedUrl,
   companionEnabledAtRest,
+  companionOriginTarget,
   companionPairing,
+  companionRefreshTailscale,
   companionCloudDesktopAccess,
   companionRevoke,
+  companionRunning,
   companionState,
   rememberCompanionEnabled,
+  rememberCompanionKeepAwake,
+  setCompanionHostedUrl,
+  setCompanionLifecycleListener,
   startCompanion,
   stopCompanion,
 } from "./companion.mjs";
+
+let companionPowerBlocker = null;
+
+function syncCompanionKeepAwake(companionEnabled, keepAwake) {
+  const shouldBlock = companionEnabled && keepAwake;
+  if (shouldBlock && companionPowerBlocker === null) {
+    companionPowerBlocker = powerSaveBlocker.start("prevent-app-suspension");
+  } else if (!shouldBlock && companionPowerBlocker !== null) {
+    if (powerSaveBlocker.isStarted(companionPowerBlocker)) powerSaveBlocker.stop(companionPowerBlocker);
+    companionPowerBlocker = null;
+  }
+}
 
 function slog(line) {
   try {
@@ -229,23 +397,330 @@ function slog(line) {
   }
 }
 
-const LOG_TAIL_BYTES = 256 * 1024;
-
-function readLogTail(logPath) {
+// The server stream is intentionally asynchronous, but a fatal main-process
+// exception may terminate Electron before such a write is flushed. Crash
+// metadata gets its own tiny synchronous file. The formatter admits only a
+// fixed set of fields, so renderer URLs, page titles, exception messages and
+// absolute paths never land on disk or in a public bug report.
+function recordDesktopCrash(event) {
+  let handle = null;
   try {
-    const size = fs.statSync(logPath).size;
-    const start = Math.max(0, size - LOG_TAIL_BYTES);
-    const handle = fs.openSync(logPath, "r");
+    const record = formatDesktopCrashRecord(event);
+    if (!record) return;
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+
+    const flags =
+      fs.constants.O_WRONLY |
+      fs.constants.O_APPEND |
+      (process.platform === "win32" ? 0 : fs.constants.O_NOFOLLOW);
+    let before = null;
     try {
-      const buffer = Buffer.alloc(size - start);
-      fs.readSync(handle, buffer, 0, buffer.length, start);
-      return decodeLogTail(buffer, start > 0);
-    } finally {
-      fs.closeSync(handle);
+      before = fs.lstatSync(DESKTOP_CRASH_LOG);
+      if (!before.isFile() || before.nlink !== 1) return;
+      handle = fs.openSync(DESKTOP_CRASH_LOG, flags);
+    } catch (error) {
+      if (error?.code !== "ENOENT") return;
+      // O_EXCL makes first creation race-safe on Windows, where O_NOFOLLOW is
+      // unavailable, as well as on POSIX.
+      try {
+        handle = fs.openSync(
+          DESKTOP_CRASH_LOG,
+          flags | fs.constants.O_CREAT | fs.constants.O_EXCL,
+          0o600,
+        );
+      } catch {
+        return;
+      }
     }
+
+    const stats = fs.fstatSync(handle);
+    // A hard-linked or non-regular target is not an app-owned crash log.
+    if (!stats.isFile() || stats.nlink !== 1) return;
+    if (before && (before.dev !== stats.dev || before.ino !== stats.ino)) return;
+    // A renderer crash loop must not grow a persistent log without bound.
+    // The diagnostics export reads only a bounded tail, so dropping older
+    // crash metadata here preserves the useful part of the record.
+    if (stats.size >= DESKTOP_CRASH_LOG_MAX_BYTES) fs.ftruncateSync(handle, 0);
+    if (process.platform !== "win32") fs.fchmodSync(handle, 0o600);
+    fs.writeFileSync(handle, `[${new Date().toISOString()}] ${record}\n`, "utf8");
   } catch {
-    return null;
+    /* crash diagnostics must never change app lifecycle */
+  } finally {
+    if (handle !== null) {
+      try {
+        fs.closeSync(handle);
+      } catch {}
+    }
   }
+}
+
+// uncaughtExceptionMonitor observes Node's fatal path without converting it
+// into a handled exception. In particular, an unhandled rejection still
+// follows Node's normal exit behaviour after its metadata is persisted.
+installDesktopCrashListeners({
+  appTarget: app,
+  processTarget: process,
+  record: recordDesktopCrash,
+  isShuttingDown: () => desktopShutdownStarted,
+  mainWebContents: () => mainWindow?.webContents ?? null,
+});
+
+// ── managed companion connection ───────────────────────────────────────
+// Account onboarding provisions one remote Cloudflare Tunnel per desktop,
+// then calls reconcileManagedCompanionEndpointProvision below. Only the
+// endpoint is public state. The connector token stays in credentials.bin and
+// is passed to cloudflared through a private token file by the lifecycle
+// module — never through IPC, argv, the environment, or logs.
+let managedCompanionConnector = null;
+let companionAccountService = null;
+let companionDesiredThisLaunch = false;
+let companionLaunchGeneration = 0;
+let advertisementTransition = Promise.resolve();
+
+/** The one serialized credential mutation hook. Account onboarding and every
+ * other runtime credential writer share this state, so persisting a tunnel
+ * token can never overwrite an API key saved at the same time (or vice
+ * versa). */
+export async function updateSecureCredentialDocument(derive, afterPersist) {
+  if (!secureCredentialState) throw new Error("Secure credentials are not ready");
+  try {
+    return await secureCredentialState.update(derive, afterPersist);
+  } finally {
+    secureCredentials = secureCredentialState.read();
+  }
+}
+
+function publicManagedCompanionState() {
+  const access = managedCompanionTunnelAccess(secureCredentials);
+  const status = managedCompanionConnector?.getStatus();
+  if (status) {
+    const publicState = {
+      status: status.status,
+      configured: status.configured,
+      ready: status.ready,
+    };
+    if (status.endpoint) publicState.url = status.endpoint;
+    if (status.retryInMs) publicState.retryInMs = status.retryInMs;
+    if (status.error) publicState.error = status.error;
+    return publicState;
+  }
+  return access
+    ? { status: "stopped", configured: true, ready: false, url: access.endpoint }
+    : { status: "unconfigured", configured: false, ready: false };
+}
+
+function decorateDesktopCompanionState(state) {
+  // The panel polls this state, so a sidecar that exited on its own releases
+  // the blocker within one poll instead of keeping the computer awake forever.
+  syncCompanionKeepAwake(state.enabled && !state.error, state.keepAwake === true);
+  return { ...state, managedConnection: publicManagedCompanionState() };
+}
+
+async function desktopCompanionState() {
+  return decorateDesktopCompanionState(await companionState());
+}
+
+function companionLaunchOptions(hostedUrl = null) {
+  return {
+    resourcesPath: process.resourcesPath,
+    harnessPort: SERVER_PORT,
+    hostedUrl,
+    log: slog,
+  };
+}
+
+function ensureManagedCompanionConnector() {
+  if (managedCompanionConnector) return managedCompanionConnector;
+  managedCompanionConnector = createManagedCompanionTunnel({
+    binaryPath: resolveCloudflaredBinary({
+      isPackaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+      appPath: app.getAppPath(),
+    }),
+    guardianEntry: resolveManagedCompanionGuardian({ appPath: app.getAppPath() }),
+    runtimeExecutable: process.execPath,
+    runtimeRoot: path.join(app.getPath("userData"), "managed-companion-tunnel"),
+    onChange: (status) => {
+      slog(`managed companion connection ${status.status}`);
+      if (!companionDesiredThisLaunch) return;
+      void reconcileCompanionAdvertisement(status.ready ? status.endpoint : null);
+    },
+    log: slog,
+  });
+  return managedCompanionConnector;
+}
+
+/** Publish a hosted address only after its connector has passed public health
+ * verification. Updating the owned sidecar in place preserves the exact
+ * private origin generation and cannot invalidate an open pairing window. */
+function reconcileCompanionAdvertisement(
+  endpoint,
+  ownedGeneration = companionLaunchGeneration,
+) {
+  const normalizedEndpoint = endpoint || null;
+  const work = advertisementTransition.then(async () => {
+    if (
+      ownedGeneration !== companionLaunchGeneration ||
+      !companionDesiredThisLaunch ||
+      !companionRunning() ||
+      companionAdvertisedHostedUrl() === normalizedEndpoint
+    ) {
+      return desktopCompanionState();
+    }
+    const updated = await setCompanionHostedUrl(normalizedEndpoint);
+    return { ...updated, managedConnection: publicManagedCompanionState() };
+  });
+  advertisementTransition = work.then(
+    () => {},
+    () => {},
+  );
+  return work;
+}
+
+async function startManagedCompanionConnection({ waitForVerification = true } = {}) {
+  if (companionAccountCleanupPending(secureCredentials)) {
+    return publicManagedCompanionState();
+  }
+  const access = managedCompanionTunnelAccess(secureCredentials);
+  if (!access) return publicManagedCompanionState();
+  const target = companionOriginTarget();
+  if (!target) return publicManagedCompanionState();
+  const operation = ensureManagedCompanionConnector().start({ ...access, originTarget: target });
+  if (!waitForVerification) {
+    void operation.catch(() => {});
+    return publicManagedCompanionState();
+  }
+  const status = await operation;
+  await reconcileCompanionAdvertisement(status.ready ? status.endpoint : null);
+  return publicManagedCompanionState();
+}
+
+async function startDesktopCompanion({ waitForHosted = true, remember = true } = {}) {
+  companionDesiredThisLaunch = true;
+  companionLaunchGeneration += 1;
+  // Direct LAN comes up first. The hosted endpoint is added in place only
+  // after the guardian has verified the public route to this exact sidecar.
+  const localState = await startCompanion(companionLaunchOptions());
+  if (!localState.enabled || localState.error) {
+    companionDesiredThisLaunch = false;
+    return desktopCompanionState();
+  }
+  if (remember) rememberCompanionEnabled(true);
+  await startManagedCompanionConnection({ waitForVerification: waitForHosted });
+  return desktopCompanionState();
+}
+
+async function stopDesktopCompanion({ remember = true } = {}) {
+  companionDesiredThisLaunch = false;
+  companionLaunchGeneration += 1;
+  if (remember) rememberCompanionEnabled(false);
+  syncCompanionKeepAwake(false, false);
+  await managedCompanionConnector?.stop();
+  await stopCompanion();
+  return desktopCompanionState();
+}
+
+async function refreshDesktopCompanionTailscale() {
+  if (!companionRunning()) {
+    const started = await startDesktopCompanion({ waitForHosted: false });
+    if (!started.enabled || started.error) return started;
+  }
+  return decorateDesktopCompanionState(await companionRefreshTailscale());
+}
+
+setCompanionLifecycleListener(({ expected, pid }) => {
+  if (expected) return;
+  slog(`owned companion exited unexpectedly pid=${pid ?? "unknown"}`);
+  companionDesiredThisLaunch = false;
+  companionLaunchGeneration += 1;
+  syncCompanionKeepAwake(false, false);
+  // stop() invalidates the guardian's owner pipe synchronously, before the
+  // sidecar module removes this generation's private socket.
+  void managedCompanionConnector?.stop().catch(() => {});
+});
+
+/** Narrow main-process hook for the account onboarding flow. Its return value
+ * is explicitly secret-free and can be used to refresh the settings panel. */
+export async function reconcileManagedCompanionEndpointProvision(provision) {
+  await updateSecureCredentialDocument((credentials) =>
+    withManagedCompanionTunnelAccess(credentials, provision),
+  );
+  if (companionDesiredThisLaunch) {
+    await startManagedCompanionConnection({ waitForVerification: true });
+  }
+  return publicManagedCompanionState();
+}
+
+/** Called only after the control plane has revoked/deleted the endpoint. */
+export async function clearManagedCompanionEndpointCredentials() {
+  await updateSecureCredentialDocument((credentials) =>
+    withoutManagedCompanionTunnelAccess(credentials),
+  );
+  await managedCompanionConnector?.stop();
+  if (companionDesiredThisLaunch) await reconcileCompanionAdvertisement(null);
+  return publicManagedCompanionState();
+}
+
+/** Account sign-out must stop advertising the hosted route before it asks
+ * the control plane to revoke anything, but it must not erase the retry
+ * credentials until that remote cleanup is durably scheduled. */
+async function stopManagedCompanionEndpointLocally() {
+  await managedCompanionConnector?.stop();
+  if (companionDesiredThisLaunch) await reconcileCompanionAdvertisement(null);
+  return publicManagedCompanionState();
+}
+
+async function activatePersistedManagedCompanionEndpoint() {
+  if (companionDesiredThisLaunch) {
+    return startManagedCompanionConnection({ waitForVerification: true });
+  }
+  return publicManagedCompanionState();
+}
+
+function installationDisplayName() {
+  const hostname = [...os.hostname()]
+    .filter((character) => character.codePointAt(0) >= 32 && character.codePointAt(0) !== 127)
+    .join("")
+    .trim();
+  return hostname.slice(0, 80) || "This computer";
+}
+
+function ensureCompanionAccountService() {
+  if (companionAccountService) return companionAccountService;
+  const baseURL = resolveCompanionControlPlaneURL({
+    isPackaged: app.isPackaged,
+    environment: process.env,
+  });
+  let client = null;
+  if (baseURL) {
+    try {
+      client = createControlPlaneClient({ baseURL });
+    } catch {
+      // An invalid explicit override disables hosted access. Direct LAN,
+      // Bonjour, and Tailscale pairing remain completely independent.
+    }
+  }
+  companionAccountService = createCompanionAccountService({
+    client,
+    readCredentials: () => secureCredentialState?.read() ?? secureCredentials,
+    updateCredentials: updateSecureCredentialDocument,
+    identity: {
+      name: installationDisplayName(),
+      platform:
+        process.platform === "win32"
+          ? "windows"
+          : process.platform === "darwin"
+            ? "darwin"
+            : "linux",
+      appVersion: app.getVersion().slice(0, 64),
+    },
+    newClientInstanceId: randomUUID,
+    activatePersistedEndpoint: activatePersistedManagedCompanionEndpoint,
+    stopManagedEndpoint: stopManagedCompanionEndpointLocally,
+    managedConnectionState: publicManagedCompanionState,
+    companionIsOn: () => companionDesiredThisLaunch,
+  });
+  return companionAccountService;
 }
 
 // Everything the bug-report bundle needs. The config summary comes from the
@@ -260,7 +735,8 @@ async function gatherDiagnostics() {
     .then((res) => (res.ok ? res.json() : null))
     .catch(() => null);
   const logPath = path.join(LOG_DIR, "server.log");
-  const log = readLogTail(logPath);
+  const log = readSafeLogTail(logPath);
+  const desktopLog = readSafeLogTail(DESKTOP_CRASH_LOG);
   return buildDiagnosticsReport({
     appInfo: {
       version: app.getVersion(),
@@ -272,91 +748,258 @@ async function gatherDiagnostics() {
       uptimeSeconds: Math.round(process.uptime()),
     },
     configSummary: serverStatus ?? {},
+    desktopLogTail: desktopLog?.tail ?? "",
     logTail: log?.tail ?? "",
   });
 }
 
+// Set by startServerPackaged: true only when every failing candidate port was
+// taken by another process — decides which error-page message renders.
+let serverStartConflictOnly = false;
+
+function syncBrowserConnection(proc) {
+  try {
+    postBrowserConnection(proc, browserHost?.url ? browserHost.descriptor() : null);
+  } catch (error) {
+    slog(`browser connection sync failed: ${error?.message ?? error}`);
+  }
+}
+
+function receiveBrowserControlHold(rawMessage) {
+  const message = rawMessage?.data ?? rawMessage;
+  return applyBrowserControlHold(message, (botId) => {
+    browserControlHolds.add(botId);
+    browserSurface?.setHumanControl(botId, true);
+  });
+}
+
+async function clearBrowserPartition(partition) {
+  await clearBrowserPartitionSession(session.fromPartition(partition));
+}
+
+async function applyBrowserLifecycleCleanup(lifecycle) {
+  if (lifecycle.type === "bot-deleted") {
+    browserSurface?.close(lifecycle.botId);
+    browserControlHolds.delete(lifecycle.botId);
+    browserHost?.revokeCapabilitiesForBot(lifecycle.botId);
+    await clearBrowserPartition(browserPartition(lifecycle.botId));
+  } else {
+    browserSurface?.forgetProfile(lifecycle.partitionId);
+    browserHost?.revokeCapabilitiesForProfile(lifecycle.partitionId);
+    await clearBrowserPartition(browserProfilePartition(lifecycle.partitionId));
+  }
+  return true;
+}
+
+const browserLifecycleCleanups = new Map();
+const completedBrowserLifecycleCleanups = new Set();
+const MAX_COMPLETED_BROWSER_CLEANUPS = 512;
+
+function rememberBrowserLifecycleCleanup(requestId) {
+  if (!requestId) return;
+  completedBrowserLifecycleCleanups.delete(requestId);
+  completedBrowserLifecycleCleanups.add(requestId);
+  while (completedBrowserLifecycleCleanups.size > MAX_COMPLETED_BROWSER_CLEANUPS) {
+    completedBrowserLifecycleCleanups.delete(completedBrowserLifecycleCleanups.values().next().value);
+  }
+}
+
+/** Run one private cleanup request at most once and acknowledge only after
+ * Chromium confirms its session data is gone. Duplicate retries join the
+ * same promise; a retry whose success ACK was lost receives a cached ACK. */
+function receiveBrowserLifecycleCleanup(proc, rawMessage) {
+  const message = rawMessage?.data ?? rawMessage;
+  const lifecycle = decodeBrowserLifecycleMessage(message);
+  if (!lifecycle) return false;
+  const requestId = lifecycle.requestId;
+  let cleanup = requestId ? browserLifecycleCleanups.get(requestId) : null;
+  if (!cleanup) {
+    cleanup = requestId && completedBrowserLifecycleCleanups.has(requestId)
+      ? Promise.resolve(true)
+      : applyBrowserLifecycleCleanup(lifecycle).then((result) => {
+          rememberBrowserLifecycleCleanup(requestId);
+          return result;
+        });
+    if (requestId) {
+      browserLifecycleCleanups.set(requestId, cleanup);
+      void cleanup.finally(() => {
+        if (browserLifecycleCleanups.get(requestId) === cleanup) browserLifecycleCleanups.delete(requestId);
+      }).catch(() => {});
+    }
+  }
+  void cleanup.then(
+    () => {
+      if (requestId) proc.postMessage(browserLifecycleResult(requestId, true));
+    },
+    (error) => {
+      slog(`browser lifecycle cleanup failed: ${error?.message ?? error}`);
+      if (requestId) {
+        try {
+          proc.postMessage(browserLifecycleResult(requestId, false));
+        } catch (postError) {
+          slog(`browser lifecycle result send failed: ${postError?.message ?? postError}`);
+        }
+      }
+    },
+  ).catch((error) => {
+    slog(`browser lifecycle result send failed: ${error?.message ?? error}`);
+  });
+  return true;
+}
+
 async function startServerOn(port) {
   const entry = path.join(process.resourcesPath, "server", "index.js");
+  const childEnv = managedComposioChildEnvironment(composioBrokerUrl(), secureCredentials, {
+    ...process.env,
+    // A packaged utility child must never fall back to a descriptor inherited
+    // from the launching shell. It starts fail-closed until this exact main
+    // process sends the private in-memory connection after spawn.
+    OMB_DESKTOP_PARENT: "1",
+    OMB_STATIC_DIR: path.join(process.resourcesPath, "ui"),
+    OMB_RESOURCES_PATH: process.resourcesPath,
+    OMB_SKILLS_DIR: path.join(process.resourcesPath, "skills"),
+    OMB_PORT: String(port),
+    // the server advertises this to remote clients so version skew is visible
+    OMB_APP_VERSION: app.getVersion(),
+    OMB_USER_DATA: app.getPath("userData"),
+    ...(secureCredentials.composioApiKey
+      ? { COMPOSIO_API_KEY: secureCredentials.composioApiKey }
+      : {}),
+    // "we could not read your keys" must not reach the UI as "you have none"
+    OMB_CREDENTIAL_STORE: credentialStoreUnavailable ? "unavailable" : "ok",
+    // one env var per stored workspace secret (xai/box/voice/OpenCode Go);
+    // the server prefers these over config.json, whose plaintext fields
+    // the boot migration has deleted
+    ...workspaceCredentialEnv(secureCredentials),
+  });
+  delete childEnv.OMB_BROWSER_CONNECTION;
   slog(`fork ${entry} port=${port}`);
   const proc = utilityProcess.fork(entry, [], {
-    env: {
-      ...process.env,
-      OMB_STATIC_DIR: path.join(process.resourcesPath, "ui"),
-      OMB_RESOURCES_PATH: process.resourcesPath,
-      OMB_SKILLS_DIR: path.join(process.resourcesPath, "skills"),
-      OMB_PORT: String(port),
-      OMB_USER_DATA: app.getPath("userData"),
-      ...(secureCredentials.composioApiKey
-        ? { COMPOSIO_API_KEY: secureCredentials.composioApiKey }
-        : {}),
-      // one env var per stored workspace secret (xai/box/voice/OpenCode);
-      // the server prefers these over config.json, whose plaintext fields
-      // the boot migration has deleted
-      ...workspaceCredentialEnv(secureCredentials),
-      ...(composioBrokerUrl() && secureCredentials.composioBrokerToken
-        ? {
-            OMB_COMPOSIO_BROKER_URL: composioBrokerUrl(),
-            OMB_COMPOSIO_BROKER_TOKEN: secureCredentials.composioBrokerToken,
-          }
-        : {}),
-    },
+    env: childEnv,
     stdio: ["ignore", "pipe", "pipe"],
   });
   proc.stdout?.on("data", (d) => slog(`[out] ${String(d).trimEnd()}`));
   proc.stderr?.on("data", (d) => slog(`[err] ${String(d).trimEnd()}`));
-  proc.once("spawn", () => slog(`spawned pid=${proc.pid}`));
+  proc.on("message", (message) => {
+    try {
+      if (receiveBrowserControlHold(message)) return;
+      if (receiveBrowserLifecycleCleanup(proc, message)) return;
+    } catch (error) {
+      slog(`browser private sync rejected: ${error?.message ?? error}`);
+    }
+  });
+  proc.once("spawn", () => {
+    slog(`spawned pid=${proc.pid}`);
+    syncBrowserConnection(proc);
+  });
   let exited = false;
   proc.once("exit", (code) => {
     exited = true;
+    // Capabilities belong to turns in this exact server child. A crash or
+    // restart invalidates them before any replacement child receives the
+    // browser descriptor.
+    browserHost?.clearCapabilities();
     slog(`exited code=${code}`);
   });
   // wait for the port to answer (fresh machine: first boot writes data dirs).
   // Identity check is by PID: a dev harness server has the same API shape,
   // so only the child we actually forked (matching pid + static serving)
   // counts as ours.
-  for (let i = 0; i < 40; i++) {
-    if (exited) return null;
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
-      if (res.ok) {
-        const body = await res.json().catch(() => null);
-        if (body?.app === "openmausbot" && body.pid === proc.pid && body.static) return proc;
-        break; // someone else owns this port — try the next one
-      }
-    } catch {
-      /* not up yet */
-    }
-    await new Promise((r) => setTimeout(r, 500));
+  // The budget is wall-clock, not a fixed poll count: a healthy boot can take
+  // well past 20s on cold machines or when pre-listen network calls stall
+  // (issue #506), and reaping an about-to-listen child reads to the user as
+  // "something else is using its ports" even though nothing was on them.
+  // The probe itself is deadline-bounded (a hung health endpoint cannot wedge
+  // us here forever) and reports WHY it gave up, so the error page can tell
+  // port conflict apart from slow startup.
+  const identity = await pollServerIdentity({
+    port,
+    // Getter, not value: proc.pid stays undefined until the async `spawn`
+    // event fires, and capturing it here would make the probe judge our own
+    // child a "foreign owner" on its first health answer.
+    pid: () => proc.pid,
+    bootTimeoutMs: SERVER_BOOT_TIMEOUT_MS,
+    isExited: () => exited,
+  });
+  if (identity.outcome === "ready") return { proc };
+  if (identity.outcome === "exited") {
+    slog(`child on port ${port} exited before answering /api/health`);
+  } else {
+    slog(
+      identity.outcome === "foreign-owner"
+        ? `port ${port} answered health checks from another process`
+        : `child on port ${port} did not answer /api/health within ${SERVER_BOOT_TIMEOUT_MS / 1000}s`,
+    );
   }
   try {
     proc.kill();
   } catch {}
-  return null;
+  return { proc: null, reason: identity.outcome };
 }
 
 async function startServerPackaged() {
   // two passes: a quit-and-reopen relaunch can race the dying instance's
   // server during teardown — one settle-and-retry covers it
+  let everyPortForeignOwned = true;
   for (let attempt = 0; attempt < 2; attempt++) {
     for (const port of [8799, 18799, 28799]) {
-      const proc = await startServerOn(port);
-      if (proc) {
-        serverProc = proc;
+      const started = await startServerOn(port);
+      if (started.proc) {
+        serverProc = started.proc;
         SERVER_PORT = port;
         return true;
       }
+      // A child that exited or timed out is not evidence of a port conflict —
+      // only "another process answered health checks" is.
+      if (started.reason !== "foreign-owner") everyPortForeignOwned = false;
     }
     await new Promise((r) => setTimeout(r, 2500));
   }
+  serverStartConflictOnly = everyPortForeignOwned;
   return false;
 }
 
-const ERROR_PAGE =
-  "data:text/html;charset=utf-8," +
-  encodeURIComponent(
-    `<body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;background:#070707;color:#fcfcfc;font:15px -apple-system,system-ui"><div style="text-align:center;max-width:360px"><div style="font-size:40px">🐭</div><h2 style="font-weight:600;margin:12px 0 6px">Couldn't start the bot server</h2><p style="color:#fcfcfc99;line-height:1.5">Something else is using its ports. Quit and reopen OpenMausBot — if it keeps happening, restart your computer.</p></div></body>`,
+function syncManagedComposioCredentials() {
+  if (!serverProc) return;
+  try {
+    serverProc.postMessage({
+      type: "openmausbot:managed-composio",
+      access: managedComposioAccess(composioBrokerUrl(), secureCredentials),
+    });
+  } catch (error) {
+    slog(`connected-apps credential sync failed: ${error?.message ?? error}`);
+  }
+}
+
+// The page is built at failure time (not import time): the message depends on
+// how the boot failed, and the log path comes from LOG_DIR so Windows and
+// Linux users see their real location instead of a macOS guess. The link
+// opens the log through the window's setWindowOpenHandler, which routes to
+// the platform handler.
+function escapeHtml(value) {
+  return value.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
+}
+
+function buildErrorPage({ allPortsOccupied }) {
+  const serverLogPath = path.join(LOG_DIR, "server.log");
+  const serverLogHref = pathToFileURL(serverLogPath).href;
+  const reason = allPortsOccupied
+    ? "Every OpenMausBot port answered health checks from another process — likely a second copy of the app, or another program on ports 8799–28799. Quit that program, then quit and reopen OpenMausBot."
+    : "The background server didn't come up in time — this is usually slow startup, not a port conflict. Quit and reopen OpenMausBot.";
+  return (
+    "data:text/html;charset=utf-8," +
+    encodeURIComponent(
+      `<body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;background:#070707;color:#fcfcfc;font:15px -apple-system,system-ui"><div style="text-align:center;max-width:360px"><div style="font-size:40px">🐭</div><h2 style="font-weight:600;margin:12px 0 6px">Couldn't start the bot server</h2><p style="color:#fcfcfc99;line-height:1.5">${escapeHtml(reason)} If it keeps happening, check <a target="_blank" rel="noopener" href="${serverLogHref}" style="color:#fcfcfc">${escapeHtml(serverLogPath)}</a>.</p></div></body>`,
+    )
   );
+}
+
+// How long one packaged-server child gets to answer /api/health before the
+// parent reaps it and tries the next port. Wall-clock, deliberately generous:
+// first boots write data dirs and pre-listen network calls (managed composio,
+// workspace credentials) can stall a healthy child far past 20s on some
+// machines, which used to surface as the misleading "ports are busy" page.
+const SERVER_BOOT_TIMEOUT_MS = 60_000;
 
 let cuaReady = Promise.resolve({ mode: "unavailable", reason: "not-started" });
 const androidDevice = createAndroidDeviceController({ resourcesPath: process.resourcesPath });
@@ -410,12 +1053,25 @@ function openDesktopViewer(owner, rawUrl, rawTitle, contextId) {
   const titleCandidate = Object.prototype.toString.call(rawTitle) === "[object String]" ? rawTitle.trim() : "";
   const title = titleCandidate ? titleCandidate.slice(0, 80) : "Live desktop";
 
+  const nextContextId =
+    Object.prototype.toString.call(contextId) === "[object String]" ? contextId.slice(0, 120) : null;
+
   // Desktop URLs contain rotating access tokens. A newly minted URL replaces
   // the old viewer instead of being retained anywhere after its window closes.
-  if (desktopViewerWindow && !desktopViewerWindow.isDestroyed()) desktopViewerWindow.close();
+  // Clear the ref first so the stale window's close handler no-ops; on a bot
+  // change, tell the previous bot to release (same-bot reopen stays quiet).
+  if (desktopViewerWindow && !desktopViewerWindow.isDestroyed()) {
+    const previous = desktopViewerWindow;
+    const previousOwner = desktopViewerOwner;
+    const previousContextId = desktopViewerContextId;
+    desktopViewerWindow = null;
+    previous.close();
+    if (previousContextId !== nextContextId && previousOwner && !previousOwner.isDestroyed()) {
+      previousOwner.send("desktop-viewer:state", { open: false, contextId: previousContextId });
+    }
+  }
   desktopViewerOwner = owner.webContents;
-  desktopViewerContextId =
-    Object.prototype.toString.call(contextId) === "[object String]" ? contextId.slice(0, 120) : null;
+  desktopViewerContextId = nextContextId;
 
   const viewer = new BrowserWindow({
     width: 1220,
@@ -423,7 +1079,9 @@ function openDesktopViewer(owner, rawUrl, rawTitle, contextId) {
     minWidth: 760,
     minHeight: 520,
     parent: owner,
-    modal: true,
+    // Not modal: the person still needs the app's "Hand control back" button
+    // while the desktop is open. `parent` keeps it floating above the app.
+    modal: false,
     show: false,
     title,
     icon: APP_ICON,
@@ -451,6 +1109,7 @@ function openDesktopViewer(owner, rawUrl, rawTitle, contextId) {
   viewer.on("closed", () => {
     if (desktopViewerWindow !== viewer) return;
     desktopViewerWindow = null;
+    // The panel drops its "viewer open" state and releases control on this.
     notifyDesktopViewer(false);
     desktopViewerOwner = null;
     desktopViewerContextId = null;
@@ -490,43 +1149,306 @@ function openDesktopViewer(owner, rawUrl, rawTitle, contextId) {
   return true;
 }
 
+function ensureDesktopWorkspace(owner) {
+  if (!owner || owner.isDestroyed()) throw new Error("The OpenMausBot window is unavailable");
+  if (desktopWorkspaceManager) {
+    if (desktopWorkspaceOwner !== owner) {
+      throw new Error("The desktop workspace belongs to another app window");
+    }
+    return desktopWorkspaceManager;
+  }
+
+  desktopWorkspaceOwner = owner;
+  const manager = createDesktopWorkspaceManager({
+    owner,
+    createView: (options) => new WebContentsView(options),
+    partitionPrefix: `openmausbot-desktop-workspace-${randomUUID()}`,
+    notify: (state) => {
+      if (!owner.isDestroyed() && !owner.webContents.isDestroyed()) {
+        owner.webContents.send("desktop-workspace:state", state);
+      }
+    },
+  });
+  desktopWorkspaceManager = manager;
+
+  // Native child views outlive the renderer DOM unless we explicitly tear
+  // them down. Reloads, renderer crashes and owner destruction all close both
+  // panes without retaining their secret-bearing noVNC URLs.
+  owner.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) manager.closeAll();
+  });
+  owner.webContents.on("render-process-gone", () => manager.closeAll());
+  owner.once("closed", () => {
+    manager.closeAll();
+    if (desktopWorkspaceManager === manager) {
+      desktopWorkspaceManager = null;
+      desktopWorkspaceOwner = null;
+    }
+  });
+  return manager;
+}
+
+function desktopWorkspaceForEvent(event, create = false) {
+  const owner = mainWindow;
+  if (!owner || owner.isDestroyed() || event.sender !== owner.webContents) {
+    throw new Error("The desktop workspace is available only to the main app window");
+  }
+  if (desktopWorkspaceManager && desktopWorkspaceOwner !== owner) {
+    throw new Error("The desktop workspace belongs to another app window");
+  }
+  return create ? ensureDesktopWorkspace(owner) : desktopWorkspaceManager;
+}
+
+/** The built-in browser: WebContentsViews per bot inside the app window,
+ * plus the loopback host the bot's tools call. The host and its in-memory
+ * master token live for the whole process; the surface belongs to a
+ * window and is rebuilt for every window created — macOS keeps the app
+ * alive with none open, and `activate` makes a new one. Never blocks the
+ * window: without it the Browser tab simply reports itself unavailable. */
+function removeBrowserConnectionDescriptor() {
+  try {
+    removeBrowserConnectionDescriptorFile({ userData: app.getPath("userData") });
+  } catch (error) {
+    slog(`could not remove stale browser descriptor: ${error?.message ?? error}`);
+  }
+}
+
+async function ensureBrowserHost() {
+  if (!browserSurfaceIsSupported) {
+    removeBrowserConnectionDescriptor();
+    throw new Error("The sandboxed built-in browser is not yet available on this platform");
+  }
+  if (browserHost?.url) return browserHost;
+  const candidate = createBrowserHost({ manager: () => browserSurface });
+  try {
+    await candidate.start();
+    if (app.isPackaged) removeBrowserConnectionDescriptor();
+    else browserConnectionStore.persist(candidate.descriptor());
+    // Publish only after listen + descriptor handling both succeed. A failed
+    // candidate is stopped below so the next window can retry cleanly.
+    browserHost = candidate;
+    if (serverProc) syncBrowserConnection(serverProc);
+    return candidate;
+  } catch (error) {
+    await candidate.stop().catch(() => {});
+    throw error;
+  }
+}
+
+async function startBrowserSurface(owner) {
+  if (!browserSurfaceIsSupported) {
+    // Never leave a development descriptor behind that could make the server
+    // advertise browser tools while the native surface is deliberately gated.
+    removeBrowserConnectionDescriptor();
+    if (serverProc) syncBrowserConnection(serverProc);
+    return;
+  }
+  let surface = null;
+  try {
+    surface = createBrowserSurfaceManager({
+      owner,
+      createView: (options) => new WebContentsView(options),
+      notify: (state) => {
+        if (!owner.isDestroyed() && !owner.webContents.isDestroyed()) owner.webContents.send("browser:state", state);
+      },
+      onUserInteraction: (state) => {
+        if (!owner.isDestroyed() && !owner.webContents.isDestroyed()) owner.webContents.send("browser:user-interaction", state);
+      },
+    });
+    for (const botId of browserControlHolds) surface.setHumanControl(botId, true);
+    browserSurface = surface;
+    await ensureBrowserHost();
+    // A renderer reload or crash loses the panel that positioned the views;
+    // hide them until a mounted Browser tab lays them out again. The pages
+    // themselves stay alive — a bot mid-task must not lose its tab.
+    owner.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+      if (isMainFrame && !isInPlace) browserSurface?.hideAll();
+    });
+    owner.webContents.on("render-process-gone", () => browserSurface?.hideAll());
+    owner.once("closed", () => {
+      surface.closeAll();
+      if (browserSurface === surface) browserSurface = null;
+    });
+    slog(`browser surface ready for window ${owner.id} (host ${browserHost.url})`);
+  } catch (error) {
+    slog(`browser surface unavailable: ${error?.message ?? error}`);
+    surface?.closeAll();
+    if (browserSurface === surface) browserSurface = null;
+  }
+}
+
+function browserSurfaceForEvent(event) {
+  const owner = mainWindow;
+  if (!owner || owner.isDestroyed() || event.sender !== owner.webContents) {
+    throw new Error("The browser is available only to the main app window");
+  }
+  if (!browserSurface) throw new Error("The built-in browser is unavailable");
+  return browserSurface;
+}
+
+ipcMain.handle("browser:available", () => Boolean(browserSurface && browserHost?.url));
+ipcMain.handle("browser:state", (event, botId) => browserSurfaceForEvent(event).state(botId));
+ipcMain.handle("browser:layout", (event, botId, bounds, profile, mode, layoutOwner) =>
+  browserSurfaceForEvent(event).layout(
+    botId,
+    bounds ?? null,
+    Object.prototype.toString.call(profile) === "[object String]" ? profile : undefined,
+    mode === "expanded" ? "expanded" : "compact",
+    Object.prototype.toString.call(layoutOwner) === "[object String]" && layoutOwner.length <= 128
+      ? layoutOwner
+      : undefined,
+  ),
+);
+const browserProfileFromRenderer = (profile) =>
+  Object.prototype.toString.call(profile) === "[object String]" ? profile : undefined;
+
+ipcMain.handle("browser:forward", async (event, botId, profile) => {
+  const result = await browserSurfaceForEvent(event).forward(botId, browserProfileFromRenderer(profile), { source: "user" });
+  return { url: result.url, title: result.title };
+});
+ipcMain.handle("browser:reload", async (event, botId, profile) => {
+  const result = await browserSurfaceForEvent(event).reload(botId, browserProfileFromRenderer(profile), { source: "user" });
+  return { url: result.url, title: result.title };
+});
+ipcMain.handle("browser:navigate", async (event, botId, url, profile) => {
+  const result = await browserSurfaceForEvent(event).navigate(botId, url, browserProfileFromRenderer(profile), { source: "user" });
+  return { url: result.url, title: result.title };
+});
+ipcMain.handle("browser:back", async (event, botId, profile) => {
+  const result = await browserSurfaceForEvent(event).back(botId, browserProfileFromRenderer(profile), { source: "user" });
+  return { url: result.url, title: result.title };
+});
+ipcMain.handle("browser:set-human-control", (event, botId, held, profile) => {
+  const owner = mainWindow;
+  if (!owner || owner.isDestroyed() || event.sender !== owner.webContents) {
+    throw new Error("The browser is available only to the main app window");
+  }
+  const id = String(botId ?? "");
+  if (!/^[A-Za-z0-9_-]{1,120}$/.test(id)) throw new Error("A bot id is required");
+  // A generic Computer-panel release must be able to clear a positive hold
+  // remembered across renderer/surface recreation. If no surface exists,
+  // there is no local browser to update, but the remembered gate still goes.
+  if (!browserSurface) {
+    if (held === true) throw new Error("The built-in browser is unavailable");
+    browserControlHolds.delete(id);
+    return true;
+  }
+  const surface = browserSurface;
+  const applied = surface.setHumanControl(id, held === true, browserProfileFromRenderer(profile));
+  if (held === true) browserControlHolds.add(id);
+  else browserControlHolds.delete(id);
+  return applied;
+});
+ipcMain.handle("browser:close", (event, botId) => browserSurfaceForEvent(event).close(botId));
+// Deleting a profile: every bot's view on it goes, then its cookies, storage
+// and cache. The partition directory itself is left for Chromium to reuse
+// (removing it while the session object lives is the EBUSY trap every
+// Electron app with profiles has hit); nothing identifying remains in it.
+ipcMain.handle("browser:forget-profile", async (event, partitionId) => {
+  const surface = browserSurfaceForEvent(event);
+  const id = String(partitionId ?? "");
+  if (!/^[A-Za-z0-9_-]{1,40}$/.test(id) || id === "guest") throw new Error("That browser partition id is invalid");
+  const dropped = surface.forgetProfile(id);
+  browserHost?.revokeCapabilitiesForProfile(id);
+  await clearBrowserPartition(browserProfilePartition(id));
+  return { dropped };
+});
+
 ipcMain.on("screen:preview-intent", (event) => {
   event.returnValue = displayMediaGuard.begin(event.senderFrame);
 });
 
+ipcMain.on("desktop:unread-count", (event, value) => {
+  const sender = BrowserWindow.fromWebContents(event.sender);
+  if (!sender || sender !== mainWindow || sender.isDestroyed()) return;
+  unreadCount = normalizeUnreadCount(value);
+  applyUnreadBadge(sender);
+});
+
 function createWindow() {
-  const isMac = process.platform === "darwin";
+  const waitsForSkinSync = process.platform === "win32";
+  const primary = screen.getPrimaryDisplay();
+  const displays = [primary, ...screen.getAllDisplays().filter((display) => display.id !== primary.id)];
+  const restored = resolveWindowState(readWindowState(), displays.map((display) => display.workArea));
   const win = new BrowserWindow({
-    width: 1440,
-    height: 920,
+    ...restored.bounds,
     minWidth: 900,
     minHeight: 600,
+    // The renderer restores its persisted skin before mounting React and
+    // mirrors it over desktop:skin. Keep Windows hidden until that handshake
+    // recolors the native caption-button overlay, otherwise a saved light
+    // skin still flashes the Midnight-black block on every cold start.
+    show: !waitsForSkinSync,
     icon: APP_ICON,
     backgroundColor: "#070707",
     autoHideMenuBar: process.platform !== "darwin",
-    // macOS keeps inset traffic lights, Windows keeps its custom overlay,
-    // and Linux uses the native desktop title bar and window controls.
-    ...(isMac
-      ? { titleBarStyle: "hiddenInset", trafficLightPosition: { x: 16, y: 16 } }
-      : process.platform === "win32"
-        ? {
-            titleBarStyle: "hidden",
-            // height MUST match the ChatView/GroupView header strip (px-5 py-3
-            // around a 36px control row = 60). Windows draws the caption buttons
-            // to fill the overlay, so anything shorter leaves a dead band under
-            // them and anything taller overhangs the header.
-            titleBarOverlay: { color: "#070707", symbolColor: "#b5b5b5", height: 60 },
-          }
-        : {}),
+    ...windowChromeOptions(process.platform),
     webPreferences: {
       contextIsolation: true,
       preload: path.join(__dirname, "preload.cjs"),
     },
   });
+  mainWindow = win;
+  void startBrowserSurface(win);
+  if (waitsForSkinSync) {
+    // A broken renderer or preload must not strand the app as an invisible
+    // process. Normal startup shows from desktop:skin almost immediately;
+    // this is only the bounded recovery path.
+    const skinSyncFallback = setTimeout(() => {
+      if (!win.isDestroyed() && !win.isVisible()) win.show();
+    }, 5_000);
+    skinSyncFallback.unref?.();
+    const clearSkinSyncFallback = () => clearTimeout(skinSyncFallback);
+    win.once("show", clearSkinSyncFallback);
+    win.once("closed", clearSkinSyncFallback);
+  }
+  installWindowStatePersistence(win);
+  applyUnreadBadge(win);
+  if (restored.maximized) win.maximize();
+  win.once("closed", () => {
+    if (mainWindow === win) mainWindow = null;
+  });
 
   win.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
     return { action: "deny" };
+  });
+  win.webContents.on("did-finish-load", () => deliverPackageInstall(win));
+
+  // Native context menu for text inputs — without this, right-click does
+  // nothing in the Electron window (no Cut/Copy/Paste/Select All).
+  win.webContents.on("context-menu", (_event, params) => {
+    // nothing actionable here — no menu at all, rather than a wall of
+    // disabled items
+    if (!params.isEditable && !params.linkURL && !params.misspelledWord && !params.selectionText) return;
+    const menuItems = [];
+    if (params.misspelledWord) {
+      for (const suggestion of params.dictionarySuggestions.slice(0, 5)) {
+        menuItems.push({
+          label: suggestion,
+          click: () => win.webContents.replaceMisspelling(suggestion),
+        });
+      }
+      if (menuItems.length) menuItems.push({ type: "separator" });
+    }
+    if (params.linkURL) {
+      menuItems.push(
+        { label: "Copy Link", click: () => clipboard.writeText(params.linkURL) },
+        { type: "separator" },
+      );
+    }
+    menuItems.push(
+      { label: "Undo", role: "undo", enabled: params.editFlags.canUndo },
+      { label: "Redo", role: "redo", enabled: params.editFlags.canRedo },
+      { type: "separator" },
+      { label: "Cut", role: "cut", enabled: params.editFlags.canCut },
+      { label: "Copy", role: "copy", enabled: params.editFlags.canCopy },
+      { label: "Paste", role: "paste", enabled: params.editFlags.canPaste },
+      { label: "Paste and Match Style", role: "pasteAndMatchStyle", enabled: params.editFlags.canPaste },
+      { type: "separator" },
+      { label: "Select All", role: "selectAll", enabled: params.editFlags.canSelectAll },
+    );
+    Menu.buildFromTemplate(menuItems).popup({ window: win, frame: params.frame });
   });
 
   // Packaged CI smoke hook. It validates the real renderer/preload bridge and
@@ -621,6 +1543,7 @@ function createWindow() {
             mcpEnv: connection?.mcp?.env,
           };
         }
+        result.hardwareAccelerationEnabled = app.isHardwareAccelerationEnabled();
         result.displayMediaRequests = displayMediaRequestCount;
         console.log(`[smoke] renderer-ready ${JSON.stringify(result)}`);
       } catch (error) {
@@ -638,7 +1561,7 @@ function createWindow() {
     return `${base}${join}access_token=${encodeURIComponent(token)}`;
   };
   if (app.isPackaged) {
-    win.loadURL(serverReady ? withToken(`http://127.0.0.1:${SERVER_PORT}`) : ERROR_PAGE);
+    win.loadURL(serverReady ? withToken(`http://127.0.0.1:${SERVER_PORT}`) : buildErrorPage({ allPortsOccupied: serverStartConflictOnly }));
   } else {
     win.loadURL(withToken(DEV_URL));
   }
@@ -722,6 +1645,42 @@ ipcMain.handle("desktop:export-diagnostics", async (event) => {
   return result.filePath;
 });
 
+// Bots hand users files as markdown links to paths inside the OpenMausBot
+// home (workspaces, attachments). As plain anchors those resolved against the
+// page origin, so the click opened http://127.0.0.1:8799<path> in the default
+// browser and the server's SPA fallback answered with index.html — a second
+// copy of the chat UI instead of the file. Ask where to put it and copy it
+// there instead: a save dialog tells the user the file landed somewhere and
+// where, which a silent copy into ~/Downloads does not. The path is
+// renderer-controlled, so it must resolve inside ~/.openmausbot and be a
+// regular file — never a symlink escape or directory.
+ipcMain.handle("desktop:save-file", async (event, rawPath) => {
+  return withSavableFile(rawPath, { home: os.homedir() }, async ({ defaultName, copyTo }) => {
+    const parent = BrowserWindow.fromWebContents(event.sender);
+    const defaultPath = await defaultSaveName(app.getPath("downloads"), defaultName);
+    const choice = await dialog.showSaveDialog(parent ?? undefined, {
+      title: "Where do you want to save it?",
+      message: "Where do you want to save it?",
+      defaultPath,
+      buttonLabel: "Save",
+      properties: ["createDirectory", "showOverwriteConfirmation"],
+    });
+    // Cancelling is a decision, not a failure — the bubble stays quiet.
+    if (choice.canceled || !choice.filePath) return null;
+    await copyTo(choice.filePath);
+    shell.showItemInFolder(choice.filePath);
+    return choice.filePath;
+  });
+});
+
+// The renderer owns the skin. Native Windows/Linux chrome is intentionally
+// outside that surface; acknowledge the renderer handshake without creating
+// a frameless caption overlay that can cover page controls.
+ipcMain.handle("desktop:skin", (_event, skin) => {
+  if (!isKnownSkin(skin)) return false;
+  return true;
+});
+
 ipcMain.handle("desktop:open-external", async (_event, rawUrl) => {
   if (typeof rawUrl !== "string") throw new Error("A web address is required");
   let url;
@@ -744,6 +1703,43 @@ ipcMain.handle("desktop-viewer:open", (event, rawUrl, title, contextId) => {
   const owner = BrowserWindow.fromWebContents(event.sender);
   return openDesktopViewer(owner, rawUrl, title, contextId);
 });
+
+// Two Local VM desktops share the existing app BrowserWindow. The renderer
+// supplies only layout and intent; URL validation, sandboxing, session
+// isolation and the one-interactive-pane invariant stay in the main process.
+ipcMain.handle("desktop-workspace:open", (event, input) =>
+  desktopWorkspaceForEvent(event, true).open(input),
+);
+ipcMain.handle("desktop-workspace:layout", (event, items) => {
+  const manager = desktopWorkspaceForEvent(event);
+  if (!manager) return false;
+  return manager.layout(items);
+});
+ipcMain.handle("desktop-workspace:set-interactive", (event, contextId) => {
+  const manager = desktopWorkspaceForEvent(event);
+  if (!manager) return contextId == null;
+  return manager.setInteractive(contextId);
+});
+ipcMain.handle("desktop-workspace:close", (event, contextId) => {
+  const manager = desktopWorkspaceForEvent(event);
+  if (!manager) return true;
+  return manager.close(contextId);
+});
+
+// Close only when the caller owns the current viewer — otherwise one bot's
+// "Hand control back" would close (and release) another bot's viewer.
+ipcMain.handle("desktop-viewer:close", (_event, contextId) => {
+  const scoped = Object.prototype.toString.call(contextId) === "[object String]" ? contextId : null;
+  if (scoped !== desktopViewerContextId) return false;
+  if (desktopViewerWindow && !desktopViewerWindow.isDestroyed()) desktopViewerWindow.close();
+  return true;
+});
+
+// Lets a (re)mounted panel seed viewer-open state instead of defaulting to false.
+ipcMain.handle("desktop-viewer:state-now", () => ({
+  open: Boolean(desktopViewerWindow && !desktopViewerWindow.isDestroyed()),
+  contextId: desktopViewerContextId,
+}));
 
 ipcMain.handle("perm:status", () => ({
   mic:
@@ -805,28 +1801,35 @@ ipcMain.handle("skill-recorder:save", (_event, payload) => saveSkillRecording(pa
 // The renderer gets these five and nothing else: it can turn the companion
 // on and off, look at it, open or cancel a pairing window, and remove a
 // device. It cannot reach the sidecar's control port itself.
-ipcMain.handle("companion:state", () => companionState());
-ipcMain.handle("companion:start", async () => {
-  const state = await startCompanion({
-    resourcesPath: process.resourcesPath,
-    harnessPort: SERVER_PORT,
-    log: slog,
-  });
-  // Remember only a start that worked: persisting the intent behind a failed
-  // one would greet every launch with the same error for a toggle the panel
-  // showed as off.
-  if (state.enabled && !state.error) rememberCompanionEnabled(true);
-  return state;
+ipcMain.handle("companion:state", () => desktopCompanionState());
+ipcMain.handle("companion:start", () => startDesktopCompanion());
+ipcMain.handle("companion:stop", () => stopDesktopCompanion());
+ipcMain.handle("companion:keep-awake", async (_event, enabled) => {
+  rememberCompanionKeepAwake(Boolean(enabled));
+  return desktopCompanionState();
 });
-ipcMain.handle("companion:stop", () => {
-  rememberCompanionEnabled(false);
-  return stopCompanion();
-});
-ipcMain.handle("companion:pairing", (_event, open) => companionPairing(Boolean(open)));
-ipcMain.handle("companion:cloud-desktop", (_event, deviceId, allowed) =>
-  companionCloudDesktopAccess(deviceId, Boolean(allowed)),
+ipcMain.handle("companion:refresh-tailscale", () => refreshDesktopCompanionTailscale());
+ipcMain.handle("companion:pairing", (_event, open, expectedToken) =>
+  companionPairing(Boolean(open), expectedToken).then(decorateDesktopCompanionState),
 );
-ipcMain.handle("companion:revoke", (_event, deviceId) => companionRevoke(deviceId));
+ipcMain.handle("companion:cloud-desktop", (_event, deviceId, allowed) =>
+  companionCloudDesktopAccess(deviceId, Boolean(allowed)).then(() => desktopCompanionState()),
+);
+ipcMain.handle("companion:revoke", (_event, deviceId) =>
+  companionRevoke(deviceId).then(() => desktopCompanionState()),
+);
+
+// Auth and connector credentials never cross this boundary. Every handler
+// returns the same deliberately tiny, secret-free public account state.
+ipcMain.handle("companion-account:state", () => ensureCompanionAccountService().state());
+ipcMain.handle("companion-account:request-code", (_event, email) =>
+  ensureCompanionAccountService().requestCode(email),
+);
+ipcMain.handle("companion-account:verify-code", (_event, email, code) =>
+  ensureCompanionAccountService().verifyCode(email, code),
+);
+ipcMain.handle("companion-account:retry", () => ensureCompanionAccountService().retry());
+ipcMain.handle("companion-account:sign-out", () => ensureCompanionAccountService().signOut());
 
 ipcMain.handle("desktop:capabilities", async () =>
   desktopCapabilities({
@@ -847,11 +1850,11 @@ ipcMain.handle("assemblyai:set-key", async (_event, value) => {
     throw new Error("The operating-system credential store is unavailable");
   }
   const secret = value.trim();
-  const nextCredentials = { ...secureCredentials };
-  if (secret) nextCredentials.assemblyAiApiKey = secret;
-  else delete nextCredentials.assemblyAiApiKey;
-  await saveSecureCredentials(nextCredentials);
-  secureCredentials = nextCredentials;
+  await updateSecureCredentialDocument((credentials) => {
+    if (secret) credentials.assemblyAiApiKey = secret;
+    else delete credentials.assemblyAiApiKey;
+    return credentials;
+  });
   return { configured: Boolean(secret) };
 });
 
@@ -877,18 +1880,7 @@ ipcMain.handle("credential:set", async (_event, name, value) => {
     throw new Error("The operating-system credential store is unavailable");
   }
   const secret = value.trim();
-  const previousCredentials = secureCredentials;
-  if (app.isPackaged) {
-    const nextCredentials = { ...secureCredentials };
-    if (secret) nextCredentials[name] = secret;
-    else delete nextCredentials[name];
-    // Commit the encrypted value before the server makes it live. If
-    // validation or reload fails below, restore the previous store so the
-    // next launch cannot disagree with the response the user saw.
-    await saveSecureCredentials(nextCredentials);
-    secureCredentials = nextCredentials;
-  }
-  try {
+  const applyToHarness = async () => {
     // In development the server is a separately launched process, so it
     // cannot receive credentials from Electron at boot. Keep its established
     // local config path there; production always uses the encrypted store.
@@ -902,13 +1894,20 @@ ipcMain.handle("credential:set", async (_event, name, value) => {
     const body = await response.json().catch(() => null);
     if (!response.ok) throw new Error(body?.error || `Could not save credential (HTTP ${response.status})`);
     return body;
-  } catch (error) {
-    if (app.isPackaged) {
-      await saveSecureCredentials(previousCredentials);
-      secureCredentials = previousCredentials;
-    }
-    throw error;
-  }
+  };
+  if (!app.isPackaged) return applyToHarness();
+
+  // Commit the encrypted value before the server makes it live. The shared
+  // state rolls credentials.bin back if validation/reload fails, while also
+  // keeping concurrent account and provider updates serialized.
+  return updateSecureCredentialDocument(
+    (credentials) => {
+      if (secret) credentials[name] = secret;
+      else delete credentials[name];
+      return credentials;
+    },
+    applyToHarness,
+  );
 });
 
 async function broadcastDesktopCapabilities() {
@@ -931,13 +1930,21 @@ setCuaStateListener((connection) => {
 });
 
 app.whenReady().then(async () => {
+  if (app.isPackaged) app.setAsDefaultProtocolClient("openmausbot");
   if (process.platform === "darwin") app.dock.setIcon(APP_ICON);
   secureCredentials = await loadSecureCredentials();
   if (app.isPackaged) {
     await secureComposioConfig();
     await secureWorkspaceConfig();
-    await ensureManagedComposioCredentials();
   }
+  // Boot migrations above are deliberately sequential. From this point on,
+  // every account/API-key writer must use the shared serialized state.
+  // An unreadable store must not become a WRITE of an empty document.
+  secureCredentialState = createSecureCredentialState(secureCredentials, saveSecureCredentials, {
+    writable: !credentialStoreUnavailable,
+  });
+  secureCredentials = secureCredentialState.read();
+  const hostedAccount = ensureCompanionAccountService();
   // Display capture remains user-initiated. The renderer first sends a
   // short-lived one-shot intent, then calls getDisplayMedia in the same click.
   // The handler binds that request to the same frame/origin, rejects audio,
@@ -1002,16 +2009,51 @@ app.whenReady().then(async () => {
           return { mode: "unavailable", reason: String(e) };
         })
       : Promise.resolve({ mode: "unavailable", reason: "unsupported-platform" });
-  if (app.isPackaged) serverReady = await startServerPackaged();
+  if (app.isPackaged) {
+    // The embedded harness receives this descriptor only over its private
+    // utility-process port. Never leave the master token in userData where a
+    // shell-capable bot running as the same OS user could read it.
+    removeBrowserConnectionDescriptor();
+    await ensureBrowserHost().catch((error) => {
+      slog(`browser host unavailable before server start: ${error?.message ?? error}`);
+    });
+    serverReady = await startServerPackaged();
+  }
   // The companion the user left on comes back without anyone finding the
   // toggle again — one attempt, after the harness port is settled, with the
   // exact options the IPC handler uses. A failure surfaces in companionState
   // (the panel shows the error) rather than retrying; and it never delays
   // the window.
   if (serverReady && companionEnabledAtRest()) {
-    void startCompanion({ resourcesPath: process.resourcesPath, harnessPort: SERVER_PORT, log: slog });
+    void startDesktopCompanion({ waitForHosted: false, remember: false });
   }
   const win = createWindow();
+  // Reconcile incomplete setup and resume interrupted sign-out only after the
+  // local app is usable. This background network work never gates LAN pairing
+  // or the first window.
+  void hostedAccount.restore().catch(() => {});
+  // Registration is optional network work. Start it only after the local
+  // server and first window are usable, then update the server child over its
+  // private parent port so Connected Apps becomes available without restart.
+  // Registering while the store is unreadable would mint a SECOND installation
+  // identity for a user who already has one — the first thing they would
+  // notice is every connected app gone, permanently.
+  if (credentialStoreUnavailable) {
+    slog("skipping connected-apps registration: the credential store was unreadable this launch");
+  }
+  if (app.isPackaged && composioBrokerUrl() && !credentialStoreUnavailable) {
+    void updateSecureCredentialDocument(async (credentials) => {
+      await ensureManagedComposioCredentials({
+        brokerUrl: composioBrokerUrl(),
+        credentials,
+        // The shared credential state performs the one atomic encrypted
+        // write after this registration has derived its complete document.
+        saveCredentials: async () => {},
+        log: slog,
+      });
+      return credentials;
+    }).finally(syncManagedComposioCredentials);
+  }
   // in-app auto-update (packaged only) — checks GitHub releases, downloads on
   // the user's click, installs on "Restart to update"
   startUpdater(win);
@@ -1029,21 +2071,47 @@ app.on("window-all-closed", () => {
 // Cap the defer so a wedged daemon cannot keep the app alive forever.
 const CUA_STOP_TIMEOUT_MS = 2500;
 let cuaCleanedUp = false;
+let signalQuitRequested = false;
+
+// Package managers, desktop watchdogs, and terminal launchers commonly stop
+// Linux apps with SIGTERM/SIGINT. Convert the first signal into Electron's
+// normal quit path so the embedded server, Cua descriptor/socket, and private
+// AppImage stage receive the same bounded cleanup as a window close. A second
+// signal keeps Node's default force-quit behavior because these are `once`
+// listeners.
+const requestSignalQuit = () => {
+  if (signalQuitRequested) return;
+  signalQuitRequested = true;
+  app.quit();
+};
+process.once("SIGINT", requestSignalQuit);
+process.once("SIGTERM", requestSignalQuit);
+
 app.on("before-quit", (e) => {
+  desktopShutdownStarted = true;
   if (cuaCleanedUp) return;
   e.preventDefault();
   try {
     serverProc?.kill();
   } catch {}
-  // the sidecar holds a socket that is reachable from off this machine —
-  // it should not outlive the window by even a moment
-  void stopCompanion();
+  // Release the sleep blocker synchronously; child shutdown is awaited below.
+  syncCompanionKeepAwake(false, false);
   // a live dictation session runs its own helper child that holds the mic —
   // stop it here so quitting never orphans a recording process
   if (nativeActions.appleSpeech) stopSpeech();
   stopRecorder();
+  try {
+    browserSurface?.closeAll();
+  } catch {}
   const cleanup = Promise.race([
-    stopCua().catch(() => {}),
+    Promise.all([
+      stopCua().catch(() => {}),
+      browserHost?.stop().catch(() => {}) ?? Promise.resolve(),
+      // Both listeners reachable from outside the app are owned children.
+      // Shut the connector down first, then the sidecar, without changing the
+      // remembered toggle the next launch will restore.
+      stopDesktopCompanion({ remember: false }).catch(() => {}),
+    ]),
     new Promise((resolve) => setTimeout(resolve, CUA_STOP_TIMEOUT_MS).unref()),
   ]);
   cleanup.then(() => {

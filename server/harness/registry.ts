@@ -109,6 +109,19 @@ export class ProviderRegistry {
     return this.byId.get(instanceId)?.live ?? null;
   }
 
+  /** The configured executable for instance-scoped maintenance actions.
+   * This deliberately comes from the registry/config, never an HTTP body. */
+  cliTarget(instanceId: InstanceId): { driverKind: string; cli: string | null } | null {
+    const entry = this.byId.get(instanceId);
+    if (!entry) return null;
+    const driverKind = entry.shadow?.driverKind ?? entry.live!.driverKind;
+    const driver = this.driversByKind.get(driverKind);
+    return {
+      driverKind,
+      cli: this.cliByInstance.get(instanceId) ?? entry.shadow?.cli ?? cliDefaultOf(driver) ?? null,
+    };
+  }
+
   entries(): RegistryEntry[] {
     return [...this.byId.values()];
   }
@@ -171,10 +184,12 @@ export class ProviderRegistry {
             agentsMcp: inst.adapter.capabilities.agentsMcp === true,
             composioMcp: inst.adapter.capabilities.composioMcp === true,
             phoneMcp: inst.adapter.capabilities.phoneMcp === true,
+            browserMcp: inst.adapter.capabilities.browserMcp === true,
             images: inst.adapter.capabilities.images === true,
             effortLevels: inst.adapter.capabilities.effortLevels,
             queueing: inst.adapter.capabilities.queueing === true,
             localComputerMcp: inst.adapter.capabilities.localComputerMcp === true,
+            approvalReview: inst.reviewPermission !== undefined,
           },
           access: driver?.metadata.access ?? "subscription",
           install: driver?.install,
