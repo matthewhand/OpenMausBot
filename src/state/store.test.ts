@@ -172,7 +172,7 @@ describe("config status frames", () => {
         rooms: { turnTimeoutMinutes: 20 },
         localVm: { mode: "per-bot", maxInstances: 3 },
         opencodeGo: { configured: true },
-        tts: { configured: true, ready: true, voice: "Ada" },
+        tts: { provider: "elevenlabs", configured: true, ready: true, voice: "Ada", baseUrl: "" },
         profile: { name: "Ian", email: "ian@example.test" },
         features: { skillRecorder: true },
       }),

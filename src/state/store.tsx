@@ -690,8 +690,6 @@ export type Action =
   | {
       type: "updateBot";
       botId: string;
-      type: "updateBot";
-      botId: string;
       patch: BotUpdatePatch;
     }
   | { type: "setHideInterBotChannels"; enabled: boolean };
@@ -1778,15 +1776,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             .catch(showError);
           break;
         }
-        case "deleteBot": {
-          const pending = patchTimers.current.get(action.botId);
-          if (pending) {
-            clearTimeout(pending.timer);
-            patchTimers.current.delete(action.botId);
-          }
+        case "deleteBot":
           api(`/api/bots/${action.botId}`, { method: "DELETE" }).catch(showError);
           break;
-        }
         case "markUnread":
           api(`/api/bots/${action.botId}`, { method: "PATCH", body: JSON.stringify({ unread: true }) }).catch(
             () => {},

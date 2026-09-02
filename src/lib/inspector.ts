@@ -221,7 +221,7 @@ export function matchInspectorTool(
 ): { row: InspectorRow; lens: "events" | "raw" } | null {
   const runtime = rows.filter((row) => {
     const event = runtimeEvent(row);
-    if (!event || event.itemType !== "tool") return false;
+    if (!event || !("itemType" in event) || event.itemType !== "tool") return false;
     if (focus.itemId && event.itemId === focus.itemId) return true;
     if (event.type === "item.started") return toolNameMatches(event.title, focus.toolName);
     return false;
