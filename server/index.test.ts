@@ -237,6 +237,24 @@ describe("harness HTTP API", () => {
     expect((await api("DELETE", "/api/groups/test-pinned-room")).status).toBe(200);
   });
 
+  it("hides and unhides a room via PATCH", async () => {
+    const { body } = await api("GET", "/api/bots");
+    const created = await api("POST", "/api/groups", { name: "Sidebar hide", memberIds: [body.bots[0].id] });
+    expect(created.status).toBe(201);
+    const groupId = created.body.group.id;
+
+    const hidden = await api("PATCH", `/api/groups/${groupId}`, { hidden: true });
+    expect(hidden.status).toBe(200);
+    expect(hidden.body.group.hidden).toBe(true);
+    const afterHide = await api("GET", "/api/bots");
+    expect(afterHide.body.groups.find((group: { id: string }) => group.id === groupId).hidden).toBe(true);
+
+    const shown = await api("PATCH", `/api/groups/${groupId}`, { hidden: false });
+    expect(shown.status).toBe(200);
+    expect(shown.body.group.hidden).toBe(false);
+    expect((await api("DELETE", `/api/groups/${groupId}`)).status).toBe(200);
+  });
+
   it("describes the configured fleet, shadows included", async () => {
     const { status, body } = await api("GET", "/api/instances");
     expect(status).toBe(200);

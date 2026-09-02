@@ -105,6 +105,8 @@ export interface Group {
   /** folder the room's turns actually run in, pinned on the first turn;
    * null = each member's own default; absent = not pinned yet */
   pinnedCwd?: string | null;
+  /** tucked out of the sidebar main list; same meaning as Bot.hidden */
+  hidden?: boolean;
   messages: Message[];
 }
 
@@ -333,7 +335,7 @@ export type Action =
   | {
       type: "patchGroup";
       groupId: string;
-      patch: Partial<Pick<Group, "name" | "bulletin" | "memberIds" | "defaultResponder">>;
+      patch: Partial<Pick<Group, "name" | "bulletin" | "memberIds" | "defaultResponder" | "hidden">>;
     }
   | { type: "deleteGroup"; groupId: string }
   | { type: "toggleReaction"; threadId: string; messageId: string; emoji: string }

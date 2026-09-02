@@ -129,6 +129,8 @@ export interface GroupRecord {
    * turn that dispatches. null = each member's own default; absent = not
    * pinned yet. See pinGroupCwd for why it never moves. */
   pinnedCwd?: string | null;
+  /** tucked out of the sidebar main list; same meaning as BotRecord.hidden */
+  hidden?: boolean;
 }
 
 /** One task = one conversation with its own context.
@@ -551,7 +553,7 @@ export class Store {
     );
   }
 
-  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd">>): GroupRecord | null {
+  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd" | "hidden">>): GroupRecord | null {
     const group = this.group(id);
     if (!group) return null;
     Object.assign(group, patch);

@@ -413,6 +413,19 @@ describe("Store change stream", () => {
     expect(events.at(-1)).toEqual({ type: "group.deleted", groupId: g.id });
   });
 
+  it("persists a room's hidden flag across a restart", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const group = store.createGroup("Quiet room", [bot.id]);
+    store.patchGroup(group.id, { hidden: true });
+    expect(store.group(group.id)?.hidden).toBe(true);
+
+    const reloaded = new Store(selection);
+    expect(reloaded.group(group.id)?.hidden).toBe(true);
+    reloaded.patchGroup(group.id, { hidden: false });
+    expect(new Store(selection).group(group.id)?.hidden).toBe(false);
+  });
+
   it("unsubscribe stops delivery", () => {
     const store = new Store(selection);
     const bot = store.createBot();
