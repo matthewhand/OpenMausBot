@@ -2628,6 +2628,10 @@ const server = createServer(async (req, res) => {
       for (const key of ["name", "bulletin", "unread"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
+      if (body.hidden !== undefined) {
+        if (typeof body.hidden !== "boolean") return json(res, 400, { error: "hidden must be true or false" });
+        patch.hidden = body.hidden;
+      }
       if (Array.isArray(body.memberIds)) {
         const ids = body.memberIds.filter((id: unknown): id is string => typeof id === "string" && Boolean(store.bot(id)));
         if (ids.length) patch.memberIds = ids;

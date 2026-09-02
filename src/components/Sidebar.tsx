@@ -8,9 +8,13 @@ import {
   Bot as BotIcon,
   CalendarDays,
   Check,
+  ChevronDown,
+  ChevronRight,
   ClipboardCopy,
   Copy,
   Crown,
+  Eye,
+  EyeOff,
   FolderPlus,
   Library,
   Loader2,
@@ -147,6 +151,15 @@ interface MenuState {
   y: number;
 }
 
+function isContextMenuKey(event: React.KeyboardEvent) {
+  return event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey);
+}
+
+function menuPointFromTarget(target: EventTarget & Element): { x: number; y: number } {
+  const rect = target.getBoundingClientRect();
+  return { x: rect.left + 12, y: rect.bottom };
+}
+
 function groupPreview(group: Group, bots: Bot[]): string {
   if (group.busyBotId) {
     return `${bots.find((b) => b.id === group.busyBotId)?.name ?? "A bot"} is working…`;
@@ -186,7 +199,15 @@ function StackedMauses({ members }: { members: Bot[] }) {
   );
 }
 
-function GroupListItem({ group, onMenu }: { group: Group; onMenu: (menu: { groupId: string; x: number; y: number }) => void }) {
+function GroupListItem({
+  group,
+  onMenu,
+  onUnhide,
+}: {
+  group: Group;
+  onMenu: (menu: { groupId: string; x: number; y: number }) => void;
+  onUnhide?: (group: Group) => void;
+}) {
   const { state, dispatch } = useStore();
   const selected = state.activeView === "chat" && state.selectedId === group.id;
   const members = group.memberIds
@@ -194,14 +215,22 @@ function GroupListItem({ group, onMenu }: { group: Group; onMenu: (menu: { group
     .filter((b): b is Bot => Boolean(b));
   const last = group.messages.at(-1);
   return (
+    <div className="group relative">
     <button
       onClick={() => dispatch({ type: "select", id: group.id })}
       onContextMenu={(e) => {
         e.preventDefault();
         onMenu({ groupId: group.id, x: e.clientX, y: e.clientY });
       }}
+      onKeyDown={(event) => {
+        if (!isContextMenuKey(event)) return;
+        event.preventDefault();
+        const point = menuPointFromTarget(event.currentTarget);
+        onMenu({ groupId: group.id, ...point });
+      }}
       className={cn(
         "flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left",
+        onUnhide && "pr-10",
         selected ? "bg-raised" : "hover:bg-raised/50",
       )}
     >
@@ -217,6 +246,18 @@ function GroupListItem({ group, onMenu }: { group: Group; onMenu: (menu: { group
         </div>
       </div>
     </button>
+    {onUnhide && (
+      <button
+        type="button"
+        onClick={() => onUnhide(group)}
+        aria-label={`Unhide ${group.name}`}
+        title={`Unhide ${group.name}`}
+        className="absolute right-2 top-2.5 flex size-7 items-center justify-center rounded-lg bg-card/90 text-ink-secondary opacity-0 shadow-sm transition hover:bg-raised hover:text-ink focus:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100 max-md:opacity-100"
+      >
+        <Eye size={14} />
+      </button>
+    )}
+    </div>
   );
 }
 
@@ -246,7 +287,7 @@ function RoomContextMenu({
   }, [onClose]);
 
   if (!group) return null;
-  const top = Math.min(menu.y, window.innerHeight - 164);
+  const top = Math.min(menu.y, window.innerHeight - 200);
   const left = Math.min(menu.x, window.innerWidth - 240);
   return createPortal(
     <div
@@ -254,6 +295,23 @@ function RoomContextMenu({
       style={{ top, left }}
       className="fixed z-40 w-[228px] overflow-hidden rounded-xl border border-hairline/50 bg-card py-1.5 shadow-2xl shadow-black/60"
     >
+      <button
+        onClick={() => {
+          const nextHidden = !group.hidden;
+          dispatch({ type: "patchGroup", groupId: group.id, patch: { hidden: nextHidden } });
+          if (nextHidden && state.selectedId === group.id) {
+            const next =
+              state.groups.find((candidate) => candidate.id !== group.id && !candidate.hidden) ??
+              state.bots.find((candidate) => !candidate.hidden);
+            if (next) dispatch({ type: "select", id: next.id });
+          }
+          onClose();
+        }}
+        className="flex w-full items-center gap-3 px-3.5 py-2 text-left text-[14px] text-ink hover:bg-raised/70"
+      >
+        {group.hidden ? <Eye size={16} className="text-ink-secondary" /> : <EyeOff size={16} className="text-ink-secondary" />}
+        {group.hidden ? "Unhide" : "Hide from sidebar"}
+      </button>
       <button
         onClick={() => {
           void navigator.clipboard?.writeText(group.threadId);
@@ -355,10 +413,14 @@ function BotContextMenu({
   menu,
   onClose,
   onArchive,
+  onHide,
+  onUnhide,
 }: {
   menu: MenuState;
   onClose: () => void;
   onArchive: (bot: Bot) => void;
+  onHide: (bot: Bot) => void;
+  onUnhide: (bot: Bot) => void;
 }) {
   const { state, dispatch } = useStore();
   const bot = state.bots.find((b) => b.id === menu.botId);
@@ -389,7 +451,7 @@ function BotContextMenu({
       ? "Keep at least one active bot"
       : undefined;
   // keep the menu on-screen near the click
-  const top = Math.max(8, Math.min(menu.y, window.innerHeight - 380));
+  const top = Math.max(8, Math.min(menu.y, window.innerHeight - 420));
   const left = Math.min(menu.x, window.innerWidth - 240);
 
   const item = (
@@ -460,12 +522,21 @@ function BotContextMenu({
         }),
         divider("d3"),
         item(
+          bot.hidden ? <Eye size={16} className="text-ink-secondary" /> : <EyeOff size={16} className="text-ink-secondary" />,
+          bot.hidden ? "Unhide" : "Hide from sidebar",
+          () => (bot.hidden ? onUnhide(bot) : onHide(bot)),
+          {
+            disabled: !bot.hidden && archiveBlocked,
+            hint: bot.hidden ? undefined : archiveHint,
+          },
+        ),
+        item(
           <Archive size={16} className="text-ink-secondary" />,
           "Archive",
           () => onArchive(bot),
           {
-            disabled: archiveBlocked,
-            hint: archiveHint,
+            disabled: archiveBlocked || Boolean(bot.hidden),
+            hint: bot.hidden ? "Already hidden" : archiveHint,
           },
         ),
         item(<Trash2 size={16} />, "Delete", () => dispatch({ type: "deleteBot", botId: bot.id }), {
@@ -481,11 +552,13 @@ function BotListItem({
   onMenu,
   onArchive,
   archiveDisabled,
+  onUnhide,
 }: {
   bot: Bot;
   onMenu: (menu: MenuState) => void;
   onArchive: (bot: Bot) => void;
   archiveDisabled: boolean;
+  onUnhide?: (bot: Bot) => void;
 }) {
   const { state, dispatch } = useStore();
   const [renaming, setRenaming] = useState(false);
@@ -570,6 +643,11 @@ function BotListItem({
         tabIndex={0}
         onClick={() => dispatch({ type: "select", id: bot.id })}
         onKeyDown={(event) => {
+          if (isContextMenuKey(event)) {
+            event.preventDefault();
+            onMenu({ botId: bot.id, ...menuPointFromTarget(event.currentTarget) });
+            return;
+          }
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
             dispatch({ type: "select", id: bot.id });
@@ -580,6 +658,17 @@ function BotListItem({
       >
         {body}
       </div>
+      {onUnhide ? (
+        <button
+          type="button"
+          onClick={() => onUnhide(bot)}
+          aria-label={`Unhide ${bot.name}`}
+          title={`Unhide ${bot.name}`}
+          className="absolute right-2 top-2.5 flex size-7 items-center justify-center rounded-lg bg-card/90 text-ink-secondary opacity-0 shadow-sm transition hover:bg-raised hover:text-ink focus:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100 max-md:opacity-100"
+        >
+          <Eye size={14} />
+        </button>
+      ) : (
       <button
         type="button"
         disabled={archiveDisabled}
@@ -596,6 +685,7 @@ function BotListItem({
       >
         <Archive size={14} />
       </button>
+      )}
     </div>
   );
 }
@@ -745,6 +835,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const [newRoom, setNewRoom] = useState(false);
   const [teamLibraryOpen, setTeamLibraryOpen] = useState(false);
   const [archivedBotsOpen, setArchivedBotsOpen] = useState(false);
+  const [hiddenOpen, setHiddenOpen] = useState(false);
   const [exportingTeam, setExportingTeam] = useState(false);
   const [teamFeedback, setTeamFeedback] = useState<{
     error: boolean;
@@ -854,6 +945,11 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
     }
   };
 
+  const unhideGroup = (group: Group) => {
+    dispatch({ type: "patchGroup", groupId: group.id, patch: { hidden: false } });
+    dispatch({ type: "select", id: group.id });
+  };
+
   const undoBotArchive = async (bot: { id: string; name: string }) => {
     setTeamFeedback(null);
     try {
@@ -891,7 +987,10 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const visibleBots = matchingBots
     .filter((bot) => !bot.chiefOfStaff)
     .sort((a, b) => Number(b.pinned ?? false) - Number(a.pinned ?? false));
-  const visibleGroups = state.groups.filter((g) => !q || g.name.toLowerCase().includes(q));
+  const visibleGroups = state.groups.filter((g) => !g.hidden && (!q || g.name.toLowerCase().includes(q)));
+  const hiddenGroups = state.groups.filter((g) => g.hidden && (!q || g.name.toLowerCase().includes(q)));
+  const hiddenBots = state.bots.filter((b) => b.hidden && (!q || b.name.toLowerCase().includes(q) || (b.title ?? "").toLowerCase().includes(q)));
+  const hiddenCount = hiddenGroups.length + hiddenBots.length;
   const activeBotCount = state.bots.filter((bot) => !bot.hidden).length;
   const archivedBots = state.bots.filter((bot) => bot.hidden);
   const pendingTeamUndo = teamFeedback?.undo;
@@ -1022,7 +1121,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
       {/* Bot list */}
       <div className="flex-1 overflow-y-auto px-2">
         <div className="flex flex-col gap-0.5">
-          {!chiefBot && visibleBots.length === 0 && visibleGroups.length === 0 && q && q.length < MIN_QUERY && (
+          {!chiefBot && visibleBots.length === 0 && visibleGroups.length === 0 && hiddenCount === 0 && q && q.length < MIN_QUERY && (
             <div className="px-3 py-6 text-center text-[13px] text-ink-secondary">Nothing matches “{query}”</div>
           )}
           {chiefBot && (
@@ -1047,6 +1146,37 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
               archiveDisabled={activeBotCount <= 1}
             />
           ))}
+          {hiddenCount > 0 && (
+            <div className="mt-2">
+              <button
+                type="button"
+                aria-expanded={hiddenOpen}
+                onClick={() => setHiddenOpen((open) => !open)}
+                className="flex w-full items-center gap-1.5 rounded-lg px-3 py-2 text-left text-[12.5px] font-medium text-ink-secondary hover:bg-raised/50 hover:text-ink"
+              >
+                {hiddenOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                Hidden
+                <span className="text-[11.5px] font-normal">{hiddenCount}</span>
+              </button>
+              {hiddenOpen && (
+                <div className="flex flex-col gap-0.5">
+                  {hiddenGroups.map((g) => (
+                    <GroupListItem key={g.id} group={g} onMenu={setRoomMenu} onUnhide={unhideGroup} />
+                  ))}
+                  {hiddenBots.map((b) => (
+                    <BotListItem
+                      key={b.id}
+                      bot={b}
+                      onMenu={setMenu}
+                      onArchive={(bot) => void archiveBot(bot)}
+                      archiveDisabled
+                      onUnhide={(bot) => void undoBotArchive(bot)}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           <SearchResults query={query} onLanded={() => setQuery("")} />
         </div>
       </div>
@@ -1094,7 +1224,15 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
         </div>
       </div>
 
-      {menu && <BotContextMenu menu={menu} onClose={() => setMenu(null)} onArchive={(bot) => void archiveBot(bot)} />}
+      {menu && (
+        <BotContextMenu
+          menu={menu}
+          onClose={() => setMenu(null)}
+          onArchive={(bot) => void archiveBot(bot)}
+          onHide={(bot) => void archiveBot(bot)}
+          onUnhide={(bot) => void undoBotArchive(bot)}
+        />
+      )}
       {roomMenu && (
         <RoomContextMenu
           menu={roomMenu}
