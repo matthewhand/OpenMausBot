@@ -1,7 +1,16 @@
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+
+function reviewHttps() {
+  const key = process.env.OMB_UI_TLS_KEY;
+  const cert = process.env.OMB_UI_TLS_CERT;
+  if (process.env.OMB_UI_HTTPS !== "1" || !key || !cert) return undefined;
+  if (!existsSync(key) || !existsSync(cert)) return undefined;
+  return { key: readFileSync(key), cert: readFileSync(cert) };
+}
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
@@ -28,9 +37,20 @@ export default defineConfig({
   },
   server: {
     // IPv4 explicitly — a bare ::1 bind makes localhost a coin-flip for
-    // clients that resolve IPv4 first
-    host: "127.0.0.1",
+    // clients that resolve IPv4 first. For LAN access, set OMB_UI_HOST=0.0.0.0
+    host: process.env.OMB_UI_HOST || "127.0.0.1",
     port: Number(process.env.OMB_UI_PORT) || 5199,
+    // nginx on another host will send its own Host header
+    allowedHosts: true,
+    // Optional self-signed TLS. The review UI stays HTTP so nginx can offload.
+    https: reviewHttps(),
+    hmr: process.env.OMB_UI_PUBLIC_HOST
+      ? {
+          host: process.env.OMB_UI_PUBLIC_HOST,
+          protocol: process.env.OMB_UI_HMR_PROTOCOL || "wss",
+          clientPort: Number(process.env.OMB_UI_HMR_CLIENT_PORT || 443),
+        }
+      : undefined,
     // packager output lands inside the repo — its HTML files must never
     // trigger dev full-page reloads
     watch: {

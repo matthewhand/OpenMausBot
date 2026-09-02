@@ -14,7 +14,7 @@ import { createServer as createNetServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
-import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
+import { DATA_DIR, RESERVED_MCP_NAMES, stripWorkspaceCredentialEnv } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
 import { brokerSocketPath, describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
 
@@ -31,6 +31,7 @@ import type {
 import { computerProxyEnv } from "../container-computer.ts";
 import { newEventId, newId } from "../contracts.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
+import { turnRunsFullAuto } from "../auto-approve.ts";
 import {
   applyClaudeInject,
   decodeInjectId,
@@ -548,7 +549,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         // token-level streaming: content_block_delta events between the
         // whole-message frames, so the bubble grows as the model writes
         "--include-partial-messages",
-        "--permission-mode", config.permissionMode === "auto" ? "acceptEdits" : config.permissionMode,
+        "--permission-mode",
+        turnRunsFullAuto(turn)
+          ? "bypassPermissions"
+          : config.permissionMode === "auto"
+            ? "acceptEdits"
+            : config.permissionMode,
       ];
       const turnEnvironment: NodeJS.ProcessEnv = { ...process.env, ...input.environment };
       const turnModel = await resolveClaudeTurnModel(turn.model, turnEnvironment);
@@ -561,6 +567,22 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // acceptEdits run silently denies anything unlisted)
       const mcpServers: Record<string, unknown> = {};
       const allowed: string[] = [];
+
+      // Custom remote MCP servers (user-configured HTTP/SSE)
+      if (turn.integrations?.mcpServers) {
+        for (const server of turn.integrations.mcpServers) {
+          if (server.enabled === false) continue;
+          if (RESERVED_MCP_NAMES.has(server.name)) continue;
+          const headers = server.headers ?? {};
+          mcpServers[server.name] = {
+            type: server.transport,
+            url: server.url,
+            ...(Object.keys(headers).length ? { headers } : {}),
+          };
+          allowed.push(`mcp__${server.name}`);
+        }
+      }
+
       if (turn.integrations?.composio) {
         mcpServers.composio = { ...turn.integrations.composio };
         allowed.push("mcp__composio");
@@ -613,7 +635,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // bypassPermissions (fullAuto) — nothing would ever ask.
       let broker: ReturnType<typeof createPermissionBroker> | undefined;
       let socketPath: string | null = null;
-      if (config.permissionMode !== "bypassPermissions") {
+      const permissionMode = turnRunsFullAuto(turn)
+        ? "bypassPermissions"
+        : config.permissionMode === "auto"
+          ? "acceptEdits"
+          : config.permissionMode;
+      if (permissionMode !== "bypassPermissions") {
         socketPath = permissionSocketPath(threadId);
         args.push("--permission-prompt-tool", "mcp__ogb__approve");
         mcpServers.ogb = { command: process.execPath, args: [PERM_PROXY_PATH, socketPath], env: { ...NODE_ENV_FLAG } };

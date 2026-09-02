@@ -626,6 +626,22 @@ const TOOLS = [
     },
   },
   {
+    name: "execute_shell_cmd",
+    description:
+      "Execute a shell command on the bot's computer. Returns stdout, stderr, and exit code.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "The shell command to execute" },
+        cmd: { type: "string", description: "Alias for command" },
+        observe: {
+          type: "boolean",
+          description: "default false — set true to also return a screenshot if visual output changed",
+        },
+      },
+    },
+  },
+  {
     name: "computer_exec",
     description:
       "Run a shell command on the bot's cloud computer (Linux, passwordless sudo, X11 desktop). Returns stdout/stderr/exit code — and, unlike the UI tools, no screenshot unless you ask for one.",
@@ -679,7 +695,7 @@ function actionShell(a: any): string | { error: string } {
     return cuaOrX11("type_text", cuaArgs, `xdotool type --clearmodifiers --delay 8 -- ${shellQuote(t)}`);
   }
   if (kind === "press_key") {
-    const keys = String(a.keys ?? "").replace(/[^\w+]/g, "");
+    const keys = String(a.keys ?? "").replace(/[^a-zA-Z0-9_+\-.,/\[\]]/g, "").trim();
     if (!keys) return { error: "press_key needs keys" };
     const parts = keys.split("+").filter(Boolean);
     const tool = parts.length > 1 ? "hotkey" : "press_key";
@@ -981,12 +997,23 @@ async function call(id: unknown, name: string, args: any) {
       .join(" → ");
     return actAndObserve(id, actions, `ran ${actions.length} actions: ${summary}`, args, 180_000);
   }
-  if (name === "computer_exec") {
-    const command = String(args.command ?? "").slice(0, 4000);
+  if (
+    name === "computer_exec" ||
+    name === "execute_shell_cmd" ||
+    name === "execute_shell_command" ||
+    name === "execute_command" ||
+    name === "exec_command" ||
+    name === "run_shell_cmd"
+  ) {
+    const raw = String(args.command ?? args.cmd ?? "");
+    if (!raw.trim()) return text(id, "command cannot be empty", true);
+    if (raw.length > 4000) return text(id, `command exceeds 4000 character limit (${raw.length} chars)`, true);
+    const command = raw;
     observations.noteAction();
     const out = await runOnBox(command, 120_000);
     const note = `exit ${out.exitCode}\n${out.stdout.slice(-6000)}${out.stderr ? `\n[stderr]\n${out.stderr.slice(-2000)}` : ""}`;
-    if (args.observe !== true) return text(id, note);
+    const isErr = !out.ok || out.exitCode !== 0;
+    if (args.observe !== true) return text(id, note, isErr);
     const shot = await runOnBox([ENV, GEOMETRY, ensureRemoteCuaCommand(), captureBlock()].join("; "), 60_000);
     return observed(id, note, await frameFrom(shot));
   }
@@ -1055,8 +1082,10 @@ async function handle(msg: any) {
   }
 }
 
+process.stdin.setEncoding("utf8");
 let buf = "";
-process.stdin.on("data", (chunk) => {
+let queue = Promise.resolve();
+process.stdin.on("data", (chunk: string) => {
   buf += chunk;
   let nl;
   while ((nl = buf.indexOf("\n")) !== -1) {
@@ -1064,7 +1093,8 @@ process.stdin.on("data", (chunk) => {
     buf = buf.slice(nl + 1);
     if (!line.trim()) continue;
     try {
-      void handle(JSON.parse(line));
+      const parsed = JSON.parse(line);
+      queue = queue.then(() => handle(parsed)).catch(() => {});
     } catch {
       /* ignore malformed lines */
     }

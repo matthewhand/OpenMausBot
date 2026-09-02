@@ -10,6 +10,7 @@ import { join } from "node:path";
 import type { ModelCatalog } from "../../contracts.ts";
 import { decodeInjectId, hostApiKey, localHost, mergeLocalInject } from "../local-inject.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
+import { turnRunsFullAuto } from "../../auto-approve.ts";
 
 export const STATIC_GROK_MODELS: ModelCatalog = {
   default: "grok-4.6",
@@ -218,7 +219,7 @@ const support: AcpSupport = {
   // [models].default (grok-4.6) and oMLX never sees a request.
   spawnArgs: (config, turn) => [
     "--permission-mode",
-    config.fullAuto ? "bypassPermissions" : "default",
+    config.fullAuto || turnRunsFullAuto(turn) ? "bypassPermissions" : "default",
     "agent",
     ...(turn.model ? ["-m", turn.model] : []),
     // long form on purpose: `--effort` is documented as an alias, and an

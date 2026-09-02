@@ -640,10 +640,10 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               <div className="mt-0.5 text-[13px] text-ink-secondary">
                 {bot.computer === "local"
                   ? bot.autoApprove
-                    ? "Keeps going on this computer — you'll still be asked about anything destructive, and about questions it asks you."
+                    ? "Runs tools on this computer without asking — except destructive or sensitive commands, and questions it asks you. No model review of each command."
                     : "Approve each action on this computer yourself. Turn on to let this bot keep working without stopping to ask."
                   : bot.autoApprove
-                  ? "Keeps going on its own — you'll still be asked about anything destructive, and about questions it asks you."
+                  ? "Runs tools without asking — except destructive or sensitive commands, and questions it asks you. No model review of each command."
                   : "Approve each action yourself. Turn on to let this bot keep working without stopping to ask."}
               </div>
             </div>

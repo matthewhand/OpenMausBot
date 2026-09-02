@@ -8,6 +8,7 @@
 // two would deadlock over the speaker otherwise.
 import { useSyncExternalStore } from "react";
 
+import { speechStop } from "./speech-capture";
 import { speaker } from "./tts";
 
 let current: string | null = null;
@@ -27,7 +28,7 @@ export function startCall(targetId: string) {
   // Switching calls must silence both halves before ownership changes; the
   // old overlay may not unmount until React's next render.
   speaker.stop();
-  void window.ogb?.speechStop();
+  void speechStop();
   current = targetId;
   notify();
 }
@@ -39,7 +40,7 @@ export function endCall(targetId?: string): boolean {
   if (current === null) return false;
   current = null;
   speaker.stop();
-  void window.ogb?.speechStop();
+  void speechStop();
   notify();
   return true;
 }

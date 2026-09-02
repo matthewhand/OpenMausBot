@@ -112,15 +112,18 @@ describe("augmentedPath", () => {
     expect(parts).not.toContain(join(homedir(), ".volta", "bin"));
   });
 
-  it.skipIf(process.platform !== "win32")("finds Antigravity installed after launch", () => {
+  it.skipIf(process.platform !== "win32")("finds Antigravity and Hermes installed after launch", () => {
     const previous = process.env.LOCALAPPDATA;
     const localAppData = mkdtempSync(join(tmpdir(), "omb-localappdata-"));
     try {
       process.env.LOCALAPPDATA = localAppData;
       const agyBin = join(localAppData, "agy", "bin");
+      const hermesBin = join(localAppData, "hermes", "bin");
       mkdirSync(agyBin, { recursive: true });
+      mkdirSync(hermesBin, { recursive: true });
       resetPathCacheForTests();
       expect(augmentedPath().split(delimiter)).toContain(agyBin);
+      expect(augmentedPath().split(delimiter)).toContain(hermesBin);
     } finally {
       if (previous === undefined) delete process.env.LOCALAPPDATA;
       else process.env.LOCALAPPDATA = previous;

@@ -4,7 +4,7 @@
 // question is never answered by the machine.
 import { describe, expect, it } from "vitest";
 
-import { approvalKey, autoDecision, looksDestructive, looksSensitive } from "./auto-approve.ts";
+import { approvalKey, autoDecision, looksDestructive, looksSensitive, turnRunsFullAuto } from "./auto-approve.ts";
 
 describe("looksDestructive", () => {
   const dangerous = [
@@ -146,5 +146,18 @@ describe("unattended turns", () => {
   it("still auto-approves the same action when a person started the turn", () => {
     expect(autoDecision(bot, "Bash", "git status")).toBeTruthy();
     expect(autoDecision(bot, "Bash", "git status", { unattended: false })).toBeTruthy();
+  });
+});
+
+describe("turnRunsFullAuto", () => {
+  it("follows the bot Auto switch and skips the host-desktop broker", () => {
+    expect(turnRunsFullAuto({})).toBe(false);
+    expect(turnRunsFullAuto({ autoApprove: true })).toBe(true);
+    expect(
+      turnRunsFullAuto({
+        autoApprove: true,
+        integrations: { localComputer: { scope: "local-computer" } },
+      }),
+    ).toBe(false);
   });
 });

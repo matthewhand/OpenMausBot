@@ -26,7 +26,7 @@ function json(res: ServerResponse, status: number, body: JsonValue): void {
 
 function readRawBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
-    let raw = "";
+    const chunks: Buffer[] = [];
     let bytes = 0;
     let done = false;
     const fail = (status: number, message: string) => {
@@ -34,18 +34,24 @@ function readRawBody(req: IncomingMessage): Promise<string> {
       done = true;
       reject(Object.assign(new Error(message), { status }));
     };
-    req.on("data", (chunk) => {
+    req.on("data", (chunk: Buffer | string) => {
       if (done) return;
-      bytes += Buffer.byteLength(chunk);
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buf.length;
       if (bytes > MAX_WEBHOOK_BODY_BYTES) return fail(413, "Webhook body is too large");
-      raw += chunk;
+      chunks.push(buf);
     });
     req.on("end", () => {
       if (done) return;
       done = true;
-      resolve(raw);
+      resolve(Buffer.concat(chunks).toString("utf8"));
     });
     req.on("error", () => fail(400, "Could not read webhook body"));
+    req.on("close", () => {
+      if (!done && !req.readableEnded) {
+        fail(400, "Webhook request connection closed prematurely");
+      }
+    });
   });
 }
 

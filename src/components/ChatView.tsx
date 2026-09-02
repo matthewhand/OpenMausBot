@@ -41,6 +41,8 @@ import { showWorkingDots } from "@/lib/turn-tail";
 import { ChatMarkdown } from "./ChatMarkdown";
 import { OptionCard } from "./OptionCard";
 import { ApprovalCard } from "./ApprovalCard";
+import { CommChip } from "./CommPopup";
+import { ActivityChip } from "./ToolCallPopup";
 import { Composer } from "./Composer";
 import { ConnectorCard } from "./ConnectorCard";
 import { ModelPicker } from "./ModelPicker";
@@ -530,50 +532,6 @@ function Bubble({
   );
 }
 
-/** A tool run: spinner while live, check/cross once settled. */
-function ActivityChip({ message }: { message: Message }) {
-  const { dispatch } = useStore();
-  const tool = message.tool;
-  if (!tool) return null;
-  // bot⇄bot comm chip: opens the channel where the exchange lives
-  const comm = message.comm;
-  if (comm) {
-    return (
-      <div className="flex justify-start">
-        <button
-          onClick={() => dispatch({ type: "select", id: comm.groupId })}
-          title={`Open the conversation with ${comm.withName}`}
-          className="flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink"
-        >
-          <MausAvatar color={comm.withColor} state="happy" size={16} />
-          <span className="max-w-[480px] truncate">{tool.name}</span>
-          <ChevronRight size={13} />
-        </button>
-      </div>
-    );
-  }
-  const failed = tool.ok === false;
-  return (
-    <div className="flex justify-start">
-      <div
-        className={cn(
-          "flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px]",
-          failed ? "text-danger" : "text-ink-secondary",
-        )}
-      >
-        {tool.ok === undefined ? (
-          <Loader2 size={13} className="animate-spin" />
-        ) : failed ? (
-          <X size={13} />
-        ) : (
-          <Check size={13} className="text-success" />
-        )}
-        <span className="max-w-[480px] truncate font-mono">{tool.name}</span>
-      </div>
-    </div>
-  );
-}
-
 function ScreenFrame({ png, mime }: { png: string; mime?: string }) {
   return (
     <div className="flex justify-start">
@@ -681,14 +639,16 @@ const MessagesList = memo(function MessagesList({
               );
             case "activity":
               // a failed turn is an error, not a tool run — render it as one
-              return m.tool?.name.startsWith("error:") ? (
+              return m.comm ? (
+                <CommChip message={m} />
+              ) : m.tool?.name.startsWith("error:") ? (
                 <ErrorRow
                   message={m.tool.name.slice(6).trim()}
                   onRetry={m.id === messages.at(-1)?.id && canRetryLast ? onRegenerate : undefined}
                   setupInstance={m.tool.setup ? engine : undefined}
                 />
               ) : (
-                <ActivityChip message={m} />
+                <ActivityChip message={m} threadId={bot.threadId} />
               );
             case "screen":
               return m.png ? <ScreenFrame png={m.png} mime={m.mime} /> : null;
@@ -1000,6 +960,33 @@ export function ChatView({ bot }: { bot: Bot }) {
               <span className="@max-4xl/chathead:hidden">Stop</span>
             </button>
           )}
+          <button
+            type="button"
+            role="switch"
+            aria-checked={Boolean(bot.autoApprove)}
+            aria-label="Auto mode"
+            title={
+              bot.autoApprove
+                ? "Auto is on — tools run without asking. Click to approve each action yourself."
+                : "Ask before each tool. Click to Auto."
+            }
+            onClick={() => {
+              if (!bot.autoApprove && bot.computer === "local") {
+                dispatch({ type: "toggleSettings", open: true });
+                return;
+              }
+              dispatch({ type: "updateBot", botId: bot.id, patch: { autoApprove: !bot.autoApprove } });
+            }}
+            className={cn(
+              "flex items-center rounded-full border px-2.5 py-1 text-[13px]",
+              COMPACT_BUBBLE,
+              bot.autoApprove
+                ? "border-accent/40 bg-accent/12 text-accent"
+                : "border-hairline/40 bg-raised/60 text-ink-secondary hover:bg-raised hover:text-ink",
+            )}
+          >
+            Auto
+          </button>
           <TaskPicker bot={bot} />
           <UsageChip bot={bot} />
           <WorkingFolderChip bot={bot} />

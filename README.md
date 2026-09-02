@@ -59,8 +59,9 @@ already have:
   custom CLI binary (a versioned build or wrapper) in **Settings → Engines**.
 - **Local first.** One small harness server on `127.0.0.1` owns every agent process. Transcripts, keys, and
   events live in `~/.openmausbot`, not a cloud.
-- **Agents with hands.** Each bot can use a cloud Linux desktop, an isolated Local VM, or your own computer,
-  plus 500+ apps through Composio. Host control is available on macOS and as an explicit Ubuntu GNOME beta.
+- **Agents with hands.** Each bot can get a real computer — a cloud Linux desktop it drives while you watch
+  live, this computer, or a Local VM on this machine — plus 500+ apps through Composio, or your own
+  remote MCP servers (HTTP or SSE). Host control is available on macOS and as an explicit Ubuntu GNOME beta.
 
 ## Features
 
@@ -70,8 +71,8 @@ already have:
 
 ### 🧠 Pick a brain per bot
 
-A model picker with a provider rail — Claude and Codex models side by side, defaults marked, unavailable
-providers dimmed with the reason. Switch a bot's model mid-conversation.
+A model picker with a Cloud / Local provider rail — official models, local injects, and a setup card
+when an engine is not signed in. Switch a bot's model mid-conversation.
 
 <img src="docs/screenshots/model-picker.png" alt="Model picker with provider rail" width="100%">
 
@@ -81,9 +82,9 @@ providers dimmed with the reason. Switch a bot's model mid-conversation.
 ### 🖥️ Every bot gets a computer
 
 Open the Computer panel and the bot's cloud desktop spins up on its own — live screen preview while it
-works, "Open desktop" to take over in your browser, or point the bot at *this Mac* instead.
+works, "Open desktop" to take over in your browser, or point the bot at this computer or a Local VM.
 
-<img src="docs/screenshots/computer-panel.png" alt="Computer panel with live screen preview" width="100%">
+<img src="docs/screenshots/computer-panel.png" alt="Computer panel with live screen preview, Local VM, and scheduled tasks" width="100%">
 
 </td>
 </tr>
@@ -95,17 +96,18 @@ works, "Open desktop" to take over in your browser, or point the bot at *this Ma
 Shell commands, file edits, and questions surface as inline cards — Allow / Deny / answer in chat. A
 permission broker turns every risky action into a decision you make, for cloud and local computers alike.
 
-<img src="docs/screenshots/approval-card.png" alt="Approval and question cards in chat" width="100%">
+<img src="docs/screenshots/approval-card.png" alt="Onboarding question card in chat" width="100%">
 
 </td>
 <td width="50%" valign="top">
 
-### 🔌 Connected apps
+### 🔌 Connected apps and custom MCP
 
 A one-click marketplace over Composio Sessions: Gmail, Slack, GitHub, Notion, Linear and hundreds more.
-OAuth once, and every bot can use them as tools.
+OAuth once, and every bot can use them as tools. You can also add your own HTTP or SSE MCP servers on
+the Plugins panel's Custom MCP tab.
 
-<img src="docs/screenshots/marketplace.png" alt="Connected apps marketplace" width="100%">
+<img src="docs/screenshots/marketplace.png" alt="Plugins marketplace for Composio connected apps" width="100%">
 
 </td>
 </tr>
@@ -114,7 +116,7 @@ OAuth once, and every bot can use them as tools.
 
 ### 🗂 Manage bots like chats
 
-Right-click any bot: pin, mark unread, edit profile, duplicate, copy conversation ID, hide, delete. It's a
+Right-click any bot: pin, archive, mark unread, edit profile, duplicate, copy conversation ID, delete. It's a
 messaging app — your agents behave like contacts.
 
 <img src="docs/screenshots/context-menu.png" alt="Bot context menu" width="100%">
@@ -145,8 +147,9 @@ Press the speaker on any reply, or switch a bot to read its answers out as they 
 to what ran overnight while you make breakfast. Hit **call** and it's a conversation: it hears you, tells
 you what it's doing while it works, and asks for approvals out loud.
 
-Bring your own ElevenLabs key — paste it once in App Settings, pick a voice, and every bot can talk.
-Give a bot its own voice and a channel stops sounding like one person.
+Choose your TTS provider: **ElevenLabs** (cloud, high quality) or **OpenAI-compatible** (local servers like
+Kokoro, or any service using the OpenAI audio API). Paste your credentials once in App Settings, pick a
+voice, and every bot can talk. Give a bot its own voice and a channel stops sounding like one person.
 
 **Also in the box:** streaming replies with tool-run activity chips · native macOS dictation from the
 composer mic (on-device Apple speech recognition — desktop app) · SupaMaus cursor mascots with role-aware
@@ -178,6 +181,7 @@ flowchart LR
     CL & CX & GR -- "permission requests" --> BROKER
     server -- "Box API" --> BOX[("Cloud computer<br/>box.ascii.dev")]
     server -- "Composio Session" --> APPS[("Gmail · Slack · GitHub · …")]
+    server -- "Custom MCP servers" --> MCP[("Your HTTP/SSE MCP tools")]
 ```
 
 | Layer | Where | What it does |
@@ -230,7 +234,7 @@ pnpm package:linux    # Ubuntu x64: .deb + AppImage + verified CUA runtime
 | Capability | macOS | Ubuntu 24.04 Xorg | Ubuntu 24.04 Wayland |
 |---|---|---|---|
 | Packaged app, embedded harness, local agent CLIs | Supported | Beta | Beta |
-| Composio and Box/cloud computers | Supported | Beta | Beta |
+| Remote MCP servers, Composio, and Box/cloud computers | Supported | Beta | Beta |
 | Explicit preview-only local screen capture | Supported | Beta | Beta |
 | Bot control of this computer | Supported | Beta: opt-in, bundled Cua 0.19.3 | Beta: GNOME only, opt-in, bundled Cua 0.19.3; separately installed WinRects v8 helper |
 | Native on-device dictation | Supported | Planned | Planned |
@@ -257,10 +261,29 @@ in the sidebar footer) when you want to enable its integration:
 |---|---|---|
 | Composio project key (`ak_…`) | Connect Gmail, GitHub, Slack, Notion, and other apps to your bots | [OpenMausBot Composio setup](docs/composio.md) |
 | Box API key | Give bots an isolated remote Linux computer with a desktop and terminal | [Box API key guide](https://docs.ascii.dev/box/api-keys) |
-| ElevenLabs key | Read replies aloud, and call your bots | [ElevenLabs API keys](https://elevenlabs.io/app/settings/api-keys) |
+| TTS provider | Read replies aloud and call your bots — choose ElevenLabs or OpenAI-compatible (Kokoro, etc.) | [ElevenLabs keys](https://elevenlabs.io/app/settings/api-keys) or [local Kokoro setup](docs/voice-mode.md) |
+**Custom MCP servers** are configured in the sidebar **Plugins** panel (puzzle icon in the footer), on the
+**Custom MCP** tab. No account or API key required — just point at your HTTP or SSE MCP server URL. See the
+[MCP servers directory](https://github.com/modelcontextprotocol/servers) for examples.
 
-Composio and Box are third-party services with their own accounts and terms. Box is a paid service after
-its trial, and using a cloud computer may incur charges.
+### Adding a custom remote MCP server
+
+1. Click **Plugins** in the sidebar footer to open the Plugins panel
+2. Open the **Custom MCP** tab and click **Add server**
+3. Fill in:
+   - **Name**: A unique identifier (lowercase, alphanumeric, dash, underscore) — used as `mcp__<name>` in tool allowlists
+   - **Transport**: HTTP (streamable HTTP) or SSE (Server-Sent Events)
+   - **URL**: Your MCP server endpoint
+   - **Headers** (optional): Add auth headers, API keys, etc. These are stored securely and never echoed back
+4. Click "Save"
+
+Your Claude bots can now use tools from that server. Example custom servers:
+- **Notion**: Read and write pages, databases
+- **GitHub**: Issues, PRs, code search
+- **APIs.guru**: Browse and test public APIs
+- **Custom APIs**: Your own internal tools
+
+MCP servers can be enabled/disabled per server without losing their configuration.
 
 ```sh
 pnpm typecheck     # app + server
@@ -291,8 +314,9 @@ Early but real — the loop works end to end: message → agent → streamed rep
 computer use. macOS, Windows, and Ubuntu 24.04 x64 have released builds; Ubuntu remains a beta with the
 capability limits above. Rough edges to expect: hosted/mobile connectivity is still being built, and webhook
 triggers currently use the local receiver rather than an always-on hosted relay.
-Voice needs an ElevenLabs key, and calls are macOS-only for now (they ride the same on-device dictation as
-the composer mic) — see [`docs/voice-mode.md`](docs/voice-mode.md) for the design and the known gaps.
+Voice supports ElevenLabs and OpenAI-compatible providers (like local Kokoro), and calls are macOS-only for
+now (they ride the same on-device dictation as the composer mic) — see [`docs/voice-mode.md`](docs/voice-mode.md)
+for the design and the known gaps.
 
 Contributions welcome — the driver SPI in [`server/contracts.ts`](server/contracts.ts) is deliberately
 small; adding a provider is one file in [`server/drivers/`](server/drivers/) plus a one-line registration.

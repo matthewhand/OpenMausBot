@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { removeTempDir } from "../../testing/cleanup.ts";
-import { HERMES_CONFIG_MODEL_ID, hermesAcpModelId, hermesConfiguredModel } from "./hermes.ts";
+import { HERMES_CONFIG_MODEL_ID, hermesAcpModelId, hermesConfiguredModel, hermesHome } from "./hermes.ts";
 
 describe("hermesConfiguredModel", () => {
   const dirs: string[] = [];
@@ -64,9 +64,68 @@ describe("hermesConfiguredModel", () => {
     });
   });
 
+  it("offers the configured model when Portal OAuth landed in auth.json", () => {
+    const env = home("# OPENROUTER_API_KEY=\n", "model:\n  default: nous/hermes-agent\n");
+    writeFileSync(join(env.HERMES_HOME, "auth.json"), '{"nous":{"access_token":"tok"}}\n');
+    expect(hermesConfiguredModel(env)).toEqual({
+      id: HERMES_CONFIG_MODEL_ID,
+      label: "nous/hermes-agent (Hermes config)",
+      custom: true,
+    });
+  });
+
+  it("does not treat an empty auth.json as configured", () => {
+    const env = home("# OPENROUTER_API_KEY=\n");
+    writeFileSync(join(env.HERMES_HOME, "auth.json"), "{}\n");
+    expect(hermesConfiguredModel(env)).toBeNull();
+  });
+
   it("does not map to an ACP model id, so no session/set_model is sent for it", () => {
     // This is what makes Hermes fall through to its own configured provider.
     expect(hermesAcpModelId(HERMES_CONFIG_MODEL_ID)).toBeNull();
+  });
+});
+
+describe("hermesHome", () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    for (const d of dirs.splice(0)) await removeTempDir(d);
+  });
+
+  it("honors HERMES_HOME over the Windows native layout", () => {
+    const root = mkdtempSync(join(tmpdir(), "omb-hermes-home-"));
+    dirs.push(root);
+    const explicit = join(root, "explicit");
+    mkdirSync(explicit, { recursive: true });
+    expect(
+      hermesHome({
+        HERMES_HOME: explicit,
+        HOME: root,
+        LOCALAPPDATA: join(root, "AppData", "Local"),
+      }),
+    ).toBe(explicit);
+  });
+
+  it("uses %LOCALAPPDATA%\\hermes when that is the native install inside HOME", () => {
+    const root = mkdtempSync(join(tmpdir(), "omb-hermes-win-"));
+    dirs.push(root);
+    const localApp = join(root, "AppData", "Local");
+    const native = join(localApp, "hermes");
+    mkdirSync(native, { recursive: true });
+    writeFileSync(join(native, "config.yaml"), "model:\n  default: x\n");
+    expect(hermesHome({ HOME: root, USERPROFILE: root, LOCALAPPDATA: localApp })).toBe(native);
+  });
+
+  it("does not adopt a LOCALAPPDATA hermes that sits outside this HOME", () => {
+    const root = mkdtempSync(join(tmpdir(), "omb-hermes-scratch-"));
+    const foreignRoot = mkdtempSync(join(tmpdir(), "omb-hermes-foreign-"));
+    dirs.push(root, foreignRoot);
+    const foreign = join(foreignRoot, "hermes");
+    mkdirSync(foreign, { recursive: true });
+    writeFileSync(join(foreign, "config.yaml"), "model:\n  default: x\n");
+    writeFileSync(join(foreign, ".env"), "OPENROUTER_API_KEY=sk-or-real\n");
+    expect(hermesHome({ HOME: root, USERPROFILE: root, LOCALAPPDATA: foreignRoot })).toBe(join(root, ".hermes"));
+    expect(hermesConfiguredModel({ HOME: root, USERPROFILE: root, LOCALAPPDATA: foreignRoot })).toBeNull();
   });
 });
 

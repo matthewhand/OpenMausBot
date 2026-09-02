@@ -326,6 +326,11 @@ export function readCuaConnection({
     for (const directory of ["OpenMausBot", "openmausbot", "OpenGrokBot", "opengrokbot"]) {
       candidates.push(join(home, "Library", "Application Support", directory, "cua-connection.json"));
     }
+  } else if (platform === "win32") {
+    const appData = process.env.APPDATA || join(home, "AppData", "Roaming");
+    for (const dir of ["OpenMausBot", "openmausbot", "OpenGrokBot", "opengrokbot"]) {
+      candidates.push(join(appData, dir, "cua-connection.json"));
+    }
   }
 
   for (const file of [...new Set(candidates)]) {

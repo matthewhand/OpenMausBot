@@ -5,9 +5,9 @@
 // header" failure. Inject writes providers.<host> and session/set_model
 // `custom:<host>:<model>` instead.
 import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 
 import type { ModelCatalog } from "../../contracts.ts";
 import { decodeInjectId, hostApiKey, INJECT_SEP, localHost, mergeLocalInject } from "../local-inject.ts";
@@ -15,8 +15,36 @@ import { createAcpDriver, type AcpSupport } from "./core.ts";
 
 const EMPTY: ModelCatalog = { default: "", options: [] };
 
-function hermesHome(env: Record<string, string | undefined>): string {
-  return env.HERMES_HOME || join(env.HOME || env.USERPROFILE || homedir(), ".hermes");
+function pathIsInside(parent: string, child: string): boolean {
+  const norm = process.platform === "win32" ? (p: string) => p.replace(/\//g, "\\").toLowerCase() : (p: string) => p;
+  const rel = relative(norm(parent), norm(child));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function hermesHasUserData(dir: string): boolean {
+  return existsSync(join(dir, "config.yaml")) || existsSync(join(dir, ".env")) || existsSync(join(dir, "auth.json"));
+}
+
+/** Hermes data dir: `HERMES_HOME`, else the native Windows install, else `~/.hermes`.
+ *
+ * Native Windows (`install.ps1`) stores config/auth at `%LOCALAPPDATA%\hermes`
+ * and sets user-env `HERMES_HOME` to that. A GUI app that never inherited the
+ * user env (started before install, stale Explorer PATH) would otherwise
+ * read/write `%USERPROFILE%\.hermes` — a parallel empty home, not the one
+ * `hermes setup` already filled in. Only adopt LOCALAPPDATA when it sits
+ * inside this env's HOME, so a test scratch HOME cannot leak into the
+ * developer's real install.
+ */
+export function hermesHome(env: Record<string, string | undefined>): string {
+  if (env.HERMES_HOME) return env.HERMES_HOME;
+  const home = env.HOME || env.USERPROFILE || homedir();
+  const posix = join(home, ".hermes");
+  const localApp = env.LOCALAPPDATA;
+  if (localApp) {
+    const nativeWin = join(localApp, "hermes");
+    if (hermesHasUserData(nativeWin) && pathIsInside(home, nativeWin)) return nativeWin;
+  }
+  return posix;
 }
 
 function quoteYaml(value: string): string {
@@ -113,14 +141,23 @@ function nonEmptyDotenvValue(text: string, name: string): string | null {
   return raw.replace(/[ \t]+#.*$/, "").trim() || null;
 }
 
+function hermesAuthFileConfigured(dir: string): boolean {
+  try {
+    const raw = readFileSync(join(dir, "auth.json"), "utf8").trim();
+    return Boolean(raw) && raw !== "{}" && raw !== "[]" && raw !== "null";
+  } catch {
+    return false;
+  }
+}
+
 /** Model Hermes' own config will use, when a remote provider is configured.
  *
  * Hermes is a BYOK harness and OpenMausBot only ever offered it *local* hosts
  * (Ollama, LM Studio, EXO...). A user who has configured Hermes with a hosted
  * provider — an OpenRouter key in `~/.hermes/.env`, which is how `hermes setup`
- * stores it — had no selectable model at all: the picker showed "No local
- * models found" and greyed the agent out, despite Hermes being installed,
- * authenticated and perfectly able to answer.
+ * stores it, or Portal OAuth in `auth.json` — had no selectable model at all:
+ * the picker showed "No local models found" and greyed the agent out, despite
+ * Hermes being installed, authenticated and perfectly able to answer.
  *
  * Read-only on purpose. `ensureHermesInjectProvider` writes `config.yaml`, and
  * doing that from a catalog probe would rewrite the user's real Hermes config
@@ -137,11 +174,12 @@ export function hermesConfiguredModel(
   try {
     secrets = readFileSync(join(dir, ".env"), "utf8");
   } catch {
-    return null;
+    secrets = "";
   }
   // Only an uncommented, non-empty assignment counts; the shipped file has the
   // key present but commented out, and that must not read as "configured".
-  if (!nonEmptyDotenvValue(secrets, "OPENROUTER_API_KEY")) return null;
+  // `hermes setup --portal` stores OAuth in auth.json instead of this key.
+  if (!nonEmptyDotenvValue(secrets, "OPENROUTER_API_KEY") && !hermesAuthFileConfigured(dir)) return null;
 
   let model = "";
   try {
@@ -335,6 +373,9 @@ const support: AcpSupport = {
     // named custom provider + session/set_model is the real route.
     delete env.OPENAI_API_KEY;
     delete env.OPENROUTER_API_KEY;
+    // Pin the resolved data dir so a custom CLI path and a PATH `hermes` both
+    // load the user's existing config/auth, not a throwaway `~/.hermes`.
+    env.HERMES_HOME = hermesHome(env);
   },
   pickAuthMethod: () => null,
   authFailure: "continue",

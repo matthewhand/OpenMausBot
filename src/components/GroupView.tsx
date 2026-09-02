@@ -23,6 +23,8 @@ import { ConnectorCard } from "./ConnectorCard";
 import { GroupCallButton, GroupCallOverlay } from "./GroupCallView";
 import { ReactionBar, ReactionChips } from "./Reactions";
 import { ApprovalCard } from "./ApprovalCard";
+import { CommChip } from "./CommPopup";
+import { ActivityChip } from "./ToolCallPopup";
 import { ManageMembersPanel } from "./ManageMembersPanel";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
@@ -118,17 +120,10 @@ const Transcript = memo(function Transcript({
             <div className="flex justify-start">
               <ApprovalCard bot={memberOf(m.from?.botId)} message={m} />
             </div>
+          ) : m.kind === "activity" && m.comm ? (
+            <CommChip message={m} />
           ) : m.kind === "activity" && m.tool ? (
-            <div className="flex justify-start">
-              <div
-                className={cn(
-                  "flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px]",
-                  m.tool.ok === false ? "text-danger" : "text-ink-secondary",
-                )}
-              >
-                <span className="max-w-[480px] truncate font-mono">{m.tool.name}</span>
-              </div>
-            </div>
+            <ActivityChip message={m} threadId={group.threadId} />
           ) : m.kind === "text" && m.text ? (
             <div className={cn("group flex w-full flex-col", user ? "items-end" : "items-start")}>
               <div className={cn("flex w-full items-end gap-1.5", user ? "justify-end" : "justify-start")}>

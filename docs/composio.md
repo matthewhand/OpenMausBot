@@ -8,7 +8,7 @@ OpenMausBot uses one Composio project API key and one reusable Composio Session.
 2. Select **Platform**, select or create a project, then open **Settings → API Keys**.
 3. Copy a project key beginning with `ak_`.
 4. In OpenMausBot, open **App Settings → Connections** and save it under **Composio project key**.
-5. Open **Connected apps** and choose Gmail, GitHub, Slack, or another service. Authentication happens in your normal browser.
+5. Open **Plugins** in the sidebar footer and choose Gmail, GitHub, Slack, or another service on the Marketplace tab. Authentication happens in your normal browser.
 6. To connect another account for the same app, choose **Add account**, give it a unique label such as `work` or `personal`, and finish the second authorization in your browser.
 
 The Connected tab lists every account separately. **Disconnect** revokes only the account named on that row. OpenMausBot requires a label for a second account and configures Composio to require explicit selection when more than one account could run a tool; a new OAuth flow never silently becomes the default for an existing connection.

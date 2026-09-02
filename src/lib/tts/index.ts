@@ -1,3 +1,5 @@
+import { lanAuthHeaders } from "@/lib/lan-auth";
+
 // The speaker — one voice for the whole window.
 //
 // Deliberately a singleton: two bots talking over each other is never what
@@ -26,7 +28,7 @@ export interface SpeechSnapshot {
   error?: string;
 }
 
-interface SpeakOptions {
+export interface SpeakOptions {
   voiceId?: string;
   botId?: string;
   messageId?: string;
@@ -97,17 +99,18 @@ export class Speaker {
    * never rejects, because a voice failing is a thing to show, not a thing
    * that should take a caller's turn down with it.
    */
-  async speak(text: string, opts: SpeakOptions = {}): Promise<void> {
+  async speak(text: string, opts: SpeakOptions | string = {}): Promise<void> {
+    const options: SpeakOptions = typeof opts === "string" ? { voiceId: opts } : opts;
     this.stop();
     const mine = this.token;
     const controller = new AbortController();
     this.request = controller;
     const live = () => this.token === mine && !controller.signal.aborted;
 
-    this.set({ status: "preparing", botId: opts.botId, messageId: opts.messageId });
+    this.set({ status: "preparing", botId: options.botId, messageId: options.messageId });
     let utterances: string[];
     try {
-      utterances = await this.prepare(text, opts.voiceId, controller.signal);
+      utterances = await this.prepare(text, options.voiceId, controller.signal);
     } catch (e) {
       if (live()) this.set({ ...IDLE, error: e instanceof Error ? e.message : String(e) });
       if (this.request === controller) this.request = null;
@@ -125,7 +128,7 @@ export class Speaker {
     // turn — the only gap the listener hears is the first.
     type Rendered = { blob: Blob; error?: never } | { blob?: never; error: unknown };
     const render = (utterance: string): Promise<Rendered> =>
-      this.render(utterance, opts.voiceId, controller.signal).then(
+      this.render(utterance, options.voiceId, controller.signal).then(
         (blob) => ({ blob }),
         (error: unknown) => ({ error }),
       );
@@ -146,7 +149,7 @@ export class Speaker {
         return;
       }
       if (!live()) return;
-      this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption: utterances[i] });
+      this.set({ status: "speaking", botId: options.botId, messageId: options.messageId, caption: utterances[i] });
       const finished = await this.play(rendered.blob, live);
       if (!finished || !live()) {
         if (live()) this.set({ ...IDLE, error: "The generated voice clip couldn't be played." });
@@ -161,22 +164,20 @@ export class Speaker {
   private async prepare(text: string, voiceId: string | undefined, signal: AbortSignal): Promise<string[]> {
     const res = await fetch("/api/tts/prepare", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...lanAuthHeaders() },
       body: JSON.stringify({ text, voiceId }),
       signal,
     });
     const body: TtsPrepareBody = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error ?? `the voice service returned ${res.status}`);
-    if (!body.ready) {
-      throw new Error("Add the shared ElevenLabs key in an agent profile on this computer, then pick a voice for the agent.");
-    }
+    if (!body.ready) throw new Error("Configure TTS and pick a voice in App Settings to turn on voice.");
     return body.utterances ?? [];
   }
 
   private async render(text: string, voiceId: string | undefined, signal: AbortSignal): Promise<Blob> {
     const res = await fetch("/api/tts/speak", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...lanAuthHeaders() },
       body: JSON.stringify({ text, voiceId }),
       signal,
     });
@@ -216,3 +217,4 @@ export class Speaker {
 }
 
 export const speaker = new Speaker();
+export { auditionVoice, VOICE_SAMPLE_TEXT, SAMPLE } from "@/lib/voice-audition";

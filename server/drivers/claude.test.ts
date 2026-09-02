@@ -325,6 +325,57 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(allowed).toContain("mcp__agents");
   });
 
+  it("mounts custom remote MCP servers (HTTP/SSE) and pre-allows their tools", async () => {
+    await create();
+    const dump = join(scratch, "dump.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-custom-mcp",
+      text: "hi",
+      integrations: {
+        mcpServers: [
+          {
+            name: "notion",
+            transport: "http",
+            url: "https://api.example.com/mcp/notion",
+            headers: { Authorization: "Bearer secret-token" },
+            enabled: true,
+          },
+          {
+            name: "deepwiki",
+            transport: "sse",
+            url: "https://api.example.com/mcp/deepwiki",
+            enabled: true,
+          },
+          {
+            name: "disabled-server",
+            transport: "http",
+            url: "https://disabled.example.com/mcp",
+            enabled: false,
+          },
+        ],
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.mcpConfig.mcpServers.notion).toMatchObject({
+      type: "http",
+      url: "https://api.example.com/mcp/notion",
+      headers: { Authorization: "Bearer secret-token" },
+    });
+    expect(seen.mcpConfig.mcpServers.deepwiki).toMatchObject({
+      type: "sse",
+      url: "https://api.example.com/mcp/deepwiki",
+    });
+    expect(seen.mcpConfig.mcpServers["disabled-server"]).toBeUndefined();
+    const allowed = seen.argv[seen.argv.indexOf("--allowedTools") + 1];
+    expect(allowed).toContain("mcp__notion");
+    expect(allowed).toContain("mcp__deepwiki");
+    expect(allowed).not.toContain("mcp__disabled-server");
+  });
+
   it("mounts the dweb proxy from the drivers directory and pre-allows its tools", async () => {
     await create();
     const dump = join(scratch, "dump.json");
@@ -361,11 +412,18 @@ describe("ClaudeDriver turns (fake CLI)", () => {
           args: ["/tmp/connector-proxy.js"],
           env: { OMB_CONNECTOR_UPSTREAM_URL: "https://example.test/mcp" },
         },
+        mcpServers: [
+          { name: "custom", transport: "http", url: "https://custom.example.com/mcp", enabled: true },
+        ],
       },
     });
     await recorder.until((e) => e.type === "turn.completed");
 
     const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.mcpConfig.mcpServers.custom).toMatchObject({
+      type: "http",
+      url: "https://custom.example.com/mcp",
+    });
     expect(seen.mcpConfig.mcpServers.composio).toMatchObject({
       command: process.execPath,
       args: ["/tmp/connector-proxy.js"],
@@ -373,7 +431,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     });
     // the user's Composio key must not be readable via `ps`
     expect(JSON.stringify(seen.argv)).not.toContain("ak_test");
-    expect(seen.argv[seen.argv.indexOf("--allowedTools") + 1]).toContain("mcp__composio");
+    const allowed = seen.argv[seen.argv.indexOf("--allowedTools") + 1];
+    expect(allowed).toContain("mcp__composio");
+    expect(allowed).toContain("mcp__custom");
   });
 
   // the config file holds live credentials, so it must not outlive the turn —

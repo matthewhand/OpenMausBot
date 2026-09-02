@@ -1,9 +1,14 @@
 // The bot's computer, in the right-side slot. Where it runs decides the
 // whole flow: cloud → provision the box on open (idempotent) and preview
-// via SSE frames or a ~4s screenshot poll. macOS local mode keeps the legacy
-// in-panel capture. Linux local mode is an automation readiness state and its
-// separate preview remains explicitly user-initiated. Auto never selects a
-// Linux user's desktop.
+// The bot's computer, in the right-side slot. Where it runs decides the
+// whole flow: cloud → provision the box on open (idempotent) and preview
+// via SSE frames or a ~4s screenshot poll; local ("This computer") → frames
+// come from the Electron main process (desktopCapturer over the preload
+// bridge — box endpoints are never touched), except Linux, where local mode
+// is an automation readiness state and its separate preview stays explicitly
+// user-initiated; off → parked. Auto (unset) prefers the cloud box when one
+// exists, else local inside the app, and never selects a Linux user's
+// desktop.
 import { useEffect, useRef, useState } from "react";
 import {
   CalendarDays,
@@ -18,10 +23,12 @@ import {
   Smartphone,
   X,
 } from "lucide-react";
-import { useStore, type Bot } from "@/state/store";
+import { useStore, api, type Bot } from "@/state/store";
 import type { Routine } from "@/lib/routines";
 import { ApiKeyRow } from "./ApiKeys";
 import { cn } from "@/lib/cn";
+import { frameSrc } from "@/lib/frame-src";
+import { canOpenExternalUrl } from "@/lib/loopback-viewer";
 import { CloudBackendPicker } from "./CloudBackendPicker";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { RoutineEditor } from "./RoutinesPage";
@@ -37,13 +44,6 @@ import {
   localComputerDisabledReason,
   localComputerSelectable,
 } from "@/lib/local-computer";
-
-async function api(path: string, init?: RequestInit): Promise<any> {
-  const res = await fetch(path, { headers: { "content-type": "application/json" }, ...init });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error ?? `${res.status} ${res.statusText}`);
-  return body;
-}
 
 type Phase =
   | "checking"
@@ -374,52 +374,65 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   // cloud preview: SSE frames win while the bot works; otherwise poll
   const live = state.screens[bot.id];
   const sseFlowing = Boolean(bot.busy && live);
-  const inFlight = useRef(false);
   useEffect(() => {
     if (phase !== "ready" || sseFlowing || viewerOpen) return;
     let alive = true;
+    let inFlight = false;
+    let controller: AbortController | undefined;
     const shoot = async () => {
-      if (inFlight.current) return;
-      inFlight.current = true;
+      if (inFlight) return;
+      inFlight = true;
+      controller = new AbortController();
       try {
-        const { png, format } = await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" });
+        const { png, format } = await api(`/api/bots/${bot.id}/computer/screenshot`, {
+          method: "POST",
+          signal: controller.signal,
+        });
         if (alive) setPolledFrame({ png, mime: format === "jpeg" ? "image/jpeg" : "image/png" });
-      } catch {
+      } catch (e) {
+        if (e instanceof DOMException && e.name === "AbortError") return;
         /* box mid-command or asleep — next tick */
       } finally {
-        inFlight.current = false;
+        inFlight = false;
       }
     };
     void shoot();
     const timer = setInterval(shoot, 4000);
     return () => {
       alive = false;
+      inFlight = false;
+      controller?.abort();
       clearInterval(timer);
     };
   }, [phase, sseFlowing, bot.id, viewerOpen]);
 
   // Local VM preview comes directly from Cua Driver through the harness. It
   // does not use the password-protected noVNC viewer or cloud endpoints.
-  const vmInFlight = useRef(false);
   useEffect(() => {
     if (phase !== "vm" || viewerOpen) return;
     let alive = true;
+    let inFlight = false;
+    let controller: AbortController | undefined;
     const shoot = async () => {
-      if (vmInFlight.current) return;
-      vmInFlight.current = true;
+      if (inFlight) return;
+      inFlight = true;
+      controller = new AbortController();
       try {
-        const { image } = await api(`/api/bots/${bot.id}/local-computer/screenshot`, { method: "POST" });
+        const { image } = await api(`/api/bots/${bot.id}/local-computer/screenshot`, { method: "POST", signal: controller.signal });
         if (alive && typeof image === "string") setVmFrame(image);
       } catch (e) {
+        if (e instanceof DOMException && e.name === "AbortError") return;
         if (alive) setError(e instanceof Error ? e.message : String(e));
       } finally {
-        vmInFlight.current = false;
+        inFlight = false;
       }
     };
     void shoot();
     const timer = window.setInterval(() => void shoot(), 3000);
     return () => {
       alive = false;
+      inFlight = false;
+      controller?.abort();
       window.clearInterval(timer);
     };
   }, [phase, bot.id, viewerOpen]);
@@ -455,14 +468,14 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
     live ??
     polledFrame ??
     (lastScreenMessage ? { png: lastScreenMessage.png!, mime: lastScreenMessage.mime ?? "image/png" } : null);
-  const frameSrc =
+  const previewSrc =
     phase === "vm"
-      ? vmFrame
+      ? frameSrc(vmFrame)
       : phase === "local" && !isLinux
-      ? localFrame
-      : phase === "ready" || phase === "starting"
-        ? cloudFrame && `data:${cloudFrame.mime};base64,${cloudFrame.png}`
-        : null;
+        ? frameSrc(localFrame)
+        : phase === "ready" || phase === "starting"
+          ? cloudFrame && frameSrc(cloudFrame.png, cloudFrame.mime)
+          : null;
 
   // who-is-driving: SSE keeps this fresh; the mount fetch covers a panel
   // opened after the last frame (e.g. an app reload mid-hold)
@@ -530,6 +543,9 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
         viewerUrl = result.joinUrl?.constructor === String ? String(result.joinUrl) : null;
       }
       if (!viewerUrl) throw new Error("The computer did not return a live desktop link");
+      if (!canOpenExternalUrl(viewerUrl, window.location.hostname)) {
+        throw new Error("That desktop URL is only reachable from this machine. Use the live preview in this panel, or open the app on the host.");
+      }
 
       if (window.ogb?.desktopViewer) {
         const opened = await window.ogb.desktopViewer.open(viewerUrl, `${bot.name}'s live desktop`, bot.id);
@@ -698,9 +714,9 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
             {cloudBackend === "vps" && (phase === "ready" || phase === "starting") && <span className="text-[11px]">self-hosted VPS</span>}
         </div>
         <div className="flex aspect-[16/10] w-full items-center justify-center overflow-hidden rounded-xl bg-card">
-          {frameSrc ? (
+          {previewSrc ? (
             <img
-              src={frameSrc}
+              src={previewSrc}
               alt={`${bot.name}'s screen`}
               className="h-full w-full object-contain"
               title={phase === "vm" ? "Watch-only preview — use Open desktop to click and type" : undefined}

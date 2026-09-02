@@ -10,6 +10,7 @@ import {
   loadConfig,
   localVmMaxInstances,
   localVmMode,
+  mergeMcpServers,
   parseConfigPatch,
   parseStoredConfig,
   roomTurnTimeoutMinutes,
@@ -34,6 +35,22 @@ describe("configuration boundaries", () => {
       profile: { name: "Ada", email: "ada@example.com" },
       instances: { claude: { driver: "claudeAgent", config: { cli: "/opt/claude" } } },
     });
+  });
+
+  it("parses and validates TTS model configuration", () => {
+    const stored = parseStoredConfig({
+      tts: { provider: "openai-compatible", baseUrl: "http://127.0.0.1:9093/v1", model: "kokoro" },
+    });
+    expect(stored.tts).toEqual({
+      provider: "openai-compatible",
+      baseUrl: "http://127.0.0.1:9093/v1",
+      model: "kokoro",
+    });
+
+    const patched = parseConfigPatch({
+      tts: { model: "tts-1-hd" },
+    });
+    expect(patched.tts).toEqual({ model: "tts-1-hd" });
   });
 
   it("rejects malformed stored instances and API patches", () => {
@@ -183,6 +200,45 @@ describe("Instance CLI override", () => {
     const custom = { instances: { claude: { driver: "claudeAgent", environment: { MY_FLAG: "1" } } } };
     const kept = withInstanceCli(custom, "claude", "/x");
     expect(kept.config.instances!.claude.environment).toEqual({ MY_FLAG: "1" });
+  });
+});
+
+describe("reserved MCP names", () => {
+  it("rejects a server named after a built-in mount", () => {
+    expect(() => parseConfigPatch({ mcpServers: [{ name: "agents", transport: "http", url: "https://x.example/mcp" }] })).toThrow(
+      /reserved/,
+    );
+    expect(() =>
+      parseConfigPatch({
+        mcpServers: [
+          { name: "notion", transport: "http", url: "https://x.example/mcp" },
+          { name: "notion", transport: "sse", url: "https://y.example/sse" },
+        ],
+      }),
+    ).toThrow(/duplicate/);
+    expect(() => parseConfigPatch({ mcpServers: [{ name: "bad name", transport: "http", url: "https://x.example/mcp" }] })).toThrow();
+  });
+});
+
+describe("mergeMcpServers", () => {
+  it("keeps stored headers when a PUT omits them", () => {
+    const merged = mergeMcpServers(
+      [{ name: "notion", transport: "http", url: "https://n.example/mcp", headers: { Authorization: "Bearer secret" }, enabled: true }],
+      [{ name: "notion", transport: "http", url: "https://n.example/mcp", enabled: false }],
+    );
+    expect(merged[0]).toMatchObject({
+      name: "notion",
+      enabled: false,
+      headers: { Authorization: "Bearer secret" },
+    });
+  });
+
+  it("clears headers when the patch sends an empty object", () => {
+    const merged = mergeMcpServers(
+      [{ name: "notion", transport: "http", url: "https://n.example/mcp", headers: { Authorization: "Bearer secret" } }],
+      [{ name: "notion", transport: "http", url: "https://n.example/mcp", headers: {} }],
+    );
+    expect(merged[0].headers).toEqual({});
   });
 });
 

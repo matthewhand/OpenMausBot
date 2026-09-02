@@ -21,8 +21,15 @@ import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib
 import { currentCall } from "@/lib/call";
 import { showNotification, type NotificationTarget } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
+import { consumeLanAuthTokenFromLocation, eventsUrl, lanAuthHeaders, readLanAuthToken } from "@/lib/lan-auth";
 import { createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
+import {
+  loadHideInterBotChannels,
+  loadHideSidebarBots,
+  saveHideInterBotChannels,
+  saveHideSidebarBots,
+} from "@/lib/sidebar-groups";
 
 export type { MausColor } from "@/lib/mascot";
 
@@ -64,7 +71,20 @@ export interface Message {
   /** activity messages: tool name + outcome. `spoken` is the server's
    * narration of the same chip ("reading a file"), used by call mode. */
   /** `setup` marks an error fixed by installing something, not by retrying. */
-  tool?: { name: string; ok?: boolean; spoken?: string; setup?: boolean };
+  /** Extra keys (input/args/output/result) are shown in the tool-call popup
+   * when the harness already persisted them; most chips only have name/ok. */
+  tool?: {
+    name: string;
+    ok?: boolean;
+    spoken?: string;
+    setup?: boolean;
+    itemId?: string;
+    input?: unknown;
+    args?: unknown;
+    arguments?: unknown;
+    output?: unknown;
+    result?: unknown;
+  };
   /** user messages sent into a running turn — the model saw it mid-turn */
   steered?: boolean;
   /** screen messages: a frame of the bot's computer (base64) */
@@ -240,21 +260,30 @@ export interface ConfigStatus {
   rooms: { turnTimeoutMinutes: number };
   localVm: { mode: "shared" | "per-bot"; maxInstances: number };
   opencodeGo?: { configured: boolean };
-  /** Voice (ElevenLabs). `configured` = a key is saved; `ready` = a key AND
-   * a voice, which is what it takes to actually speak. The key itself is
-   * never echoed back. */
-  tts?: { configured: boolean; ready: boolean; voice: string };
+  /** Voice. Supports ElevenLabs and OpenAI-compatible providers.
+   * `provider` = which provider is selected; `configured` = credentials are
+   * saved; `ready` = credentials AND a voice. Secrets are never echoed back.
+   * `baseUrl` is echoed for OpenAI-compatible (not a secret). */
+  tts?: { provider: "elevenlabs" | "openai-compatible"; configured: boolean; ready: boolean; voice: string; baseUrl: string; model?: string };
   /** Shared write-only credential for on-demand GPT Image avatars. */
   imageGen?: { configured: boolean };
   /** who's using the app — collected in onboarding, shown in the sidebar */
   profile?: { name: string; email: string };
   /** Experimental features are opt-in and default off when absent. */
   features?: { skillRecorder: boolean };
+  /** Custom remote MCP servers: names, urls, and enabled state. Headers are write-only. */
+  mcpServers?: Array<{
+    name: string;
+    transport: "http" | "sse";
+    url: string;
+    enabled: boolean;
+    hasHeaders: boolean;
+  }>;
 }
 
 export type ConfigStatusFrame = Pick<
   ConfigStatus,
-  "xai" | "composio" | "box" | "vps" | "rooms" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "features"
+  "xai" | "composio" | "box" | "vps" | "rooms" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "features" | "mcpServers"
 >;
 
 export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
@@ -270,6 +299,7 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     imageGen: frame.imageGen,
     profile: frame.profile,
     features: frame.features,
+    mcpServers: frame.mcpServers,
   };
 }
 
@@ -321,10 +351,12 @@ export interface InstanceInfo {
 
 export type AppSettingsSection =
   | "general"
+  | "lan"
   | "connections"
   | "engines"
   | "companion"
   | "computer"
+  | "voice"
   | "usage";
 
 export interface AppState {
@@ -358,13 +390,29 @@ export interface AppState {
   /** a search hit to scroll to once its thread is on screen; nonce lets the
    * same message be focused twice in a row */
   focusMessage: { threadId: string; messageId: string; nonce: number; consumed: boolean } | null;
+  /** Jump the Inspector to a tool call from a transcript chip. */
+  focusInspector: {
+    threadId: string;
+    itemId?: string;
+    toolName: string;
+    at: number;
+    nonce: number;
+    consumed: boolean;
+  } | null;
   connected: boolean;
+  authRequired: boolean;
+  authError: string | null;
   error: string | null;
   mascotMotion: {
     botId: string;
     nonce: number;
     kind: Exclude<MausMotion, "none">;
   } | null;
+  /** When true, auto-created bot⇄bot pair rooms stay out of the sidebar
+   * and command palette so only custom channels are listed. */
+  hideInterBotChannels: boolean;
+  /** When true, specialist bots stay out of the sidebar so channels stay the list. */
+  hideSidebarBots: boolean;
   /** 1:1 queue-fallback lines waiting for drain; keyed by threadId.
    * Each entry is identified by the server queueId, not by text. */
   pendingQueued: Record<string, Array<{ queueId: string; text: string }>>;
@@ -462,6 +510,7 @@ export type Action =
   | { type: "setModel"; botId: string; selection: ModelSelection }
   | { type: "interrupt"; botId: string }
   | { type: "connected"; value: boolean }
+  | { type: "authRequired"; required: boolean; error?: string | null }
   | { type: "error"; message: string | null }
   | { type: "toggleSettings"; open?: boolean }
   | { type: "togglePlugins"; open?: boolean }
@@ -469,12 +518,24 @@ export type Action =
   | { type: "toggleInspector"; open?: boolean }
   | { type: "focusMessage"; threadId: string; messageId: string }
   | { type: "focusMessageConsumed"; nonce: number }
+  | {
+      type: "focusInspector";
+      threadId: string;
+      itemId?: string;
+      toolName: string;
+      at: number;
+    }
+  | { type: "focusInspectorConsumed"; nonce: number }
+  | { type: "setHideSidebarBots"; enabled: boolean }
   | { type: "toggleAppSettings"; open?: boolean; section?: AppSettingsSection }
   | {
       type: "updateBot";
       botId: string;
+      type: "updateBot";
+      botId: string;
       patch: BotUpdatePatch;
-    };
+    }
+  | { type: "setHideInterBotChannels"; enabled: boolean };
 
 export function openNotificationTarget(
   dispatch: (action: Action) => void,
@@ -815,7 +876,17 @@ export function reducer(state: AppState, action: Action): AppState {
     case "setModel":
       return updateBot(state, action.botId, (b) => ({ ...b, modelSelection: action.selection }));
     case "connected":
-      return { ...state, connected: action.value };
+      return {
+        ...state,
+        connected: action.value,
+        ...(action.value ? { authRequired: false, authError: null } : {}),
+      };
+    case "authRequired":
+      return {
+        ...state,
+        authRequired: action.required,
+        authError: action.error ?? null,
+      };
     case "error":
       return {
         ...(action.message && state.selectedId
@@ -849,6 +920,26 @@ export function reducer(state: AppState, action: Action): AppState {
     case "focusMessageConsumed":
       if (!state.focusMessage || state.focusMessage.nonce !== action.nonce) return state;
       return { ...state, focusMessage: { ...state.focusMessage, consumed: true } };
+    case "focusInspector":
+      return {
+        ...state,
+        inspectorOpen: true,
+        settingsOpen: false,
+        computerOpen: false,
+        appSettingsOpen: false,
+        pluginsOpen: false,
+        focusInspector: {
+          threadId: action.threadId,
+          itemId: action.itemId,
+          toolName: action.toolName,
+          at: action.at,
+          nonce: (state.focusInspector?.nonce ?? 0) + 1,
+          consumed: false,
+        },
+      };
+    case "focusInspectorConsumed":
+      if (!state.focusInspector || state.focusInspector.nonce !== action.nonce) return state;
+      return { ...state, focusInspector: { ...state.focusInspector, consumed: true } };
     case "toggleComputer": {
       const open = action.open ?? !state.computerOpen;
       return {
@@ -989,12 +1080,22 @@ export function reducer(state: AppState, action: Action): AppState {
       return state;
     case "taskSwitched":
       return updateBot(state, action.bot.id, (bot) => ({ ...bot, ...action.bot, messages: action.bot.messages ?? [] }));
+    case "deleteGroup": {
+      const groups = state.groups.filter((g) => g.id !== action.groupId);
+      const selectedId = state.selectedId === action.groupId ? (state.bots[0]?.id ?? "") : state.selectedId;
+      return { ...state, groups, selectedId };
+    }
+    case "setHideInterBotChannels":
+      saveHideInterBotChannels(action.enabled);
+      return { ...state, hideInterBotChannels: action.enabled };
+    case "setHideSidebarBots":
+      saveHideSidebarBots(action.enabled);
+      return { ...state, hideSidebarBots: action.enabled };
     case "newBot":
     case "duplicateBot":
     case "interrupt":
     case "createGroup":
     case "sendGroup":
-    case "deleteGroup":
     case "interruptGroup":
     case "createRoutine":
     case "updateRoutine":
@@ -1031,9 +1132,14 @@ export const initialState: AppState = {
   provisioning: {},
   computerControl: {},
   focusMessage: null,
+  focusInspector: null,
   connected: false,
+  authRequired: false,
+  authError: null,
   error: null,
   mascotMotion: null,
+  hideInterBotChannels: loadHideInterBotChannels(),
+  hideSidebarBots: loadHideSidebarBots(),
   pendingQueued: {},
   consumedQueueIds: {},
 };
@@ -1041,10 +1147,17 @@ export const initialState: AppState = {
 // ── API client ─────────────────────────────────────────────────────────
 export async function api(path: string, init?: RequestInit): Promise<any> {
   const res = await fetch(path, {
-    headers: { "content-type": "application/json" },
     ...init,
+    headers: { "content-type": "application/json", ...lanAuthHeaders(), ...(init?.headers ?? {}) },
   });
   const body = await res.json().catch(() => ({}));
+  if (res.status === 401) {
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(
+        new CustomEvent("omb:unauthorized", { detail: body.error || "Authentication required" }),
+      );
+    }
+  }
   if (!res.ok) throw new Error(body.error ?? `${res.status} ${res.statusText}`);
   return body;
 }
@@ -1076,6 +1189,9 @@ const StoreContext = createContext<{
 } | null>(null);
 
 export function StoreProvider({ children }: { children: ReactNode }) {
+  useEffect(() => {
+    consumeLanAuthTokenFromLocation();
+  }, []);
   const [state, rawDispatch] = useReducer(reducer, initialState);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -1161,9 +1277,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     };
     // fire-and-forget card persistence; the route is optional server-side
     const persistCard = (botId: string, messageId: string, patch: Partial<OptionCardData>) => {
-      fetch(`/api/bots/${botId}/cards/${messageId}`, {
+      api(`/api/bots/${botId}/cards/${messageId}`, {
         method: "PATCH",
-        headers: { "content-type": "application/json" },
         body: JSON.stringify(patch),
       }).catch(() => {});
     };
@@ -1328,9 +1443,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             .catch(showError);
           break;
         }
-        case "deleteBot":
+        case "deleteBot": {
+          const pending = patchTimers.current.get(action.botId);
+          if (pending) {
+            clearTimeout(pending.timer);
+            patchTimers.current.delete(action.botId);
+          }
           api(`/api/bots/${action.botId}`, { method: "DELETE" }).catch(showError);
           break;
+        }
         case "markUnread":
           api(`/api/bots/${action.botId}`, { method: "PATCH", body: JSON.stringify({ unread: true }) }).catch(
             () => {},
@@ -1426,6 +1547,26 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     return wrapped;
   }, [botPatchQueue]);
 
+  const [authToken, setAuthToken] = useState(() => readLanAuthToken());
+
+  useEffect(() => {
+    const onAuthChange = (e: Event) => {
+      const custom = e as CustomEvent<string>;
+      setAuthToken(custom.detail ?? readLanAuthToken());
+      rawDispatch({ type: "authRequired", required: false, error: null });
+    };
+    const onUnauthorized = (e: Event) => {
+      const custom = e as CustomEvent<string>;
+      rawDispatch({ type: "authRequired", required: true, error: custom.detail });
+    };
+    window.addEventListener("omb:auth-change", onAuthChange);
+    window.addEventListener("omb:unauthorized", onUnauthorized);
+    return () => {
+      window.removeEventListener("omb:auth-change", onAuthChange);
+      window.removeEventListener("omb:unauthorized", onUnauthorized);
+    };
+  }, []);
+
   // ── initial load + SSE fold ──────────────────────────────────────────
   useEffect(() => {
     let alive = true;
@@ -1439,7 +1580,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               groups: groups ?? [],
               computerControl: computerControl ?? {},
             }))
-          .catch(() => {}),
+          .catch((err) => {
+            if (err?.message?.toLowerCase().includes("unauthorized") || err?.message?.includes("401")) {
+              if (alive) rawDispatch({ type: "authRequired", required: true, error: err.message });
+            }
+          }),
         api("/api/instances")
           .then(({ instances }) => alive && rawDispatch({ type: "instances", instances }))
           .catch(() => {}),
@@ -1490,12 +1635,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // gap before that connection opened.
     const hydrationFallback = setTimeout(hydrate, 1_000);
 
-    const es = new EventSource("/api/events");
+    const es = new EventSource(eventsUrl("/api/events"));
     // The hydrate decision belongs to the hello frame, not to onopen: the
     // server replays what we missed when it can, and re-downloading every
     // transcript on a reconnect it already covered is pure waste.
     es.onopen = () => rawDispatch({ type: "connected", value: true });
-    es.onerror = () => rawDispatch({ type: "connected", value: false });
+    es.onerror = () => {
+      rawDispatch({ type: "connected", value: false });
+      if (readLanAuthToken()) {
+        api("/api/instances").catch((err) => {
+          if (
+            alive &&
+            (String(err?.message).includes("401") || String(err?.message).toLowerCase().includes("unauthorized"))
+          ) {
+            rawDispatch({ type: "authRequired", required: true, error: "Invalid access token" });
+          }
+        });
+      }
+    };
     handleFrame = (frame) => {
       switch (frame.kind) {
         case "message": {
@@ -1539,9 +1696,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // reading the selected chat clears its badge immediately
           if (bot.unread && bot.id === stateRef.current.selectedId) {
             bot.unread = false;
-            fetch(`/api/bots/${bot.id}`, {
+            api(`/api/bots/${bot.id}`, {
               method: "PATCH",
-              headers: { "content-type": "application/json" },
               body: JSON.stringify({ unread: false }),
             }).catch(() => {});
           }
@@ -1556,9 +1712,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // reading the selected room clears its badge immediately
           if (group.unread && group.id === stateRef.current.selectedId) {
             group.unread = false;
-            fetch(`/api/groups/${group.id}`, {
+            api(`/api/groups/${group.id}`, {
               method: "PATCH",
-              headers: { "content-type": "application/json" },
               body: JSON.stringify({ unread: false }),
             }).catch(() => {});
           }
@@ -1677,7 +1832,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       clearTimeout(hydrationFallback);
       es.close();
     };
-  }, []);
+  }, [authToken]);
 
   // Re-probe the engines on demand. A CLI installed while the app is running
   // is invisible until something asks again — the setup screens expose this

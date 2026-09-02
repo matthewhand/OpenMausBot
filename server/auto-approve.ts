@@ -15,7 +15,7 @@ const DESTRUCTIVE = [
   /\bmkfs\b|\bdiskutil\s+erase|\bdd\s+[^|]*\bof=\/dev\//i,
   /\bshutdown\b|\breboot\b|\bhalt\b/i,
   /:\(\)\s*\{.*\}\s*;?\s*:/, // fork bomb
-  /\bgit\s+push\s+[^|]*--force(-with-lease)?\b|\bgit\s+reset\s+--hard\b/i,
+  /\bgit\s+push\s+[^|]*(?:--force(?:-with-lease)?|-f\b)|\bgit\s+reset\s+--hard\b/i,
   /\bDROP\s+(TABLE|DATABASE)\b|\bTRUNCATE\s+TABLE\b/i,
   /\bsudo\s+rm\b|\bchmod\s+-R\s+777\s+\//i,
 ];
@@ -56,7 +56,18 @@ export function looksDestructive(text: string): boolean {
  * `Bash:git`, `Bash:npm` — so the grant is as narrow as the thing you
  * actually looked at. Computed once, server-side, and echoed back by the
  * client so the two sides can never disagree about what was granted. */
-const COMMAND_TOOLS = new Set(["bash", "shell", "execute", "run_command", "computer_exec", "terminal"]);
+const COMMAND_TOOLS = new Set([
+  "bash",
+  "shell",
+  "execute",
+  "run_command",
+  "computer_exec",
+  "execute_shell_cmd",
+  "execute_shell_command",
+  "exec_command",
+  "run_shell_cmd",
+  "terminal",
+]);
 
 export function approvalKey(tool: string, summary: string, scope?: "local-computer"): string {
   const bare = tool.replace(/^mcp__[^_]+__/, "").toLowerCase();
@@ -65,7 +76,7 @@ export function approvalKey(tool: string, summary: string, scope?: "local-comput
   const words = summary.trim().split(/\s+/);
   let i = 0;
   while (i < words.length && (/^[A-Z_][A-Z0-9_]*=/.test(words[i]) || words[i] === "sudo")) i += 1;
-  const program = (words[i] ?? "").split("/").pop()?.replace(/[^\w.-]/g, "") ?? "";
+  const program = (words[i] ?? "").split(/[/\\]/).pop()?.replace(/[^\w.-]/g, "") ?? "";
   const key = program ? `${tool}:${program}` : tool;
   return scope ? `${scope}:${key}` : key;
 }
@@ -172,4 +183,14 @@ export function autoDecision(
   },
 ): string | null {
   return autoVerdict(bot, tool, summary, context).approve;
+}
+
+/** Per-turn Auto: the bot's Auto switch is on, and this turn is not driving
+ * the user's host desktop (that path still needs the interactive broker).
+ * No LLM review — Auto means the engine should stop asking. */
+export function turnRunsFullAuto(turn: {
+  autoApprove?: boolean;
+  integrations?: { localComputer?: { scope?: string } };
+}): boolean {
+  return turn.autoApprove === true && turn.integrations?.localComputer?.scope !== "local-computer";
 }

@@ -11,16 +11,22 @@
 // under ~/.openmausbot (server/harness/bus.ts, server/drivers/native.ts).
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Bug, ChevronDown, ChevronRight, RefreshCw, X } from "lucide-react";
-import { useStore, type Bot } from "@/state/store";
+import { useStore } from "@/state/store";
 import { cn } from "@/lib/cn";
-import { formatTime, toRows, type InspectorEntry, type InspectorPage, type InspectorRow } from "@/lib/inspector";
+import {
+  formatTime,
+  matchInspectorTool,
+  toRows,
+  type InspectorEntry,
+  type InspectorPage,
+  type InspectorRow,
+} from "@/lib/inspector";
 import type { RuntimeEvent } from "../../server/contracts.ts";
 
 type Lens = "events" | "raw";
 
-export function InspectorPanel({ bot }: { bot: Bot }) {
-  const { dispatch } = useStore();
-  const threadId = bot.threadId;
+export function InspectorPanel({ threadId }: { threadId: string }) {
+  const { state, dispatch } = useStore();
   const [lens, setLens] = useState<Lens>("events");
   const [page, setPage] = useState<InspectorPage | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -89,11 +95,41 @@ export function InspectorPanel({ bot }: { bot: Bot }) {
     };
   }, [threadId, load]);
 
-  const entries = useMemo(
-    () => (page ? page.entries.filter((e) => (lens === "raw" ? e.kind === "native" : e.kind === "runtime")) : []),
-    [page, lens],
+  const eventRows = useMemo(
+    () => toRows((page?.entries ?? []).filter((entry) => entry.kind === "runtime")),
+    [page],
   );
-  const rows = useMemo(() => toRows(entries), [entries]);
+  const nativeRows = useMemo(
+    () => toRows((page?.entries ?? []).filter((entry) => entry.kind === "native")),
+    [page],
+  );
+  const rows = lens === "raw" ? nativeRows : eventRows;
+  const shown = rows.length;
+  const total = lens === "raw" ? (page?.total.native ?? 0) : (page?.total.runtime ?? 0);
+
+  useEffect(() => {
+    const focus = state.focusInspector;
+    if (!focus || focus.consumed || focus.threadId !== threadId || !page) return;
+    const hit = matchInspectorTool([...eventRows, ...nativeRows], {
+      itemId: focus.itemId,
+      toolName: focus.toolName,
+      at: focus.at,
+    });
+    if (!hit) {
+      dispatch({ type: "focusInspectorConsumed", nonce: focus.nonce });
+      return;
+    }
+    if (hit.lens !== lens) {
+      setLens(hit.lens);
+      return;
+    }
+    dispatch({ type: "focusInspectorConsumed", nonce: focus.nonce });
+    stickToBottom.current = false;
+    setExpanded(new Set([hit.row.key]));
+    requestAnimationFrame(() => {
+      document.getElementById(`inspector-row-${hit.row.key}`)?.scrollIntoView({ block: "center" });
+    });
+  }, [dispatch, eventRows, lens, nativeRows, page, state.focusInspector, threadId]);
 
   // follow the tail unless the user has scrolled up to read
   useEffect(() => {
@@ -113,9 +149,6 @@ export function InspectorPanel({ bot }: { bot: Bot }) {
       else next.add(key);
       return next;
     });
-
-  const shown = entries.length;
-  const total = lens === "raw" ? (page?.total.native ?? 0) : (page?.total.runtime ?? 0);
 
   return (
     <aside className="animate-panel-in flex h-full w-[460px] shrink-0 flex-col border-l border-hairline/40 bg-panel">
@@ -164,7 +197,12 @@ export function InspectorPanel({ bot }: { bot: Bot }) {
           </div>
         )}
         {rows.map((row) => (
-          <Row key={row.key} row={row} open={expanded.has(row.key)} onToggle={() => toggle(row.key)} />
+          <Row
+            key={row.key}
+            row={row}
+            open={expanded.has(row.key)}
+            onToggle={() => toggle(row.key)}
+          />
         ))}
       </div>
     </aside>
@@ -174,8 +212,10 @@ export function InspectorPanel({ bot }: { bot: Bot }) {
 function Row({ row, open, onToggle }: { row: InspectorRow; open: boolean; onToggle: () => void }) {
   return (
     <div
+      id={`inspector-row-${row.key}`}
       className={cn(
         "border-b border-hairline/20",
+        open && "ring-1 ring-inset ring-accent/40",
         row.tone === "boundary" && "bg-raised/40",
         row.tone === "error" && "bg-danger/10",
       )}
