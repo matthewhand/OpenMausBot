@@ -49,4 +49,14 @@ describe("suggestedModels", () => {
     const options = ["a", "b", "c"].map((id) => ({ id }));
     expect(suggestedModels(options, "b", "b", 3).map((option) => option.id)).toEqual(["b", "a", "c"]);
   });
+
+  it("pins recent picks after the current model and before catalog fill", () => {
+    const options = ["a", "b", "c", "d", "e", "f"].map((id) => ({ id }));
+    expect(suggestedModels(options, "a", "c", 4, ["e", "c", "missing"]).map((option) => option.id)).toEqual([
+      "c",
+      "e",
+      "a",
+      "b",
+    ]);
+  });
 });

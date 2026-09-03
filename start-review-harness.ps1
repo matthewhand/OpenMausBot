@@ -11,4 +11,8 @@ if (-not (Listening 8800)) {
 }
 if (-not (Listening 8802)) {
   Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$ui) -WindowStyle Hidden
+} elseif (-not (Listening 5199)) {
+  # Vite is already up; still restore the historical LAN port.
+  $node = 'C:\Progra~1\nodejs\node.exe'
+  Start-Process -FilePath $node -ArgumentList @('scripts\review-ui-alias.mjs') -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -RedirectStandardOutput 'C:\OpenMausBot-review-data\ui-alias-5199.out.log' -RedirectStandardError 'C:\OpenMausBot-review-data\ui-alias-5199.err.log'
 }

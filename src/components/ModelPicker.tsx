@@ -1,11 +1,20 @@
 // Compact model picker: providers live on a Cloud/Local rail. Ready engines
 // show a short suggested list with search and an explicit all-models view;
 // engines that need setup show one focused action instead of a disabled wall.
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Check, ChevronDown, ChevronLeft, ChevronRight, Search } from "lucide-react";
 import { useStore, type Bot, type InstanceInfo, type ModelSelection } from "@/state/store";
 import { filterCustomModels, partitionCustomModels, suggestedModels } from "@/lib/custom-models";
 import { isCustomOnly, splitEngineRail } from "@/lib/engine-rail";
+import {
+  loadRecentModelPicks,
+  rankEngineRail,
+  recentInstanceIds,
+  recentModelIdsFor,
+  rememberModelPick,
+  saveRecentModelPicks,
+  seedRecentModelPicks,
+} from "@/lib/model-picker-recency";
 import { ProviderMark } from "./ProviderIcons";
 import { EngineSetup, needsCli, needsSignIn } from "./EngineSetup";
 import { EngineGroupLabel } from "./EngineGroupLabel";
@@ -29,15 +38,21 @@ function engineStatus(instance: InstanceInfo): string {
   return instance.snapshot.version ?? "Ready";
 }
 
+function engineReady(instance: InstanceInfo): boolean {
+  return !needsCli(instance) && !needsSignIn(instance);
+}
+
 function ModelRow({
   option,
   current,
   defaultId,
+  recent,
   onPick,
 }: {
   option: ModelOption;
   current: boolean;
   defaultId: string;
+  recent: boolean;
   onPick: () => void;
 }) {
   return (
@@ -61,6 +76,9 @@ function ModelRow({
         )}
         {option.id === defaultId && (
           <span className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary">Default</span>
+        )}
+        {recent && option.id !== defaultId && (
+          <span className="shrink-0 rounded bg-accent/10 px-1.5 py-px text-[10px] text-accent">Recent</span>
         )}
         {option.loaded && (
           <span className="shrink-0 rounded bg-accent/10 px-1.5 py-px text-[10px] text-accent">Loaded</span>
@@ -122,12 +140,27 @@ export function ModelPicker({
   const [pane, setPane] = useState<"main" | "custom">("main");
   const [query, setQuery] = useState("");
   const [showAll, setShowAll] = useState(false);
+  const [storedRecents, setStoredRecents] = useState(loadRecentModelPicks);
   const rootRef = useRef<HTMLDivElement>(null);
 
   const selection = bot.modelSelection;
+  const recents = useMemo(
+    () =>
+      seedRecentModelPicks(
+        storedRecents,
+        state.bots.map((candidate) => candidate.modelSelection),
+      ),
+    [storedRecents, state.bots],
+  );
+  const recentEngines = useMemo(() => recentInstanceIds(recents), [recents]);
+  const recentEngineSet = useMemo(() => new Set(recentEngines), [recentEngines]);
   const active = state.instances.find((instance) => instance.instanceId === selection.instanceId);
   const railInstance =
     state.instances.find((instance) => instance.instanceId === (railId ?? selection.instanceId)) ?? state.instances[0];
+  const recentModels = useMemo(
+    () => new Set(recentModelIdsFor(recents, railInstance?.instanceId ?? selection.instanceId)),
+    [recents, railInstance?.instanceId, selection.instanceId],
+  );
 
   useEffect(() => {
     if (open) void refreshInstances();
@@ -181,6 +214,9 @@ export function ModelPicker({
       model,
     };
     if (sameInstance && selection.effort) nextSelection.effort = selection.effort;
+    const nextRecents = rememberModelPick(storedRecents, instance.instanceId, model);
+    setStoredRecents(nextRecents);
+    saveRecentModelPicks(nextRecents);
     dispatch({
       type: "setModel",
       botId: bot.id,
@@ -193,10 +229,27 @@ export function ModelPicker({
   const custom = railInstance?.models.options.filter((option) => option.custom) ?? [];
   const currentModel = selection.instanceId === railInstance?.instanceId ? selection.model : undefined;
   const filteredOfficial = filterCustomModels(official, query);
+  const recentOfficialIds = railInstance ? recentModelIdsFor(recents, railInstance.instanceId) : [];
   const compactOfficial = railInstance
-    ? suggestedModels(official, railInstance.models.default, currentModel, COMPACT_MODEL_COUNT)
+    ? suggestedModels(
+        official,
+        railInstance.models.default,
+        currentModel,
+        COMPACT_MODEL_COUNT,
+        recentOfficialIds,
+      )
     : [];
-  const shownOfficial = query ? filteredOfficial : showAll ? official : compactOfficial;
+  const shownOfficial = query
+    ? filteredOfficial
+    : railInstance
+      ? suggestedModels(
+          official,
+          railInstance.models.default,
+          currentModel,
+          showAll ? official.length : COMPACT_MODEL_COUNT,
+          recentOfficialIds,
+        )
+      : [];
   const filteredCustom = filterCustomModels(custom, query);
   const { pinned, rest } = partitionCustomModels(filteredCustom);
   const blocked = railInstance
@@ -213,6 +266,7 @@ export function ModelPicker({
       option={option}
       current={selection.instanceId === railInstance?.instanceId && selection.model === option.id}
       defaultId={railInstance?.models.default ?? ""}
+      recent={recentModels.has(option.id)}
       onPick={() => railInstance && pick(railInstance, option.id)}
     />
   );
@@ -289,26 +343,35 @@ export function ModelPicker({
           <div className="flex w-14 shrink-0 flex-col gap-1 overflow-y-auto border-r border-hairline/40 bg-panel p-2">
             {(() => {
               const { subscription, custom: local } = splitEngineRail(state.instances);
+              const rankedSubscription = rankEngineRail(subscription, recentEngines, engineReady);
+              const rankedLocal = rankEngineRail(local, recentEngines, engineReady);
               const railButton = (instance: InstanceInfo) => {
                 const selected = instance.instanceId === railInstance?.instanceId;
                 const attention = needsCli(instance) || needsSignIn(instance);
+                const recent = recentEngineSet.has(instance.instanceId);
                 return (
                   <button
                     type="button"
                     key={instance.instanceId}
                     onClick={() => selectRail(instance)}
-                    aria-label={instance.displayName}
+                    aria-label={
+                      recent
+                        ? `${instance.displayName} (recent)`
+                        : instance.displayName
+                    }
                     aria-pressed={selected}
-                    title={`${instance.displayName} · ${engineStatus(instance)}`}
+                    title={`${instance.displayName} · ${engineStatus(instance)}${recent ? " · Recent" : ""}`}
                     className={cn(
                       "relative flex size-9 items-center justify-center rounded-lg",
                       selected ? "bg-control ring-1 ring-hairline/50" : "hover:bg-control/60",
                     )}
                   >
                     <ProviderMark driverKind={instance.driverKind} size={18} />
-                    {attention && (
+                    {attention ? (
                       <span className="absolute bottom-0.5 right-0.5 size-1.5 rounded-full bg-warning ring-2 ring-panel" />
-                    )}
+                    ) : recent ? (
+                      <span className="absolute top-0.5 right-0.5 size-1.5 rounded-full bg-accent ring-2 ring-panel" />
+                    ) : null}
                   </button>
                 );
               };
@@ -317,11 +380,11 @@ export function ModelPicker({
                   {subscription.length > 0 && (
                     <EngineGroupLabel className="px-0 pb-0.5 pt-0.5 text-center text-[9px]">Cloud</EngineGroupLabel>
                   )}
-                  {subscription.map(railButton)}
+                  {rankedSubscription.map(railButton)}
                   {local.length > 0 && (
                     <EngineGroupLabel className="px-0 pb-0.5 pt-2 text-center text-[9px]">Local</EngineGroupLabel>
                   )}
-                  {local.map(railButton)}
+                  {rankedLocal.map(railButton)}
                 </>
               );
             })()}
