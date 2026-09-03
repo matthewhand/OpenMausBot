@@ -27,14 +27,15 @@ export function partitionCustomModels<T extends { id: string; loaded?: boolean }
   return { pinned, rest };
 }
 
-/** Keep the active and default choices visible, then fill the compact list
- * from catalog order. Catalog order is provider-owned and already reflects
- * its preferred/current models. */
+/** Keep the active, recently picked, and default choices visible, then fill
+ * the compact list from catalog order. Catalog order is provider-owned and
+ * already reflects its preferred/current models. */
 export function suggestedModels<T extends { id: string }>(
   options: readonly T[],
   defaultId: string,
   currentId: string | undefined,
   limit = 5,
+  recentIds: readonly string[] = [],
 ): T[] {
   const picked: T[] = [];
   const seen = new Set<string>();
@@ -44,6 +45,7 @@ export function suggestedModels<T extends { id: string }>(
     picked.push(option);
   };
   add(currentId ? options.find((option) => option.id === currentId) : undefined);
+  for (const id of recentIds) add(options.find((option) => option.id === id));
   add(options.find((option) => option.id === defaultId));
   for (const option of options) add(option);
   return picked;

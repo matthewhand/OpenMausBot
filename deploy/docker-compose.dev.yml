@@ -1,0 +1,37 @@
+# Dev OpenMausBot: Node 24 image, no Caddy, host folder bind-mounted.
+#
+#   cp .env.example .env    # set OMB_DEV_HOME; OMB_AUTH_TOKEN optional on a trusted LAN
+#   docker compose -f docker-compose.dev.yml up -d --build
+#
+# OMB_DEV_HOME defaults to the login home. Set it to a subfolder to sandbox.
+# The server binds OMB_HOST (default 0.0.0.0) so published ports actually reach it.
+
+services:
+  omb:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        ENGINES: ${ENGINES:-}
+    image: openmausbot:dev
+    restart: unless-stopped
+    user: "${OMB_DEV_UID:-1000}:${OMB_DEV_GID:-1000}"
+    environment:
+      HOME: /host-home
+      OMB_DATA_DIR: /host-home/${OMB_DATA_SUBDIR:-.openmausbot}
+      OMB_STATIC_DIR: /app/dist
+      OMB_PORT: ${OMB_PORT:-8802}
+      OMB_HOST: ${OMB_HOST:-0.0.0.0}
+      OMB_AUTH_TOKEN: ${OMB_AUTH_TOKEN:-}
+      OMB_CORS_ORIGIN: ${OMB_CORS_ORIGIN:-*}
+      OMB_WEBHOOK_PORT: ${OMB_WEBHOOK_PORT:-8800}
+    volumes:
+      - ${OMB_DEV_HOME:?set OMB_DEV_HOME in deploy/.env}:/host-home
+    ports:
+      - "${OMB_PORT:-8802}:${OMB_PORT:-8802}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:${OMB_PORT:-8802}/api/health | grep -q openmausbot"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3

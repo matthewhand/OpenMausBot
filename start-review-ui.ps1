@@ -22,12 +22,34 @@ function Get-ListenPid([int]$Port) {
     return $null
 }
 
+function Start-ReviewUiAlias {
+    $aliasPort = 5199
+    $existingAlias = Get-ListenPid $aliasPort
+    if ($existingAlias) {
+        $aliasProc = Get-CimInstance Win32_Process -Filter "ProcessId=$existingAlias" -ErrorAction SilentlyContinue
+        $aliasCmd = [string]$aliasProc.CommandLine
+        if ($aliasCmd -match 'review-ui-alias') {
+            Write-ReviewUiLog "UI alias already on $aliasPort pid $existingAlias"
+            return
+        }
+        Write-ReviewUiLog "port $aliasPort busy by pid $existingAlias; not starting alias"
+        return
+    }
+    $aliasOut = 'C:\OpenMausBot-review-data\ui-alias-5199.out.log'
+    $aliasErr = 'C:\OpenMausBot-review-data\ui-alias-5199.err.log'
+    Start-Process -FilePath $node -ArgumentList @('scripts\review-ui-alias.mjs') -WorkingDirectory 'C:\OpenMausBot-src' -WindowStyle Hidden -RedirectStandardOutput $aliasOut -RedirectStandardError $aliasErr
+    Write-ReviewUiLog "started UI alias 5199 -> 8802"
+}
+
+$node = 'C:\Progra~1\nodejs\node.exe'
+
 $existing = Get-ListenPid 8802
 if ($existing) {
     $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$existing" -ErrorAction SilentlyContinue
     $cmd = [string]$proc.CommandLine
     if ($cmd -match 'vite\.js' -and $cmd -match '8802') {
         Write-ReviewUiLog "correct review UI already on 8802 pid $existing; waiting instead of starting a second copy"
+        Start-ReviewUiAlias
         Wait-Process -Id $existing -ErrorAction SilentlyContinue
     }
 }
@@ -41,5 +63,5 @@ for ($i = 0; $i -lt 30; $i++) {
     }
 }
 
-$node = 'C:\Progra~1\nodejs\node.exe'
+Start-ReviewUiAlias
 & $node node_modules\vite\bin\vite.js --host 0.0.0.0 --port 8802 *>> $log
