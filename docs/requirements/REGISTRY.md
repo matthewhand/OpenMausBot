@@ -12,3 +12,4 @@
 | REQ-008 | Copy Windows review chats onto ubuntu-max bots | DONE | 2026-09-03 | 0 | Engineering |
 | REQ-009 | LiteLLM OpenAI-compat engines on .30 .32 .36 | DONE | 2026-09-03 | 0 | Engineering |
 | REQ-010 | Squash-merge fork PR and sync .30/.32/.36 | IN_PROGRESS | 2026-09-03 | 0 | Engineering |
+| REQ-011 | Console Vite paint + per-item Hide (Issue #27) | IN_PROGRESS | 2026-09-10 | 0 | grok proxy CLI CoS |

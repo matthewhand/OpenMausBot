@@ -1055,6 +1055,49 @@ describe("harness HTTP API", () => {
     expect((await api("DELETE", "/api/groups/test-pinned-room")).status).toBe(200);
   });
 
+  it("hides and unhides a room via PATCH without archiving members", async () => {
+    const { body } = await api("GET", "/api/bots");
+    const created = await api("POST", "/api/groups", { name: "Sidebar hide", memberIds: [body.bots[0].id] });
+    expect(created.status).toBe(201);
+    const groupId = created.body.group.id;
+    try {
+      const hidden = await api("PATCH", `/api/groups/${groupId}`, { hidden: true });
+      expect(hidden.status).toBe(200);
+      expect(hidden.body.group.hidden).toBe(true);
+      const afterHide = await api("GET", "/api/bots");
+      expect(afterHide.body.groups.find((group: { id: string }) => group.id === groupId).hidden).toBe(true);
+      expect(afterHide.body.bots.find((bot: { id: string }) => bot.id === body.bots[0].id).hidden).toBeFalsy();
+
+      const shown = await api("PATCH", `/api/groups/${groupId}`, { hidden: false });
+      expect(shown.status).toBe(200);
+      expect(shown.body.group.hidden).toBe(false);
+    } finally {
+      expect((await api("DELETE", `/api/groups/${groupId}`)).status).toBe(200);
+    }
+  });
+
+  it("tucks a bot from the sidebar without archiving it", async () => {
+    const created = await api("POST", "/api/bots");
+    expect(created.status).toBe(201);
+    const botId = created.body.bot.id;
+    try {
+      const tucked = await api("PATCH", `/api/bots/${botId}`, { sidebarHidden: true });
+      expect(tucked.status).toBe(200);
+      expect(tucked.body.bot.sidebarHidden).toBe(true);
+      expect(tucked.body.bot.hidden).toBeFalsy();
+      const afterHide = await api("GET", "/api/bots");
+      const found = afterHide.body.bots.find((bot: { id: string }) => bot.id === botId);
+      expect(found.sidebarHidden).toBe(true);
+      expect(found.hidden).toBeFalsy();
+
+      const shown = await api("PATCH", `/api/bots/${botId}`, { sidebarHidden: false });
+      expect(shown.status).toBe(200);
+      expect(shown.body.bot.sidebarHidden).toBe(false);
+    } finally {
+      expect((await api("DELETE", `/api/bots/${botId}`)).status).toBe(200);
+    }
+  });
+
   it("renames rooms through a bounded non-empty name", async () => {
     const bot = (await api("POST", "/api/bots")).body.bot;
     const room = (await api("POST", "/api/groups", { name: "Old room", memberIds: [bot.id] })).body.group;

@@ -212,6 +212,8 @@ export interface GroupRecord {
    * and remain immediately usable. */
   setupCompletedAt?: number | null;
   setupSkippedAt?: number | null;
+  /** Tucked out of the sidebar main list. Rooms have no archive path. */
+  hidden?: boolean;
 }
 
 /** One task = one conversation with its own context.
@@ -457,6 +459,8 @@ export interface BotRecord {
   rewound?: boolean;
   pinned?: boolean;
   hidden?: boolean;
+  /** Tucked into the sidebar Hidden section. Distinct from `hidden` (archive). */
+  sidebarHidden?: boolean;
   /** Optional labeled divider used to organize this bot in the sidebar. */
   section?: string;
   /** the one message pinned to the top of this bot's active thread; a pin
@@ -885,7 +889,7 @@ export class Store {
     );
   }
 
-  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd" | "pinnedMessageId" | "section" | "setupCompletedAt" | "setupSkippedAt">>): GroupRecord | null {
+  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd" | "pinnedMessageId" | "section" | "setupCompletedAt" | "setupSkippedAt" | "hidden">>): GroupRecord | null {
     const group = this.group(id);
     if (!group) return null;
     Object.assign(group, patch);

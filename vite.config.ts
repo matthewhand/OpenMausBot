@@ -1,8 +1,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { defineConfig } from "vitest/config";
+import type { Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { withViteSotHealth } from "./server/health-payload";
 
 function reviewHttps() {
   const key = process.env.OMB_UI_TLS_KEY;
@@ -12,8 +15,36 @@ function reviewHttps() {
   return { key: readFileSync(key), cert: readFileSync(cert) };
 }
 
+/** Vite is the Console SoT: `/api/health` on this port must report static:false
+ * even when the API process has a leftover dist or OMB_STATIC_DIR. */
+function viteHealthSotPlugin(): Plugin {
+  const apiPort = process.env.OMB_PORT || process.env.OGB_PORT || 8799;
+  return {
+    name: "omb-vite-health-sot",
+    configureServer(server) {
+      server.middlewares.use((req: IncomingMessage, res: ServerResponse, next: (err?: unknown) => void) => {
+        const path = req.url?.split("?")[0];
+        if (req.method !== "GET" || path !== "/api/health") {
+          next();
+          return;
+        }
+        void fetch(`http://127.0.0.1:${apiPort}/api/health`)
+          .then(async (upstream) => {
+            const raw = (await upstream.json().catch(() => ({}))) as Record<string, unknown>;
+            const payload = withViteSotHealth(raw);
+            const data = JSON.stringify(payload);
+            res.statusCode = upstream.status;
+            res.setHeader("content-type", "application/json");
+            res.end(data);
+          })
+          .catch(() => next());
+      });
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), viteHealthSotPlugin()],
   test: {
     environment: "node",
     include: [

@@ -58,6 +58,7 @@ import {
   snapshotAvatarGenerationState,
 } from "./avatar-image.ts";
 import { parseBotProfilePatch } from "./bot-profile.ts";
+import { healthPayload } from "./health-payload.ts";
 import { groupTurnCwd } from "./room-cwd.ts";
 import { RoomTurnDeadline, RoomTurnStallRegistry, roomTurnTimeoutMessage } from "./room-turn-timeout.ts";
 import * as box from "./box.ts";
@@ -7138,6 +7139,10 @@ const server = createServer(async (req, res) => {
           patch.pinnedMessageId = body.pinnedMessageId;
         } else return json(res, 400, { error: "pinnedMessageId must be a message id" });
       }
+      if (body.hidden !== undefined) {
+        if (typeof body.hidden !== "boolean") return json(res, 400, { error: "hidden must be true or false" });
+        patch.hidden = body.hidden;
+      }
       // same contract as a bot's sidebar section: null/"" clears, 60 chars max
       if (body.section !== undefined) {
         if (body.section === null) patch.section = undefined;
@@ -7508,7 +7513,7 @@ const server = createServer(async (req, res) => {
           else section = trimmed;
         }
       }
-      for (const key of ["unread", "computer", "cloudBackend", "color", "mascotExpression", "mascotBody", "pinned", "hidden"] as const) {
+      for (const key of ["unread", "computer", "cloudBackend", "color", "mascotExpression", "mascotBody", "pinned", "hidden", "sidebarHidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
       if (normalizedSelection) patch.modelSelection = normalizedSelection;
@@ -7576,6 +7581,9 @@ const server = createServer(async (req, res) => {
         const checked = validateBotCwd(body.cwd);
         if (!checked.ok) return json(res, 400, { error: checked.error });
         patch.cwd = checked.cwd ?? undefined;
+      }
+      if (body.sidebarHidden !== undefined && typeof body.sidebarHidden !== "boolean") {
+        return json(res, 400, { error: "sidebarHidden must be true or false" });
       }
       if (body.hidden === true && existingBot?.chiefOfStaff && body.chiefOfStaff !== false) {
         return json(res, 400, { error: "choose another Chief of Staff before hiding this bot" });
@@ -8467,12 +8475,11 @@ const server = createServer(async (req, res) => {
     // child proves it is OURS by echoing its pid (a stray dev server has
     // the same API shape but a different pid)
     if (method === "GET" && path === "/api/health") {
-      return json(res, 200, {
-        app: "openmausbot",
+      return json(res, 200, healthPayload({
         pid: process.pid,
-        static: Boolean(STATIC_DIR),
+        staticDirConfigured: Boolean(process.env.OMB_STATIC_DIR),
         authRequired: isLanAuthRequired(req),
-      });
+      }));
     }
     // Which edition this server runs and why (see server/enterprise.ts). Read-only.
     if (method === "GET" && path === "/api/edition") {
