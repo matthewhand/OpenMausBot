@@ -8,6 +8,8 @@ import {
   Bot as BotIcon,
   CalendarDays,
   Check,
+  ChevronDown,
+  ChevronRight,
   ClipboardCopy,
   Copy,
   Crown,
@@ -58,6 +60,12 @@ import {
   type SidebarDensity,
 } from "@/lib/sidebar-preferences";
 import { partitionChannelGroups } from "@/lib/sidebar-groups";
+import {
+  hiddenSidebarBots,
+  hiddenSidebarGroups,
+  visibleSidebarBots,
+  visibleSidebarGroups,
+} from "@/lib/sidebar-hide";
 import {
   BOT_CHATS_SECTION_ID,
   BOTS_SECTION_ID,
@@ -242,10 +250,12 @@ function GroupListItem({
   group,
   density,
   onMenu,
+  onUnhide,
 }: {
   group: Group;
   density: SidebarDensity;
   onMenu: (menu: { groupId: string; x: number; y: number }) => void;
+  onUnhide?: (group: Group) => void;
 }) {
   const { state, dispatch } = useStore();
   const selected = state.activeView === "chat" && state.selectedId === group.id;
@@ -253,7 +263,9 @@ function GroupListItem({
     .map((id) => state.bots.find((b) => b.id === id))
     .filter((b): b is Bot => Boolean(b));
   const last = group.messages.at(-1);
+  const iconOnly = density === "icons";
   return (
+    <div className="group relative">
     <button
       onClick={() => dispatch({ type: "select", id: group.id })}
       onContextMenu={(e) => {
@@ -271,14 +283,15 @@ function GroupListItem({
       }}
       className={cn(
         "relative flex w-full items-center rounded-xl text-left",
-        density === "icons" ? "justify-center px-1 py-1.5" : density === "compact" ? "gap-2 px-2 py-1.5" : "gap-3 px-3 py-2.5",
+        iconOnly ? "justify-center px-1 py-1.5" : density === "compact" ? "gap-2 px-2 py-1.5" : "gap-3 px-3 py-2.5",
+        onUnhide && !iconOnly && "pr-10",
         selected ? "bg-raised" : "hover:bg-raised/50",
       )}
-      title={density === "icons" ? group.name : undefined}
-      aria-label={density === "icons" ? group.name : undefined}
+      title={iconOnly ? group.name : undefined}
+      aria-label={iconOnly ? group.name : undefined}
     >
       <StackedMauses members={members} density={density} />
-      <div className={cn("min-w-0 flex-1", density === "icons" && "hidden")}>
+      <div className={cn("min-w-0 flex-1", iconOnly && "hidden")}>
         <div className="flex items-baseline justify-between gap-2">
           <span className="truncate text-[15px] font-semibold text-ink">{group.name}</span>
           {selected && last && <span className="shrink-0 text-xs text-ink-secondary">{formatTime(last.at)}</span>}
@@ -288,10 +301,22 @@ function GroupListItem({
           {group.unread && <span className="size-2 shrink-0 rounded-full bg-accent" />}
         </div>
       </div>
-      {density === "icons" && group.unread && (
+      {iconOnly && group.unread && (
         <span className="absolute bottom-1.5 right-1.5 size-2 rounded-full border border-panel bg-accent" />
       )}
     </button>
+    {onUnhide && !iconOnly && (
+      <button
+        type="button"
+        onClick={() => onUnhide(group)}
+        aria-label={`Unhide ${group.name}`}
+        title={`Unhide ${group.name}`}
+        className="absolute right-1 top-1/2 flex size-10 -translate-y-1/2 items-center justify-center rounded-lg bg-card/90 text-ink-secondary opacity-0 shadow-sm transition hover:bg-raised hover:text-ink focus:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100 max-md:opacity-100"
+      >
+        <Eye size={14} />
+      </button>
+    )}
+    </div>
   );
 }
 
@@ -331,7 +356,7 @@ function RoomContextMenu({
     if (name) dispatch({ type: "patchGroup", groupId: group.id, patch: { name } });
     onClose();
   };
-  const top = Math.min(menu.y, window.innerHeight - 204);
+  const top = Math.min(menu.y, window.innerHeight - 248);
   const left = Math.min(menu.x, window.innerWidth - 240);
   return createPortal(
     <div
@@ -412,6 +437,23 @@ function RoomContextMenu({
       >
         <ClipboardCopy size={16} className="text-ink-secondary" />
         Copy conversation ID
+      </button>
+      <button
+        onClick={() => {
+          const nextHidden = !group.hidden;
+          dispatch({ type: "patchGroup", groupId: group.id, patch: { hidden: nextHidden } });
+          if (nextHidden && state.selectedId === group.id) {
+            const next =
+              state.groups.find((candidate) => candidate.id !== group.id && !candidate.hidden) ??
+              state.bots.find((candidate) => !candidate.hidden && !candidate.sidebarHidden);
+            if (next) dispatch({ type: "select", id: next.id });
+          }
+          onClose();
+        }}
+        className="flex w-full items-center gap-3 px-3.5 py-2 text-left text-[14px] text-ink hover:bg-raised/70"
+      >
+        {group.hidden ? <Eye size={16} className="text-ink-secondary" /> : <EyeOff size={16} className="text-ink-secondary" />}
+        {group.hidden ? "Unhide" : "Hide from sidebar"}
       </button>
       <button
         onClick={() => {
@@ -664,11 +706,15 @@ function BotContextMenu({
   menu,
   onClose,
   onArchive,
+  onHide,
+  onUnhide,
   onMoveToSection,
 }: {
   menu: MenuState;
   onClose: () => void;
   onArchive: (bot: Bot) => void;
+  onHide: (bot: Bot) => void;
+  onUnhide: (bot: Bot) => void;
   onMoveToSection: (botId: string) => void;
 }) {
   const { state, dispatch } = useStore();
@@ -771,12 +817,17 @@ function BotContextMenu({
         }),
         divider("d3"),
         item(
+          bot.sidebarHidden ? <Eye size={16} className="text-ink-secondary" /> : <EyeOff size={16} className="text-ink-secondary" />,
+          bot.sidebarHidden ? "Unhide" : "Hide from sidebar",
+          () => (bot.sidebarHidden ? onUnhide(bot) : onHide(bot)),
+        ),
+        item(
           <Archive size={16} className="text-ink-secondary" />,
           "Archive",
           () => onArchive(bot),
           {
-            disabled: archiveBlocked,
-            hint: archiveHint,
+            disabled: archiveBlocked || Boolean(bot.sidebarHidden),
+            hint: bot.sidebarHidden ? "Unhide before archiving" : archiveHint,
           },
         ),
         item(<Trash2 size={16} />, "Delete", () => dispatch({ type: "deleteBot", botId: bot.id }), {
@@ -793,12 +844,14 @@ function BotListItem({
   onMenu,
   onArchive,
   archiveDisabled,
+  onUnhide,
 }: {
   bot: Bot;
   density: SidebarDensity;
   onMenu: (menu: MenuState) => void;
   onArchive: (bot: Bot) => void;
   archiveDisabled: boolean;
+  onUnhide?: (bot: Bot) => void;
 }) {
   const { state, dispatch } = useStore();
   const [renaming, setRenaming] = useState(false);
@@ -903,7 +956,12 @@ function BotListItem({
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
             dispatch({ type: "select", id: bot.id });
+            return;
           }
+          if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+          event.preventDefault();
+          const rect = event.currentTarget.getBoundingClientRect();
+          onMenu({ botId: bot.id, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
         }}
         onContextMenu={onContextMenu}
         className={rowClass}
@@ -913,7 +971,18 @@ function BotListItem({
       {iconOnly && bot.unread && (
         <span className="pointer-events-none absolute bottom-1.5 right-1.5 size-2 rounded-full border border-panel bg-accent" />
       )}
-      {!iconOnly && <button
+      {!iconOnly && onUnhide && (
+        <button
+          type="button"
+          onClick={() => onUnhide(bot)}
+          aria-label={`Unhide ${bot.name}`}
+          title={`Unhide ${bot.name}`}
+          className="absolute right-1 top-1/2 flex size-10 -translate-y-1/2 items-center justify-center rounded-lg bg-card/90 text-ink-secondary opacity-0 shadow-sm transition hover:bg-raised hover:text-ink focus:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100 max-md:opacity-100"
+        >
+          <Eye size={14} />
+        </button>
+      )}
+      {!iconOnly && !onUnhide && <button
         type="button"
         disabled={archiveDisabled}
         onClick={() => onArchive(bot)}
@@ -1081,12 +1150,14 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const [teamLibraryOpen, setTeamLibraryOpen] = useState(false);
   const [teamInstallUrl, setTeamInstallUrl] = useState<string | null>(null);
   const [archivedBotsOpen, setArchivedBotsOpen] = useState(false);
+  const [hiddenOpen, setHiddenOpen] = useState(false);
   const [exportingTeam, setExportingTeam] = useState(false);
   const [teamFeedback, setTeamFeedback] = useState<{
     error: boolean;
     text: string;
     undo?: TeamImportResult;
     restoreBot?: { id: string; name: string };
+    unhideBot?: { id: string; name: string };
   } | null>(null);
   const [query, setQuery] = useState("");
   const [density, setDensityState] = useState<SidebarDensity>(() => loadSidebarDensity());
@@ -1268,6 +1339,31 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
     }
   };
 
+  const hideBot = (bot: Bot) => {
+    if (bot.hidden || bot.sidebarHidden) return;
+    dispatch({ type: "updateBot", botId: bot.id, patch: { sidebarHidden: true } });
+    if (state.selectedId === bot.id) {
+      const next = state.bots.find((candidate) => candidate.id !== bot.id && !candidate.hidden && !candidate.sidebarHidden);
+      if (next) dispatch({ type: "select", id: next.id });
+    }
+    setTeamFeedback({
+      error: false,
+      text: `${bot.name} hidden`,
+      unhideBot: { id: bot.id, name: bot.name },
+    });
+  };
+
+  const unhideBot = (bot: { id: string; name: string }) => {
+    dispatch({ type: "updateBot", botId: bot.id, patch: { sidebarHidden: false } });
+    dispatch({ type: "select", id: bot.id });
+    setTeamFeedback(null);
+  };
+
+  const unhideGroup = (group: Group) => {
+    dispatch({ type: "patchGroup", groupId: group.id, patch: { hidden: false } });
+    dispatch({ type: "select", id: group.id });
+  };
+
   const macInset = capabilities.windowChrome === "mac-inset";
   const browser = capabilities.host.label === "Browser";
   // SAFETY: Electron's documented -webkit-app-region CSS property is not in
@@ -1296,17 +1392,25 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
         (b.title ?? "").toLowerCase().includes(q) ||
         preview(b).toLowerCase().includes(q),
     );
+  const tuckedBots = hiddenSidebarBots(matchingBots);
+  const mainBots = visibleSidebarBots(matchingBots);
   const hiddenSidebarBotCount = state.hideSidebarBots
-    ? matchingBots.filter((bot) => !bot.chiefOfStaff).length
+    ? mainBots.filter((bot) => !bot.chiefOfStaff).length
     : 0;
   const listedBots = state.hideSidebarBots
-    ? matchingBots.filter((bot) => bot.chiefOfStaff)
-    : matchingBots;
-  const channels = partitionChannelGroups(state.groups, {
+    ? mainBots.filter((bot) => bot.chiefOfStaff)
+    : mainBots;
+  const matchingGroups = state.groups.filter(
+    (group) =>
+      !q || group.name.toLowerCase().includes(q),
+  );
+  const tuckedGroups = hiddenSidebarGroups(matchingGroups);
+  const channels = partitionChannelGroups(visibleSidebarGroups(matchingGroups), {
     query: q,
     hideInterBot: state.hideInterBotChannels,
   });
   const visibleGroups = channels.visible;
+  const hiddenCount = tuckedBots.length + tuckedGroups.length;
   const {
     unsectionedChief,
     pinnedBots,
@@ -1407,6 +1511,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const archivedBots = state.bots.filter((bot) => bot.hidden);
   const pendingTeamUndo = teamFeedback?.undo;
   const pendingBotUndo = teamFeedback?.restoreBot;
+  const pendingHideUndo = teamFeedback?.unhideBot;
 
   return (
     <aside
@@ -1589,7 +1694,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
       {/* Bot list */}
       <div className="flex-1 overflow-y-auto px-2">
         <div className="flex flex-col gap-0.5">
-          {matchingBots.length === 0 && visibleGroups.length === 0 && q && q.length < MIN_QUERY && (
+          {listedBots.length === 0 && visibleGroups.length === 0 && hiddenCount === 0 && q && q.length < MIN_QUERY && (
             <div className="px-3 py-6 text-center text-[13px] text-ink-secondary">Nothing matches “{query}”</div>
           )}
           {unsectionedChief && (
@@ -1733,6 +1838,44 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
               </span>
             </button>
           )}
+          {hiddenCount > 0 && density !== "icons" && (
+            <div className="mt-2">
+              <button
+                type="button"
+                aria-expanded={hiddenOpen}
+                onClick={() => setHiddenOpen((open) => !open)}
+                className="flex w-full items-center gap-1.5 rounded-lg px-3 py-2 text-left text-[12.5px] font-medium text-ink-secondary hover:bg-raised/50 hover:text-ink"
+              >
+                {hiddenOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                Hidden
+                <span className="text-[11.5px] font-normal">{hiddenCount}</span>
+              </button>
+              {hiddenOpen && (
+                <div className="flex flex-col gap-0.5">
+                  {tuckedGroups.map((group) => (
+                    <GroupListItem
+                      key={group.id}
+                      group={group}
+                      density={density}
+                      onMenu={setRoomMenu}
+                      onUnhide={unhideGroup}
+                    />
+                  ))}
+                  {tuckedBots.map((bot) => (
+                    <BotListItem
+                      key={bot.id}
+                      bot={bot}
+                      density={density}
+                      onMenu={setMenu}
+                      onArchive={(candidate) => void archiveBot(candidate)}
+                      archiveDisabled
+                      onUnhide={unhideBot}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           <SearchResults query={query} onLanded={() => setQuery("")} />
         </div>
       </div>
@@ -1835,6 +1978,8 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
           menu={menu}
           onClose={() => setMenu(null)}
           onArchive={(bot) => void archiveBot(bot)}
+          onHide={hideBot}
+          onUnhide={unhideBot}
           onMoveToSection={(botId) => setSectionPicker({ botId, x: menu.x, y: menu.y })}
         />
       )}
@@ -1925,6 +2070,14 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
                   className="rounded-md px-1.5 py-0.5 font-medium text-accent hover:bg-raised"
                 >
                   Undo
+                </button>
+              )}
+              {pendingHideUndo && (
+                <button
+                  onClick={() => unhideBot(pendingHideUndo)}
+                  className="rounded-md px-1.5 py-0.5 font-medium text-accent hover:bg-raised"
+                >
+                  Unhide
                 </button>
               )}
             </div>

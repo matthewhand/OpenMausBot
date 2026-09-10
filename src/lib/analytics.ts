@@ -111,8 +111,16 @@ export function identifyEmail(email: string) {
 // first-run email gate state
 const GATE_KEY = "omb-email-gate";
 export function emailGateDone(): boolean {
-  return Boolean(localStorage.getItem(GATE_KEY));
+  try {
+    return Boolean(localStorage.getItem(GATE_KEY));
+  } catch {
+    return false;
+  }
 }
 export function setEmailGateDone(status: "submitted" | "skipped") {
-  localStorage.setItem(GATE_KEY, status);
+  try {
+    localStorage.setItem(GATE_KEY, status);
+  } catch {
+    // Private browsing and locked-down webviews may reject localStorage.
+  }
 }

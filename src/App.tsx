@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Loader2, Menu } from "lucide-react";
 import { StoreProvider, useStore } from "@/state/store";
 import { Onboarding } from "@/components/Onboarding";
-import { emailGateDone, initAnalytics } from "@/lib/analytics";
+import { emailGateDone, initAnalytics, setEmailGateDone } from "@/lib/analytics";
+import { welcomeGateDecision } from "@/lib/welcome-gate";
 import { Sidebar } from "@/components/Sidebar";
 import { ChatView } from "@/components/ChatView";
 import { GroupView } from "@/components/GroupView";
@@ -302,8 +303,31 @@ function Shell() {
   );
 }
 
+function WelcomeGate() {
+  const { state } = useStore();
+  const [gateDone, setGateDone] = useState(() => emailGateDone());
+  const decision = welcomeGateDecision({
+    emailGateDone: gateDone,
+    connected: state.connected,
+    profile: state.config?.profile,
+    botCount: state.bots.length,
+  });
+  useEffect(() => {
+    if (decision.reason !== "existing-install" || gateDone) return;
+    setEmailGateDone("skipped");
+    setGateDone(true);
+  }, [decision.reason, gateDone]);
+  if (!decision.show) return null;
+  return (
+    <Onboarding
+      onDone={() => {
+        setGateDone(true);
+      }}
+    />
+  );
+}
+
 export default function App() {
-  const [gated, setGated] = useState(() => !emailGateDone());
   useEffect(() => {
     initAnalytics();
   }, []);
@@ -311,7 +335,7 @@ export default function App() {
     <DesktopCapabilitiesProvider>
       <StoreProvider>
         <Shell />
-        {gated && <Onboarding onDone={() => setGated(false)} />}
+        <WelcomeGate />
       </StoreProvider>
     </DesktopCapabilitiesProvider>
   );

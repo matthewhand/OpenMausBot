@@ -3,7 +3,7 @@
 // storage round-trip pins that the choice survives a restart.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { analyticsEnabled, optAction, setAnalyticsEnabled } from "./analytics";
+import { analyticsEnabled, emailGateDone, optAction, setAnalyticsEnabled, setEmailGateDone } from "./analytics";
 
 // The suite runs on the node environment, which has no localStorage.
 const store = new Map<string, string>();
@@ -18,6 +18,33 @@ beforeEach(() => store.clear());
 // Tests that swap in a throwing storage get the base one back even when an
 // assertion fails mid-test — an inline restore at the end would be skipped.
 afterEach(() => vi.stubGlobal("localStorage", baseStorage));
+
+describe("email gate storage", () => {
+  it("treats a missing key as not done", () => {
+    expect(emailGateDone()).toBe(false);
+  });
+
+  it("survives skip and submit", () => {
+    setEmailGateDone("skipped");
+    expect(emailGateDone()).toBe(true);
+    store.clear();
+    setEmailGateDone("submitted");
+    expect(emailGateDone()).toBe(true);
+  });
+
+  it("does not throw when storage is unusable", () => {
+    vi.stubGlobal("localStorage", {
+      getItem: () => {
+        throw new Error("denied");
+      },
+      setItem: () => {
+        throw new Error("denied");
+      },
+    });
+    expect(emailGateDone()).toBe(false);
+    expect(() => setEmailGateDone("skipped")).not.toThrow();
+  });
+});
 
 describe("optAction", () => {
   it("initialises on the first opt-in of a session that started off", () => {

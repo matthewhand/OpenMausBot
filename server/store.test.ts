@@ -366,6 +366,33 @@ describe("Store", () => {
     );
   });
 
+  it("persists a room's hidden flag across a restart", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const group = store.createGroup("Quiet room", [bot.id]);
+    store.patchGroup(group.id, { hidden: true });
+    expect(store.group(group.id)?.hidden).toBe(true);
+
+    const reloaded = new Store(selection);
+    expect(reloaded.group(group.id)?.hidden).toBe(true);
+    reloaded.patchGroup(group.id, { hidden: false });
+    expect(new Store(selection).group(group.id)?.hidden).toBe(false);
+  });
+
+  it("persists sidebarHidden independently of archive", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.patchBot(bot.id, { sidebarHidden: true });
+    expect(store.bot(bot.id)?.sidebarHidden).toBe(true);
+    expect(store.bot(bot.id)?.hidden).toBeFalsy();
+
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.sidebarHidden).toBe(true);
+    expect(reloaded.bot(bot.id)?.hidden).toBeFalsy();
+    reloaded.patchBot(bot.id, { hidden: true });
+    expect(new Store(selection).bot(bot.id)).toMatchObject({ hidden: true, sidebarHidden: true });
+  });
+
   it("persists a bot's effort level across a restart, defaulting to unset", () => {
     const store = new Store(selection);
     const bot = store.createBot();
