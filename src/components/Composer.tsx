@@ -613,7 +613,7 @@ export function Composer({
               center — including the corner pockets around the paperclip. */}
           <div
             aria-hidden
-            className="absolute -left-5 -right-5 top-1/2 h-[50vh] bg-app"
+            className="pointer-events-none absolute -left-5 -right-5 top-1/2 z-0 h-[50vh] bg-app"
           />
         <div className="relative z-[1] flex items-end gap-1 rounded-3xl bg-raised px-2 py-1.5">
           <input
@@ -773,6 +773,7 @@ export function Composer({
           {canInject && <ComposerInjectNow onInject={interruptTurn} />}
           {busy && !locked && !canInject && (
           <button
+            type="button"
             onClick={interruptTurn}
             aria-label="Stop this turn"
             className="flex size-8 shrink-0 items-center justify-center rounded-full text-ink-secondary hover:bg-raised hover:text-ink"
@@ -783,6 +784,7 @@ export function Composer({
         )}
         {!locked && !busy && !hasContent && capabilities.dictation.available && (
           <button
+            type="button"
             onClick={toggleMic}
             aria-label={recording ? "Stop dictation" : "Start dictation"}
             className={cn(
@@ -798,6 +800,7 @@ export function Composer({
         )}
         {hasContent && !locked && (
           <button
+            type="button"
             onClick={send}
             aria-label={
               busy && canSteer

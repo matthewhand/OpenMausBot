@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { X } from "lucide-react";
+import { ArrowUp, X } from "lucide-react";
 import { useStore, visibleMessages, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
 
@@ -91,13 +91,30 @@ export function OptionCard({
       {/* a permission ask has no free-text answer — the broker only accepts
           allow/deny, so typing here used to fail silently */}
       {!card.answered && !card.tool && (
-        <input
-          value={custom}
-          onChange={(e) => setCustom(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && answer(custom)}
-          placeholder="Type your own answer"
-          className="mt-3 w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2.5 text-[15px] text-ink placeholder:text-ink-secondary focus:outline-none focus:border-hairline"
-        />
+        <div className="mt-3 flex items-center gap-2">
+          <input
+            value={custom}
+            onChange={(e) => setCustom(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
+              e.preventDefault();
+              answer(custom);
+            }}
+            placeholder="Type your own answer"
+            aria-label="Type your own answer"
+            className="min-w-0 flex-1 rounded-lg border border-hairline/40 bg-inset px-3 py-2.5 text-[15px] text-ink placeholder:text-ink-secondary focus:outline-none focus:border-hairline"
+          />
+          <button
+            type="button"
+            onClick={() => answer(custom)}
+            disabled={!custom.trim()}
+            aria-label="Submit answer"
+            title="Submit"
+            className="flex size-9 shrink-0 items-center justify-center rounded-full bg-accent text-white hover:brightness-110 disabled:opacity-40"
+          >
+            <ArrowUp size={17} />
+          </button>
+        </div>
       )}
     </div>
   );
