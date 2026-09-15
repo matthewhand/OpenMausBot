@@ -17,8 +17,10 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddCircle
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -66,9 +68,13 @@ import com.openmausbot.companion.avatar.AvatarImageRules
 import com.openmausbot.companion.avatar.PreparedAvatar
 import com.openmausbot.companion.core.AvatarCrop
 import com.openmausbot.companion.core.Bot
+import com.openmausbot.companion.core.forTask
 import com.openmausbot.companion.core.BotProfilePatch
 import com.openmausbot.companion.core.ConfigStatus
+import com.openmausbot.companion.core.Instance
+import com.openmausbot.companion.core.ModelSelection
 import com.openmausbot.companion.core.Voice
+import com.openmausbot.companion.core.VoiceProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -76,16 +82,17 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * The paired-safe subset of an agent profile — the port of
+ * The paired-safe subset of bot settings — the port of
  * `ios/App/AgentProfileView.swift`.
  *
- * Identity, avatar, notifications and the renderer-neutral voice choice. Shared
- * provider keys stay on the computer: this sheet reports configured / not
- * configured and offers no field that could carry one.
+ * The model, identity, avatar, notifications and the renderer-neutral voice
+ * choice. Shared provider keys stay on the computer: this sheet sees the model
+ * catalog and configured / not configured, and offers no field that could
+ * carry a key.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun AgentProfileSheet(bot: Bot, onDismiss: () -> Unit) {
+internal fun AgentProfileSheet(bot: Bot, onDismiss: () -> Unit, onOpenOverview: (String) -> Unit) {
     val environment = LocalCompanion.current
     val session = environment.session
     val state by session.state.collectAsState()
@@ -98,6 +105,7 @@ internal fun AgentProfileSheet(bot: Bot, onDismiss: () -> Unit) {
     // the fleet drops the agent; `current` is what every action is applied to.
     val opened = remember { bot }
     val current = state.bot(opened.id) ?: opened
+    val currentTask = current.forTask(opened.threadId)
 
     var form by rememberSaveable(stateSaver = ProfileFormSaver) {
         mutableStateOf(ProfileForm.of(opened))
@@ -109,17 +117,38 @@ internal fun AgentProfileSheet(bot: Bot, onDismiss: () -> Unit) {
     var voices by remember { mutableStateOf<List<Voice>>(emptyList()) }
     var config by remember { mutableStateOf<ConfigStatus?>(null) }
     var busy by remember { mutableStateOf(false) }
+    var switchingEngine by remember { mutableStateOf(false) }
+
+    // The Model section. The draft survives rotation; the catalog is reloaded.
+    var instances by remember { mutableStateOf<List<Instance>>(emptyList()) }
+    var modelsLoaded by remember { mutableStateOf(false) }
+    var savedModel by remember { mutableStateOf(opened.modelSelection) }
+    var selectedInstanceId by rememberSaveable { mutableStateOf(opened.modelSelection.instanceId) }
+    var selectedModelId by rememberSaveable { mutableStateOf(opened.modelSelection.model) }
+    // "" is the engine default; the picker has no null row.
+    var selectedEffort by rememberSaveable { mutableStateOf(opened.modelSelection.effort.orEmpty()) }
+    val selectedInstance = instances.firstOrNull { it.instanceId == selectedInstanceId }
+    val modelDraft = ModelSelection(selectedInstanceId, selectedModelId, selectedEffort.ifEmpty { null })
 
     fun liveBot(): Bot = session.state.value.bot(opened.id) ?: opened
+
+    fun showModel(selection: ModelSelection) {
+        selectedInstanceId = selection.instanceId
+        selectedModelId = selection.model
+        selectedEffort = selection.effort.orEmpty()
+    }
 
     LaunchedEffect(Unit) {
         val loaded = coroutineScope {
             val status = async { session.configStatus() }
             val options = async { session.voiceOptions() }
-            status.await() to options.await()
+            val catalog = async { session.modelInstances() }
+            Triple(status.await(), options.await(), catalog.await())
         }
         config = loaded.first
         voices = loaded.second
+        instances = loaded.third
+        modelsLoaded = true
         // A stored "speak replies" that nothing can speak is turned off before
         // the toggle is ever drawn.
         form = ProfileRules.applyLoadedConfig(form, loaded.first)
@@ -181,11 +210,118 @@ internal fun AgentProfileSheet(bot: Bot, onDismiss: () -> Unit) {
                         Text("Done")
                     }
                     Text(
-                        text = "Agent profile",
+                        text = "Bot settings",
                         fontSize = 17.sp,
                         fontWeight = FontWeight.SemiBold,
                         modifier = Modifier.align(Alignment.Center),
                     )
+                }
+
+                FormSection(header = null) {
+                    ActionRow(
+                        text = "What this bot does",
+                        icon = Icons.Filled.Info,
+                        onClick = { onOpenOverview(bot.id) },
+                    )
+                }
+
+                FormSection(header = "Model", footer = ModelRules.FOOTER) {
+                    val instanceChoices = ModelRules.instanceChoices(instances, savedModel)
+                    if (!modelsLoaded) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().heightIn(min = MIN_TOUCH_TARGET),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(ModelRules.LOADING, fontSize = 15.sp, modifier = Modifier.weight(1f))
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp))
+                        }
+                    } else if (instanceChoices.isEmpty()) {
+                        IconNote(text = ModelRules.NONE_AVAILABLE, icon = Icons.Filled.Warning)
+                    } else {
+                        val providerRows = buildList {
+                            if (ModelRules.providerMissing(instances, selectedInstanceId)) {
+                                add(
+                                    VoiceChoice(
+                                        id = selectedInstanceId,
+                                        label = ModelRules.CURRENT_PROVIDER_UNAVAILABLE,
+                                        detail = null,
+                                        enabled = false,
+                                    ),
+                                )
+                            }
+                            instanceChoices.forEach {
+                                add(
+                                    VoiceChoice(
+                                        id = it.instanceId,
+                                        label = ModelRules.instanceLabel(it),
+                                        detail = null,
+                                        enabled = it.snapshot.isAvailable,
+                                    ),
+                                )
+                            }
+                        }
+                        ChoicePicker(
+                            label = "Provider",
+                            choices = providerRows,
+                            selected = selectedInstanceId,
+                            onSelect = { id ->
+                                val instance = instances.firstOrNull { it.instanceId == id }
+                                if (instance != null) showModel(ModelRules.defaultsFor(instance, savedModel))
+                            },
+                        )
+                        ChoicePicker(
+                            label = "Model",
+                            choices = ModelRules.modelChoices(selectedInstance, selectedModelId).map {
+                                VoiceChoice(id = it.id, label = it.label, detail = null, enabled = true)
+                            },
+                            selected = selectedModelId,
+                            enabled = selectedInstance?.snapshot?.isAvailable == true,
+                            onSelect = { selectedModelId = it },
+                        )
+                        val effortLevels = ModelRules.effortLevels(selectedInstance)
+                        if (effortLevels.isNotEmpty()) {
+                            ChoicePicker(
+                                label = "Reasoning effort",
+                                choices = buildList {
+                                    add(VoiceChoice(id = "", label = ModelRules.DEFAULT_EFFORT_LABEL, detail = null, enabled = true))
+                                    effortLevels.forEach {
+                                        add(VoiceChoice(id = it, label = ModelRules.effortLabel(it), detail = null, enabled = true))
+                                    }
+                                },
+                                selected = selectedEffort,
+                                onSelect = { selectedEffort = it },
+                            )
+                        }
+                        ModelRules.note(currentTask?.busy, selectedInstance)?.let { note ->
+                            IconNote(text = note, icon = Icons.Filled.Info)
+                        }
+                        ActionRow(
+                            text = "Apply model",
+                            icon = Icons.Filled.Check,
+                            enabled = !busy && currentTask != null && ModelRules.canApply(
+                                loaded = modelsLoaded,
+                                botBusy = currentTask?.busy,
+                                instance = selectedInstance,
+                                draft = modelDraft,
+                                saved = savedModel,
+                            ),
+                            onClick = {
+                                scope.launch {
+                                    busy = true
+                                    try {
+                                        val target = liveBot().forTask(opened.threadId) ?: return@launch
+                                        val updated = session.updateModel(modelDraft, target)
+                                        if (updated != null) {
+                                            savedModel = updated.modelSelection
+                                            showModel(updated.modelSelection)
+                                        }
+                                    } finally {
+                                        busy = false
+                                    }
+                                }
+                            },
+                        )
+                    }
                 }
 
                 FormSection(header = "Avatar", footer = ProfileRules.AVATAR_FOOTER) {
@@ -341,8 +477,30 @@ internal fun AgentProfileSheet(bot: Bot, onDismiss: () -> Unit) {
                     )
                 }
 
-                VoiceSection(config = config) {
-                    VoicePicker(
+                VoiceSection(
+                    config = config,
+                    switching = switchingEngine,
+                    onSwitchEngine = { next ->
+                        // The desktop's Voice engine group: one field of the
+                        // ordinary config write, then a fresh voice list,
+                        // because every engine names its own voices.
+                        if (switchingEngine || config?.voiceProvider == next) return@VoiceSection
+                        scope.launch {
+                            switchingEngine = true
+                            try {
+                                val updated = session.switchVoiceProvider(next)
+                                if (updated != null) {
+                                    config = updated
+                                    voices = session.voiceOptions()
+                                }
+                            } finally {
+                                switchingEngine = false
+                            }
+                        }
+                    },
+                ) {
+                    ChoicePicker(
+                        label = "Voice",
                         choices = ProfileRules.voiceChoices(config, voices, form.voice),
                         selected = form.voice,
                         onSelect = { form = form.copy(voice = it) },
@@ -393,7 +551,7 @@ internal fun AgentProfileSheet(bot: Bot, onDismiss: () -> Unit) {
 
                 FormSection(header = null) {
                     ActionRow(
-                        text = "Save profile",
+                        text = "Save profile changes",
                         enabled = ProfileRules.canSave(form, busy),
                         onClick = {
                             scope.launch {
@@ -426,24 +584,28 @@ internal fun AgentProfileSheet(bot: Bot, onDismiss: () -> Unit) {
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
+/** A SwiftUI `Picker` as Material draws one: a read-only field that opens a menu. */
 @Composable
-private fun VoicePicker(
+internal fun ChoicePicker(
+    label: String,
     choices: List<VoiceChoice>,
     selected: String,
     onSelect: (String) -> Unit,
+    enabled: Boolean = true,
 ) {
     var expanded by remember { mutableStateOf(false) }
-    val label = choices.firstOrNull { it.id == selected }?.label.orEmpty()
+    val selectedLabel = choices.firstOrNull { it.id == selected }?.label.orEmpty()
     ExposedDropdownMenuBox(
-        expanded = expanded,
-        onExpandedChange = { expanded = it },
+        expanded = expanded && enabled,
+        onExpandedChange = { if (enabled) expanded = it },
         modifier = Modifier.fillMaxWidth(),
     ) {
         OutlinedTextField(
-            value = label,
+            value = selectedLabel,
             onValueChange = {},
             readOnly = true,
-            label = { Text("Voice") },
+            enabled = enabled,
+            label = { Text(label) },
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
             modifier = Modifier
                 .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
@@ -480,11 +642,27 @@ private fun VoicePicker(
  * value a rule returns — the screen once drew a correct sentence in the wrong
  * slot with the whole suite green — and, like `DataTableCard`, the assertion
  * has to be over what is mounted. `VoiceSectionWiringTest` mounts exactly this.
+ *
+ * The engine picker rides above the branch: like the desktop's Voice engine
+ * group it is drawn in every state, because switching away is how you repair
+ * an engine whose credential is missing.
  */
 @Composable
-internal fun VoiceSection(config: ConfigStatus?, canSpeak: @Composable () -> Unit) {
+internal fun VoiceSection(
+    config: ConfigStatus?,
+    switching: Boolean = false,
+    onSwitchEngine: (VoiceProvider) -> Unit = {},
+    canSpeak: @Composable () -> Unit,
+) {
     val copy = ProfileRules.voiceCopy(config)
     FormSection(header = "Voice", footer = copy.footer) {
+        ChoicePicker(
+            label = "Voice engine",
+            choices = ProfileRules.providerChoices(),
+            selected = (config?.voiceProvider ?: VoiceProvider.ELEVENLABS).wire,
+            onSelect = { next -> onSwitchEngine(VoiceProvider.fromWire(next)) },
+            enabled = !switching,
+        )
         if (copy.unconfiguredNotice != null) {
             IconNote(text = copy.unconfiguredNotice, painter = R.drawable.ic_volume_off)
         } else {

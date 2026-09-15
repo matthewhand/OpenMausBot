@@ -1,5 +1,3 @@
-import { lanAuthHeaders } from "@/lib/lan-auth";
-
 // The speaker — one voice for the whole window.
 //
 // Deliberately a singleton: two bots talking over each other is never what
@@ -16,6 +14,8 @@ import { lanAuthHeaders } from "@/lib/lan-auth";
 // transcripts, and keeping it in one place is the same reasoning as the
 // server-computed approval key.
 
+import { localSystemVoiceActive, remoteSystemVoice, resolveLocalSystemVoice } from "@/lib/local-voice";
+
 export type SpeechStatus = "idle" | "preparing" | "speaking";
 
 export interface SpeechSnapshot {
@@ -28,7 +28,7 @@ export interface SpeechSnapshot {
   error?: string;
 }
 
-export interface SpeakOptions {
+interface SpeakOptions {
   voiceId?: string;
   botId?: string;
   messageId?: string;
@@ -48,6 +48,8 @@ export class Speaker {
   private objectUrl: string | null = null;
   private settlePlayback: ((finished: boolean) => void) | null = null;
   private request: AbortController | null = null;
+  private localUtterance: SpeechSynthesisUtterance | null = null;
+  private settleLocalSpeech: ((finished: boolean) => void) | null = null;
 
   subscribe(fn: (s: SpeechSnapshot) => void): () => void {
     this.watchers.add(fn);
@@ -61,7 +63,7 @@ export class Speaker {
 
   private set(next: SpeechSnapshot) {
     this.snapshot = next;
-    for (const watcher of [...this.watchers]) watcher(next);
+    for (const watcher of Array.from(this.watchers)) watcher(next);
   }
 
   /** True while this exact message is the one being spoken. */
@@ -74,6 +76,10 @@ export class Speaker {
     this.token += 1;
     this.request?.abort();
     this.request = null;
+    this.settleLocalSpeech?.(false);
+    this.settleLocalSpeech = null;
+    this.localUtterance = null;
+    if (typeof window !== "undefined") window.speechSynthesis?.cancel();
     // Pausing/removing an <audio> source does not reliably fire `ended` or
     // `error`. Resolve the play promise ourselves so every interrupted
     // speak() settles and call mode cannot leak a forever-pending task.
@@ -99,18 +105,22 @@ export class Speaker {
    * never rejects, because a voice failing is a thing to show, not a thing
    * that should take a caller's turn down with it.
    */
-  async speak(text: string, opts: SpeakOptions | string = {}): Promise<void> {
-    const options: SpeakOptions = typeof opts === "string" ? { voiceId: opts } : opts;
+  async speak(text: string, opts: SpeakOptions = {}): Promise<void> {
     this.stop();
     const mine = this.token;
     const controller = new AbortController();
     this.request = controller;
     const live = () => this.token === mine && !controller.signal.aborted;
 
-    this.set({ status: "preparing", botId: options.botId, messageId: options.messageId });
+    this.set({ status: "preparing", botId: opts.botId, messageId: opts.messageId });
+    if (localSystemVoiceActive()) {
+      await this.speakWithLocalSystem(text, opts, live);
+      if (this.request === controller) this.request = null;
+      return;
+    }
     let utterances: string[];
     try {
-      utterances = await this.prepare(text, options.voiceId, controller.signal);
+      utterances = await this.prepare(text, opts.voiceId, controller.signal);
     } catch (e) {
       if (live()) this.set({ ...IDLE, error: e instanceof Error ? e.message : String(e) });
       if (this.request === controller) this.request = null;
@@ -128,7 +138,7 @@ export class Speaker {
     // turn — the only gap the listener hears is the first.
     type Rendered = { blob: Blob; error?: never } | { blob?: never; error: unknown };
     const render = (utterance: string): Promise<Rendered> =>
-      this.render(utterance, options.voiceId, controller.signal).then(
+      this.render(utterance, opts.voiceId, controller.signal).then(
         (blob) => ({ blob }),
         (error: unknown) => ({ error }),
       );
@@ -149,7 +159,7 @@ export class Speaker {
         return;
       }
       if (!live()) return;
-      this.set({ status: "speaking", botId: options.botId, messageId: options.messageId, caption: utterances[i] });
+      this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption: utterances[i] });
       const finished = await this.play(rendered.blob, live);
       if (!finished || !live()) {
         if (live()) this.set({ ...IDLE, error: "The generated voice clip couldn't be played." });
@@ -161,23 +171,79 @@ export class Speaker {
     if (this.request === controller) this.request = null;
   }
 
+  private speakWithLocalSystem(
+    text: string,
+    opts: SpeakOptions,
+    live: () => boolean,
+  ): Promise<void> {
+    const value = text.trim();
+    if (!value) {
+      this.set(IDLE);
+      return Promise.resolve();
+    }
+
+    const synth = window.speechSynthesis;
+    const utterance = new window.SpeechSynthesisUtterance(value);
+    const selected = resolveLocalSystemVoice(remoteSystemVoice(opts.botId));
+    if (selected) utterance.voice = selected;
+    this.localUtterance = utterance;
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (finished: boolean, error?: string) => {
+        if (settled) return;
+        settled = true;
+        utterance.onstart = null;
+        utterance.onend = null;
+        utterance.onerror = null;
+        if (this.localUtterance === utterance) this.localUtterance = null;
+        if (this.settleLocalSpeech === finish) this.settleLocalSpeech = null;
+        if (live()) this.set(finished ? IDLE : { ...IDLE, ...(error ? { error } : {}) });
+        resolve();
+      };
+      this.settleLocalSpeech = finish;
+      utterance.onstart = () => {
+        if (live()) {
+          this.set({
+            status: "speaking",
+            botId: opts.botId,
+            messageId: opts.messageId,
+            caption: value,
+          });
+        }
+      };
+      utterance.onend = () => finish(true);
+      utterance.onerror = (event) => {
+        const interrupted = event.error === "canceled" || event.error === "interrupted";
+        finish(false, interrupted ? undefined : "This Mac could not play its selected voice.");
+      };
+      try {
+        synth.speak(utterance);
+      } catch {
+        finish(false, "This Mac could not start its selected voice.");
+      }
+    });
+  }
+
   private async prepare(text: string, voiceId: string | undefined, signal: AbortSignal): Promise<string[]> {
     const res = await fetch("/api/tts/prepare", {
       method: "POST",
-      headers: { "content-type": "application/json", ...lanAuthHeaders() },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ text, voiceId }),
       signal,
     });
     const body: TtsPrepareBody = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error ?? `the voice service returned ${res.status}`);
-    if (!body.ready) throw new Error("Configure TTS and pick a voice in App Settings to turn on voice.");
+    if (!body.ready) {
+      throw new Error("Add the shared ElevenLabs key in an agent profile on this computer, then pick a voice for the agent.");
+    }
     return body.utterances ?? [];
   }
 
   private async render(text: string, voiceId: string | undefined, signal: AbortSignal): Promise<Blob> {
     const res = await fetch("/api/tts/speak", {
       method: "POST",
-      headers: { "content-type": "application/json", ...lanAuthHeaders() },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ text, voiceId }),
       signal,
     });
@@ -217,4 +283,3 @@ export class Speaker {
 }
 
 export const speaker = new Speaker();
-export { auditionVoice, VOICE_SAMPLE_TEXT, SAMPLE } from "@/lib/voice-audition";

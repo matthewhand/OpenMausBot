@@ -1,6 +1,10 @@
 import type { Routine, RoutineRun, RoutineSchedule } from "./routines";
+import { nextCronRuns } from "../../shared/routine-schedule";
 
-export const CALENDAR_SLOT_MINUTES = 15;
+export const CALENDAR_SLOT_MINUTES = 5;
+const ROUTINE_MARKER_MINUTES = 30;
+const MAX_RECEIPTS_PER_ROUTINE_PER_RANGE = 12;
+const MAX_CRON_PROJECTIONS_PER_DAY = 12;
 
 export type RoutineCalendarItem = {
   id: string;
@@ -56,8 +60,39 @@ export function toLocalTimeInput(at: number): string {
   return date.toISOString().slice(11, 16);
 }
 
-export function fromLocalDateAndTime(date: string, time: string): number {
+export function fromLocalDateAndTime(date: string, time: string, originalAt?: number): number {
+  // Date/time inputs display minutes, but agent-created schedules can carry
+  // seconds and milliseconds. A title-only save must not move the anchor or
+  // choose a different occurrence of a repeated local time at a DST boundary.
+  if (originalAt != null && date === toLocalDateInput(originalAt) && time === toLocalTimeInput(originalAt)) return originalAt;
   return new Date(`${date}T${time}`).getTime();
+}
+
+/** Start a new interval at least one full cadence from now, on a clean minute boundary. */
+export function nextIntervalAnchor(now: number, everyMinutes: number): number {
+  return Math.ceil((now + everyMinutes * 60_000) / 60_000) * 60_000;
+}
+
+export function intervalAnchorForSave(
+  now: number,
+  everyMinutes: number,
+  current?: { everyMinutes: number; anchorAt: number },
+): number {
+  return current?.everyMinutes === everyMinutes
+    ? current.anchorAt
+    : nextIntervalAnchor(now, everyMinutes);
+}
+
+/** The next cadence point, retaining the original phase when editing. */
+export function nextIntervalForSave(
+  now: number,
+  everyMinutes: number,
+  current?: { everyMinutes: number; anchorAt: number },
+): number {
+  const anchor = intervalAnchorForSave(now, everyMinutes, current);
+  if (anchor > now) return anchor;
+  const intervalMs = everyMinutes * 60_000;
+  return anchor + (Math.floor((now - anchor) / intervalMs) + 1) * intervalMs;
 }
 
 export function snapMinutes(minutes: number, increment = CALENDAR_SLOT_MINUTES): number {
@@ -72,9 +107,13 @@ export function snapMinutes(minutes: number, increment = CALENDAR_SLOT_MINUTES):
 export function packCalendarCollisions(
   items: readonly CalendarCollisionItem[],
 ): Map<string, CalendarCollisionLayout> {
+  // Short events keep a 16px hit target in the renderer. Pack against that
+  // same visual footprint so adjacent five-minute cards never cover each other.
+  const visualEnd = (item: CalendarCollisionItem) =>
+    item.at + Math.max(15, item.durationMinutes) * 60_000;
   const sorted = [...items].sort((left, right) =>
     left.at - right.at
-    || left.at + left.durationMinutes * 60_000 - (right.at + right.durationMinutes * 60_000)
+    || visualEnd(left) - visualEnd(right)
     || left.id.localeCompare(right.id),
   );
   const result = new Map<string, CalendarCollisionLayout>();
@@ -86,7 +125,7 @@ export function packCalendarCollisions(
       const item = sorted[cursor]!;
       if (cluster.length > 0 && item.at >= clusterEnd) break;
       cluster.push(item);
-      clusterEnd = Math.max(clusterEnd, item.at + Math.max(1, item.durationMinutes) * 60_000);
+      clusterEnd = Math.max(clusterEnd, visualEnd(item));
       cursor += 1;
     }
 
@@ -94,7 +133,7 @@ export function packCalendarCollisions(
     const assignments = cluster.map((item) => {
       const available = columnEnds.findIndex((end) => end <= item.at);
       const column = available === -1 ? columnEnds.length : available;
-      columnEnds[column] = item.at + Math.max(1, item.durationMinutes) * 60_000;
+      columnEnds[column] = visualEnd(item);
       return { id: item.id, column };
     });
     const columns = Math.max(1, columnEnds.length);
@@ -123,8 +162,17 @@ export function slotAt(day: number, clientY: number, top: number, hourHeight: nu
   return date.getTime();
 }
 
+export function scheduleAt(schedule: Exclude<RoutineSchedule, { type: "interval" | "cron" }>, occurrenceAt: number, nextAt: number): Exclude<RoutineSchedule, { type: "interval" | "cron" }>;
+export function scheduleAt(schedule: RoutineSchedule, occurrenceAt: number, nextAt: number): RoutineSchedule;
 export function scheduleAt(schedule: RoutineSchedule, occurrenceAt: number, nextAt: number): RoutineSchedule {
+  if (schedule.type === "cron") throw new Error("Edit this routine's schedule to change its cron timing.");
   if (schedule.type === "once") return { type: "once", at: nextAt };
+  if (schedule.type === "interval") {
+    return {
+      ...schedule,
+      anchorAt: schedule.anchorAt + (nextAt - occurrenceAt),
+    };
+  }
   const dayDelta = Math.round((startOfDay(nextAt) - startOfDay(occurrenceAt)) / 86_400_000);
   return {
     type: "daily",
@@ -139,13 +187,29 @@ export function projectedRoutineItems(
   from: number,
   to: number,
 ): RoutineCalendarItem[] {
-  const items: RoutineCalendarItem[] = runs
+  const routineById = new Map(routines.map((routine) => [routine.id, routine]));
+  const receiptCounts = new Map<string, number>();
+  const visibleRuns = runs
     .filter((run) => run.scheduledFor >= from && run.scheduledFor < to)
+    .sort((left, right) => right.scheduledFor - left.scheduledFor)
+    .filter((run) => {
+      if (run.status === "queued" || run.status === "running" || run.status === "waiting") {
+        return true;
+      }
+      // A routine may later be edited or deleted, so the current definition
+      // cannot safely tell us whether its history came from a dense interval.
+      // Keep active receipts unbounded above, while trimming terminal history.
+      const count = receiptCounts.get(run.routineId) ?? 0;
+      if (count >= MAX_RECEIPTS_PER_ROUTINE_PER_RANGE) return false;
+      receiptCounts.set(run.routineId, count + 1);
+      return true;
+    });
+  const items: RoutineCalendarItem[] = visibleRuns
     .map((run) => ({
       id: `run-${run.id}`,
       at: run.scheduledFor,
-      durationMinutes: run.durationMinutes ?? 30,
-      routine: routines.find((routine) => routine.id === run.routineId) ?? null,
+      durationMinutes: ROUTINE_MARKER_MINUTES,
+      routine: routineById.get(run.routineId) ?? null,
       run,
     }));
 
@@ -154,13 +218,50 @@ export function projectedRoutineItems(
 
   for (const routine of routines) {
     if (!routine.enabled) continue;
+    if (routine.schedule.type === "cron") {
+      // Never reconstruct skipped work before the scheduler's next occurrence.
+      // Bound dense expressions per visible day, not per range: daily routines
+      // must still appear throughout a month, not vanish after the 12th.
+      if (routine.nextRunAt == null) continue;
+      for (let day = startOfDay(Math.max(from, routine.nextRunAt)); day < to; day = addDays(day, 1)) {
+        const after = Math.max(day, from, routine.createdAt, routine.nextRunAt) - 1;
+        const upcoming = nextCronRuns(routine.schedule, after, MAX_CRON_PROJECTIONS_PER_DAY);
+        if (!upcoming.length || upcoming[0]! >= to) break;
+        // Jump over empty days for sparse monthly/yearly schedules.
+        day = startOfDay(upcoming[0]!);
+        const end = Math.min(to, addDays(day, 1));
+        for (const at of upcoming) {
+          if (at >= end) break;
+          if (!hasReceipt(routine.id, at)) items.push({
+            id: `next-${routine.id}-${at}`, at, durationMinutes: ROUTINE_MARKER_MINUTES, routine, run: null,
+          });
+        }
+      }
+      continue;
+    }
     if (routine.schedule.type === "once") {
       const at = routine.schedule.at;
       if (at >= from && at < to && !hasReceipt(routine.id, at)) {
         items.push({
           id: `next-${routine.id}-${at}`,
           at,
-          durationMinutes: routine.durationMinutes,
+          durationMinutes: ROUTINE_MARKER_MINUTES,
+          routine,
+          run: null,
+        });
+      }
+      continue;
+    }
+    if (routine.schedule.type === "interval") {
+      // The scheduler deliberately skips overlapping and stale interval ticks.
+      // Its persisted nextRunAt is the only future occurrence users can act on;
+      // reconstructing an unreceipted tick would resurrect work it skipped.
+      const at = routine.nextRunAt;
+      if (at != null && at >= from && at < to && !hasReceipt(routine.id, at)) {
+        items.push({
+          id: `next-${routine.id}-${at}`,
+          at,
+          durationMinutes: ROUTINE_MARKER_MINUTES,
           routine,
           run: null,
         });
@@ -174,7 +275,7 @@ export function projectedRoutineItems(
         items.push({
           id: `next-${routine.id}-${at}`,
           at,
-          durationMinutes: routine.durationMinutes,
+          durationMinutes: ROUTINE_MARKER_MINUTES,
           routine,
           run: null,
         });

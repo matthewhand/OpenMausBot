@@ -6,6 +6,16 @@ final class ProfileRoutinePolicyTests: XCTestCase {
         let now = Date(timeIntervalSince1970: 2_000)
 
         XCTAssertTrue(routine(schedule: .daily(time: "09:00", weekdays: [1])).canToggle(at: now))
+        XCTAssertTrue(
+            routine(schedule: .interval(everyMinutes: 5, anchorAt: now.addingTimeInterval(-3_600)))
+                .canToggle(at: now),
+            "an interval remains resumable after its anchor because future occurrences still exist"
+        )
+        XCTAssertFalse(
+            routine(schedule: .init(type: .interval, everyMinutes: 4, anchorAt: 1_000))
+                .canToggle(at: now),
+            "a malformed interval must not become toggleable merely because its type is known"
+        )
         XCTAssertTrue(routine(schedule: .once(at: now.addingTimeInterval(1))).canToggle(at: now))
         XCTAssertFalse(routine(schedule: .once(at: now)).canToggle(at: now))
         XCTAssertFalse(routine(schedule: .once(at: now.addingTimeInterval(-1))).canToggle(at: now))
@@ -52,6 +62,7 @@ final class ProfileRoutinePolicyTests: XCTestCase {
         // key is on file" — so the copy that explains a false has to know
         // which engine it is talking about.
         XCTAssertEqual(try decodeConfig(#"{"tts":{"configured":false,"provider":"system"}}"#).voiceProvider, .system)
+        XCTAssertEqual(try decodeConfig(#"{"tts":{"configured":true,"provider":"chatterbox"}}"#).voiceProvider, .chatterbox)
 
         // Everything else is ElevenLabs: `voiceProvider(cfg)` in
         // `server/tts/index.ts` matches that one exact string and falls back
@@ -74,6 +85,10 @@ final class ProfileRoutinePolicyTests: XCTestCase {
             "an engine this build has never heard of must not borrow another engine's copy"
         )
         XCTAssertEqual(
+            try decodeConfig(#"{"tts":{"configured":false,"provider":"Chatterbox"}}"#).voiceProvider, .elevenlabs,
+            "capitalisation is not the server's spelling; the address fields stay hidden for it"
+        )
+        XCTAssertEqual(
             try decodeConfig(#"{"tts":{"configured":false,"provider":"system-voices"}}"#).voiceProvider, .elevenlabs,
             "a future engine whose name merely contains the old one is still unknown: matching loosely would explain it with Mac-voice copy and a Mac-voice remedy"
         )
@@ -88,6 +103,21 @@ final class ProfileRoutinePolicyTests: XCTestCase {
         XCTAssertFalse(try decodeConfig(#"{"tts":{"configured":false,"provider":"system","voice":"Albert"}}"#).canSpeak(agentVoice: nil))
     }
 
+    func testChatterboxAddressArrivesOnlyWithTheEngineThatNeedsIt() throws {
+        // Chatterbox's credential is an address, not a key, so the status
+        // carries it — and only it — for the picker to prefill.
+        let chatterbox = try decodeConfig(
+            #"{"tts":{"configured":true,"provider":"chatterbox","baseUrl":"http://127.0.0.1:4123","model":"chatterbox-turbo"}}"#
+        )
+        XCTAssertEqual(chatterbox.tts?.baseUrl, "http://127.0.0.1:4123")
+        XCTAssertEqual(chatterbox.tts?.model, "chatterbox-turbo")
+
+        // Every other engine — and an older computer — sends nothing to read.
+        let elevenlabs = try decodeConfig(#"{"tts":{"configured":true,"provider":"elevenlabs"}}"#)
+        XCTAssertNil(elevenlabs.tts?.baseUrl)
+        XCTAssertNil(elevenlabs.tts?.model)
+    }
+
     private func routine(schedule: RoutineSchedule) -> Routine {
         Routine(
             id: "routine-1",
@@ -98,6 +128,7 @@ final class ProfileRoutinePolicyTests: XCTestCase {
             enabled: false,
             schedule: schedule,
             durationMinutes: 30,
+            timeoutMinutes: nil,
             nextRunAt: nil,
             createdAt: 1,
             updatedAt: 1

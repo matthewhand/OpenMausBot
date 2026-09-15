@@ -58,6 +58,11 @@ if (process.env.FAKE_PI_DUMP) {
   }
 }
 
+// Explicit model refresh is a short-lived command, separate from RPC mode.
+if (argv[0] === "update" && argv.includes("--models")) {
+  process.exit(mode === "update-error" ? 1 : 0);
+}
+
 // exit-early: die before saying anything — a failed spawn surfaces as a
 // runtime.error + failed turn, never a hang.
 if (mode === "exit-early") {
@@ -100,8 +105,8 @@ const streamErrorTurn = () => {
 const streamToolTurn = () => {
   send({ type: "agent_start" });
   send({ type: "turn_start" });
-  send({ type: "tool_execution_start", toolCallId: "call_1", toolName: "bash", args: { command: "echo hi" } });
-  send({ type: "tool_execution_end", toolCallId: "call_1", toolName: "bash", isError: false });
+  send({ type: "tool_execution_start", toolCallId: "call_1", toolName: "bash", args: { command: "echo hi", password: "pi-input-secret" } });
+  send({ type: "tool_execution_end", toolCallId: "call_1", toolName: "bash", isError: false, result: { content: [{ type: "text", text: "hi" }], api_key: "pi-output-secret" } });
   send({ type: "turn_end", message: { stopReason: "toolUse", usage: { input: 5, output: 1 } }, usage: { input: 5, output: 1 } });
   // pi auto-continues within the same prompt to synthesize the reply
   send({ type: "turn_start" });
@@ -204,6 +209,16 @@ function handle(cmd: any) {
       send({ type: "response", command: "set_thinking_level", success: true });
       return;
     case "prompt":
+      if (process.env.FAKE_PI_DUMP) {
+        try {
+          appendFileSync(
+            process.env.FAKE_PI_DUMP,
+            JSON.stringify({ prompt: { message: cmd.message, ...(Array.isArray(cmd.images) ? { images: cmd.images } : {}) } }) + "\n",
+          );
+        } catch {
+          /* never let dumping break a run */
+        }
+      }
       // acknowledge acceptance; the completion comes via events
       send({ type: "response", command: "prompt", success: true });
       if (mode === "tooluse") streamToolTurn();

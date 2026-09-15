@@ -8,21 +8,65 @@
  * app restart without asking the model to interpret the request again.
  */
 
+import type { RoutineCronSchedule } from "./routine-schedule.ts";
+
 export type RoutineRequestRunOn = "maus" | "cloud";
+
+export interface RoutineRequestIntervalWindow {
+  start: string;
+  end: string;
+}
 
 export type RoutineRequestSchedule =
   | { type: "once"; at: number }
-  | { type: "daily"; time: string; weekdays: number[] };
+  | { type: "daily"; time: string; weekdays: number[] }
+  | RoutineCronSchedule
+  | {
+    type: "interval";
+    everyMinutes: number;
+    anchorAt?: number;
+    /** Local weekdays (Sunday = 0). Missing means every day. */
+    weekdays?: number[];
+    /** Local wall-clock window. Missing means all day. */
+    window?: RoutineRequestIntervalWindow;
+    /** Inclusive epoch-millisecond cutoff. Missing means never. */
+    endsAt?: number;
+  };
+
+export type RoutineRequestScheduleChanges =
+  | Exclude<RoutineRequestSchedule, { type: "interval" }>
+  | {
+    type: "interval";
+    everyMinutes: number;
+    anchorAt?: number;
+    /** `null` explicitly restores the every-day default. */
+    weekdays?: number[] | null;
+    /** `null` explicitly restores the all-day default. */
+    window?: RoutineRequestIntervalWindow | null;
+    /** `null` explicitly removes an existing end date. */
+    endsAt?: number | null;
+  };
 
 export interface RoutineRequestDefinition {
   name: string;
   instructions: string;
   schedule: RoutineRequestSchedule;
   runOn: RoutineRequestRunOn;
+  /** Legacy calendar/display length. It does not stop an active run. */
   durationMinutes: number;
+  /** Optional safety cap for active work. Missing means no timeout. */
+  timeoutMinutes?: number;
+  /** Carry the previous run's report into the next run. */
+  continuity?: boolean;
 }
 
-export type RoutineRequestChanges = Partial<RoutineRequestDefinition>;
+export type RoutineRequestChanges =
+  & Omit<Partial<RoutineRequestDefinition>, "schedule" | "timeoutMinutes">
+  & {
+    schedule?: RoutineRequestScheduleChanges;
+    /** `null` removes an existing safety cap. */
+    timeoutMinutes?: number | null;
+  };
 
 /** Another bot in the proposer's section that the routine is scheduled for.
  * Captured (id + display name) when the card is created so the card stays

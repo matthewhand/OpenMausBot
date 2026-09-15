@@ -5,6 +5,9 @@
 // Stream. The shapes and names are kept so the two codebases stay mutually
 // readable.
 
+import type { ApprovalMode } from "../shared/approval-mode.ts";
+import type { AskQuestion } from "../shared/ask-question.ts";
+
 export type DriverKind = string;
 export type InstanceId = string;
 export type ThreadId = string;
@@ -47,6 +50,15 @@ export interface ModelSelection {
   model: string;
   /** Optional: no effort means no flag, and the CLI keeps its own default. */
   effort?: EffortLevel;
+}
+
+/** An image already admitted to OpenMausBot's private attachment store.
+ * Drivers receive this structured value instead of learning a host path from
+ * prompt text. The harness validates the path and size before constructing it. */
+export interface TurnImageInput {
+  path: string;
+  mime: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+  bytes: number;
 }
 
 // ── instance configuration envelope ────────────────────────────────────
@@ -106,9 +118,19 @@ export type RuntimeEvent = RuntimeEventBase &
          * delta, a thread total, a per-step figure) and must never be summed. */
         usage?: { input: number; output: number; cachedInput?: number };
       }
-    | { type: "item.started"; itemType: "tool" | "reasoning"; title?: string }
+    | {
+        type: "item.started";
+        itemType: "tool" | "reasoning";
+        title?: string;
+        /** The shell command the call runs, on one redacted line of at most
+         * 200 characters, for the chip and the Verify card. Absent for calls
+         * that run no command (a Read, a fetch). */
+        summary?: string;
+        /** Bounded, redacted display preview; never raw tool arguments. */
+        input?: string;
+      }
     | { type: "item.updated"; itemType: "tool" | "reasoning"; tokens?: number | null }
-    | { type: "item.completed"; itemType: "tool"; ok: boolean }
+    | { type: "item.completed"; itemType: "tool"; ok: boolean; output?: string }
     | { type: "item.completed"; itemType: "assistant_text"; text: string }
     /** Provider-generated raster bytes. This event is folded into the
      * private attachment store and is never forwarded to renderer SSE: a
@@ -122,7 +144,26 @@ export type RuntimeEvent = RuntimeEventBase &
         tool: string;
         summary: string;
         choices?: string[];
+        /** A provider's structured ask (Claude's AskUserQuestion): the whole
+         * set of questions, each with its own options, so the card can offer
+         * them instead of an Allow/Deny a person cannot answer. */
+        questions?: AskQuestion[];
         approvalScope?: "local-computer";
+        /** Provider asks to widen its configured sandbox. Only explicit Full
+         * access may answer this automatically; Auto/remembered grants may not. */
+        requiresExplicitApproval?: boolean;
+        /** Whether the provider's own automatic reviewer was running when it
+         * raised this request. Only providers that can tell set it: Claude
+         * reports the effective permission mode in its init frame, and starts
+         * in Manual without a word when Auto is unavailable for the model.
+         * "inactive" means this ask is not a reviewer's verdict, so the app's
+         * own safe-Auto rules may answer it; unset means nobody knows. */
+        nativeReview?: "active" | "inactive";
+        /** The provider can keep an allow for the rest of its session
+         * ("Always allow this session"): Claude through its own suggested
+         * permission rules, ACP agents through `allow_always` or the
+         * driver's per-session memory. Unset when answers are one-shot. */
+        allowSession?: boolean;
       }
     | {
         type: "request.resolved";
@@ -133,10 +174,18 @@ export type RuntimeEvent = RuntimeEventBase &
         source: "user" | "auto" | "timeout" | "system" | "unavailable" | "peer";
         approvalScope?: "local-computer";
       }
-    | { type: "thread.token-usage.updated"; input: number; output: number; cachedInput?: number }
+    | {
+        type: "thread.token-usage.updated"; input: number; output: number; cachedInput?: number;
+        /** What the model's window held on the most recent model call — the
+         * whole prompt, cache reads included — and the window's size when the
+         * driver knows it. The figure that predicts the next message's cost. */
+        contextTokens?: number; contextWindow?: number;
+      }
     // `setup: true` marks a failure the user fixes by installing or
     // configuring something, not by retrying — the UI offers setup instead.
-    | { type: "runtime.error"; message: string; setup?: boolean }
+    // `terminal: true` records failure of the complete turn, rather than a
+    // transient error or a legacy provider's diagnostic during cancellation.
+    | { type: "runtime.error"; message: string; setup?: boolean; terminal?: boolean }
   );
 
 export type RuntimeEventListener = (event: RuntimeEvent) => void;
@@ -154,14 +203,48 @@ export type RequestOutcome = "allowed-once" | "rejected" | "answered" | "unavail
 // carrying the provider-native continuation (e.g. a claude session id).
 export interface SendTurnInput {
   threadId: ThreadId;
+  /** The bot this turn belongs to. threadIds are meant to be unique per bot
+   * task, but a driver's process-level resource maps (permission-broker
+   * socket, CLI session) key off threadId alone — botId lets a driver namespace
+   * those resources so a threadId that unexpectedly coincides across two
+   * bots (e.g. a delegation still holding its own broker open) can never
+   * collide with another bot's live session or broker (see #1017). */
+  botId?: string;
   text: string;
+  /** Per-bot approval policy, reasserted by providers on every turn so a
+   * resumed native session cannot retain a stale, more permissive mode. */
+  approvalMode?: ApprovalMode;
+  /** Images attached to this user turn only. They are deliberately kept out
+   * of replay transcripts: the provider's native session owns earlier image
+   * context, while a fresh replay retains the visible attachment marker. */
+  images?: TurnImageInput[];
   model?: string;
   effort?: EffortLevel;
   resumeCursor?: unknown;
+  /** The turn with the conversation so far replayed inline, attached only
+   * alongside resumeCursor. A cursor-resuming driver sends it once, on a
+   * fresh session, when the provider refuses the cursor before reading the
+   * prompt (server/resume-recovery.ts) — so a session the provider lost
+   * does not brick the thread, and the new session is not blank. */
+  recoveryText?: string;
   /** Prior turns for transcript-replay providers (API-backed drivers). */
   transcript?: Array<{ role: "user" | "assistant"; text: string }>;
   /** Bot persona (name/title/description) as a system prompt. */
   system?: string;
+  /** `system` split at the sections that legitimately change mid-conversation
+   * (memory today): `systemStable` is everything else, `systemVolatile` is
+   * those sections' text. A driver that keeps one CLI process per thread keys
+   * that process on the stable half, so a memory edit no longer respawns the
+   * session and makes the provider re-cache the entire prompt; the changed half
+   * is delivered inside the next turn instead. Drivers that rebuild their
+   * request every turn ignore both and keep reading `system`. */
+  systemStable?: string;
+  systemVolatile?: string;
+  /** Coordinated teammate turns may resume a Claude conversation whose
+   * earlier system prompt contained a different assignment. Refresh that
+   * prompt when the provider supports it; the current brief also arrives
+   * in this turn's text. */
+  refreshSystemPrompt?: boolean;
   /** Per-bot integrations the driver may hand to the agent as tools. */
   integrations?: {
     /** A local stdio bridge owns the remote Composio transport. Keeping the
@@ -253,6 +336,10 @@ export interface ProviderAdapter {
      * attachment an engine cannot open (a bot told it has an image it
      * cannot read burns the turn). */
     images?: boolean;
+    /** True only when sendTurn consumes `images` as structured provider
+     * input. Image-capable legacy drivers may instead read the attachment
+     * path kept in `text`; central dispatch strips that tag only here. */
+    nativeImageInput?: boolean;
     /** Effort levels this driver can pass to its CLI, ascending. Absent =
      * the driver cannot set effort, so the app never offers the control —
      * same rule as computerMcp: never show a knob the driver cannot turn. */
@@ -281,7 +368,15 @@ export interface ProviderAdapter {
   respondToRequest(
     threadId: ThreadId,
     requestId: string,
-    decision: { behavior: "allow" | "deny" | "answer"; message?: string },
+    decision: {
+      behavior: "allow" | "deny" | "answer";
+      message?: string;
+      /** "Always allow this session": hand the provider its own remembered
+       * approval (Claude's suggested permission rules, ACP `allow_always`)
+       * so it stops asking about this operation for the rest of the
+       * session. The app keeps no grant of its own. */
+      always?: boolean;
+    },
   ): Promise<RequestOutcome>;
   /** Deliver a user message into the RUNNING turn on this thread. Resolves
    * false when there is no live turn to steer (the caller then sends it as
@@ -297,10 +392,28 @@ export interface ProviderSnapshot {
   state: "available" | "unavailable";
   reason?: string;
   authenticated?: boolean;
+  /** Vetted display identity from the provider CLI, never credentials.
+   * `method` says how it is signed in when the CLI reports it: a personal
+   * login, or the workspace API key. */
+  account?: { email?: string; organization?: string; method?: "login" | "api-key" };
   version?: string | null;
+  /** A non-blocking provider update that unlocks newer capabilities. The
+   * engine remains usable; renderer surfaces the exact terminal command. */
+  update?: {
+    title: string;
+    message: string;
+    command: string;
+  };
   /** How this instance is paid for, when the driver can tell: a reported
    * cost on a subscription is notional and the UI labels it as such. */
   billing?: "metered" | "subscription";
+  /** A standing condition worth a look but with nothing to run: the engine
+   * works, and something about how it is set up is costing the person
+   * without their asking. Shown beside the update notice on Engines. */
+  warning?: {
+    title: string;
+    message: string;
+  };
 }
 
 // ── engine install descriptor ───────────────────────────────────────────
@@ -323,6 +436,31 @@ export interface EngineInstall {
   signInCommand?: string;
   /** `command` needs npm on PATH, so the UI can say so when Node is absent. */
   needsNode?: boolean;
+  /** The app downloads and verifies a pinned provider runtime itself. */
+  managed?: {
+    label: string;
+    downloadBytes: number;
+  };
+  /** Settings can install or update this engine on the machine running the
+   * server, as the server's own user, into a directory the app owns. Set by
+   * the registry when the install one-liner is an npm package and npm is on
+   * PATH; never something a client chooses. */
+  server?: { package: string };
+}
+
+export interface ProviderAuthenticationStart {
+  phase: "waiting" | "succeeded";
+  flowId: string | null;
+  authorizationUrl: string | null;
+  expiresAt: string | null;
+  /** A short-lived code to enter only at the provider's authorization URL. */
+  userCode?: string;
+}
+
+export interface ProviderAuthenticationStatus extends Omit<ProviderAuthenticationStart, "phase"> {
+  phase: "waiting" | "succeeded" | "failed" | "expired" | "cancelled";
+  /** Safe, actionable copy; never unfiltered CLI output or credentials. */
+  message?: string;
 }
 
 // ── driver SPI (upstream ProviderDriver — a plain record, not a service) ─
@@ -363,6 +501,15 @@ export interface ProviderInstance {
   readonly models: ModelCatalog;
   /** Refresh a live catalog without recreating the provider instance. */
   readonly refreshModels?: () => Promise<void>;
+  /** Optional first-party runtime installation and account setup. */
+  readonly installRuntime?: () => Promise<void>;
+  readonly startAuthentication?: () => Promise<ProviderAuthenticationStart>;
+  readonly getAuthentication?: (flowId: string) => Promise<ProviderAuthenticationStatus>;
+  readonly completeAuthentication?: (flowId: string, callbackUrl: string) => Promise<void>;
+  readonly cancelAuthentication?: () => Promise<void>;
+  /** Remove the sign-in the provider CLI stores on this server, so a
+   * different account can connect. Never touches another instance's home. */
+  readonly signOut?: () => Promise<void>;
   readonly adapter: ProviderAdapter;
   snapshot(): Promise<ProviderSnapshot>;
   /** Cheap one-shot text call (upstream TextGeneration) — titles, summaries. */
