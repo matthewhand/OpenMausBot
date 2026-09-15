@@ -362,3 +362,91 @@ describe("Chatterbox (local server)", () => {
     expect(() => speak(cfg(chatCfg({ baseUrl: stubBase })), "hi")).toThrow("Pick a voice in the agent profile.");
   });
 });
+
+describe("OpenAI-compatible (generic server)", () => {
+  const compatCfg = (extra: Partial<AppConfig["tts"]> = {}) => ({
+    provider: "openai-compatible" as const,
+    ...extra,
+  });
+
+  it("is configured by a server address; the key stays optional", async () => {
+    const { providerConfigured, voiceConfigured, voiceReady, describeVoice } = await voice();
+    expect(providerConfigured(cfg(compatCfg()))).toBe(false);
+    expect(providerConfigured(cfg(compatCfg({ baseUrl: `${stubBase}/v1` })))).toBe(true);
+    expect(voiceConfigured(cfg(compatCfg({ baseUrl: `${stubBase}/v1` })))).toBe(false);
+    expect(voiceConfigured(cfg(compatCfg({ baseUrl: `${stubBase}/v1`, voice: "af_heart" })))).toBe(true);
+    expect(voiceReady(cfg(compatCfg({ baseUrl: `${stubBase}/v1` })), "af_heart")).toBe(true);
+    expect(voiceReady(cfg(compatCfg({ voice: "af_heart" })), "af_heart")).toBe(false);
+    const described = describeVoice(
+      cfg(compatCfg({ baseUrl: `${stubBase}/v1`, model: "kokoro", voice: "af_heart", key: "sk-secret" })),
+    );
+    expect(described).toEqual({
+      configured: true,
+      ready: true,
+      voice: "af_heart",
+      provider: "openai-compatible",
+      baseUrl: `${stubBase}/v1`,
+      model: "kokoro",
+    });
+    expect(JSON.stringify(described)).not.toContain("sk-secret");
+  });
+
+  it("speaks with the plain audio-speech shape and no key header when keyless", async () => {
+    refuse = null;
+    seen.length = 0;
+    const { speak } = await voice();
+    const audio = await speak(cfg(compatCfg({ baseUrl: `${stubBase}/v1`, voice: "af_heart" })), "hello there");
+    expect(audio.mime).toBe("audio/wav");
+    expect(Buffer.from(audio.bytes)).toEqual(WAV);
+
+    const call = seen.at(-1)!;
+    expect(call.method).toBe("POST");
+    expect(call.url).toBe("/v1/audio/speech");
+    expect(JSON.parse(call.body)).toEqual({ model: "tts-1", input: "hello there", voice: "af_heart" });
+    expect(call.headers["authorization"]).toBeUndefined();
+  });
+
+  it("sends the optional key as a Bearer header and honors the model setting", async () => {
+    refuse = null;
+    seen.length = 0;
+    const { speak } = await voice();
+    await speak(
+      cfg(compatCfg({ baseUrl: `${stubBase}/v1`, key: "kokoro-key", model: "kokoro", voice: "af_heart" })),
+      "hi",
+      "bf_emma",
+    );
+
+    const call = seen.at(-1)!;
+    expect(call.url).toBe("/v1/audio/speech");
+    expect(call.headers["authorization"]).toBe("Bearer kokoro-key");
+    expect(JSON.parse(call.body)).toMatchObject({ model: "kokoro", voice: "bf_emma" });
+  });
+
+  it("falls back to the Kokoro voice list when the server exposes no /voices route", async () => {
+    // NOTE: the stub answers GET /v1/voices with an ElevenLabs-shaped list,
+    // so probe under a prefix the stub does not implement — that 404 is what
+    // exercises the Kokoro fallback.
+    refuse = null;
+    const { listVoices } = await voice();
+    const voices = await listVoices(cfg(compatCfg({ baseUrl: `${stubBase}/oai` })));
+    expect(voices.map((v) => v.id)).toContain("af_heart");
+  });
+
+  it("lists no voices without a server address, rather than calling out", async () => {
+    seen.length = 0;
+    const { listVoices } = await voice();
+    expect(await listVoices(cfg(compatCfg()))).toEqual([]);
+    expect(seen).toHaveLength(0);
+  });
+
+  it("names the missing setup step in its own words", async () => {
+    const { speak, NoVoiceConfigured } = await voice();
+    expect(() => speak(cfg(compatCfg()), "hi")).toThrow(NoVoiceConfigured);
+    expect(() => speak(cfg(compatCfg()), "hi")).toThrow(
+      "Add the address of your OpenAI-compatible server in Settings on the computer to turn on voice.",
+    );
+    expect(() => speak(cfg(compatCfg({ baseUrl: `${stubBase}/v1` })), "hi")).toThrow(
+      "Pick a voice in the agent profile.",
+    );
+  });
+});

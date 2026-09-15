@@ -1,15 +1,18 @@
-// Voice, wired to config. Three engines live behind this file: ElevenLabs
+// Voice, wired to config. Four engines live behind this file: ElevenLabs
 // (elevenlabs.ts, needs a key), the Mac's built-in voices
-// (system-voices.ts, no key), and a local Chatterbox server
-// (chatterbox.ts, an address instead of a key). This file is only the part that reads
-// ~/.openmausbot/config.json, picks the engine, and decides whether there
-// is a voice at all.
+// (system-voices.ts, no key), a local Chatterbox server
+// (chatterbox.ts, an address instead of a key), and any OpenAI-compatible
+// server (openai-compatible.ts, e.g. Kokoro-FastAPI or LiteLLM — an
+// address, an optional key, and a model id). This file is only the part
+// that reads ~/.openmausbot/config.json, picks the engine, and decides
+// whether there is a voice at all.
 import type { AppConfig } from "../config.ts";
 import * as chatterbox from "./chatterbox.ts";
 import * as elevenlabs from "./elevenlabs.ts";
+import * as openaiCompatible from "./openai-compatible.ts";
 import * as systemVoices from "./system-voices.ts";
 
-export type VoiceProvider = "elevenlabs" | "system" | "chatterbox";
+export type VoiceProvider = "elevenlabs" | "system" | "chatterbox" | "openai-compatible";
 
 export class NoVoiceConfigured extends Error {
   // a plain field rather than a constructor parameter property: the harness
@@ -29,7 +32,16 @@ export class NoVoiceConfigured extends Error {
 }
 
 export function voiceProvider(cfg: AppConfig): VoiceProvider {
-  return cfg.tts?.provider === "system" || cfg.tts?.provider === "chatterbox" ? cfg.tts.provider : "elevenlabs";
+  const selected = cfg.tts?.provider;
+  return selected === "system" || selected === "chatterbox" || selected === "openai-compatible"
+    ? selected
+    : "elevenlabs";
+}
+
+/** Server-address engines (Chatterbox and generic OpenAI-compatible) share
+ * one readiness shape: an address is required, a key never is. */
+function serverAddress(cfg: AppConfig): string {
+  return cfg.tts?.baseUrl?.trim() ?? "";
 }
 
 /** The system provider needs no credential — it is only ever offered where
@@ -38,7 +50,7 @@ export function voiceProvider(cfg: AppConfig): VoiceProvider {
 export function providerConfigured(cfg: AppConfig): boolean {
   const provider = voiceProvider(cfg);
   if (provider === "system") return systemVoices.systemVoicesAvailable();
-  if (provider === "chatterbox") return Boolean(cfg.tts?.baseUrl?.trim());
+  if (provider === "chatterbox" || provider === "openai-compatible") return Boolean(serverAddress(cfg));
   return Boolean(cfg.tts?.key);
 }
 
@@ -47,7 +59,9 @@ export function voiceConfigured(cfg: AppConfig): boolean {
   if (provider === "system") {
     return systemVoices.systemVoicesAvailable() && Boolean(cfg.tts?.voice);
   }
-  if (provider === "chatterbox") return Boolean(cfg.tts?.baseUrl?.trim() && cfg.tts?.voice);
+  if (provider === "chatterbox" || provider === "openai-compatible") {
+    return Boolean(serverAddress(cfg) && cfg.tts?.voice);
+  }
   return Boolean(cfg.tts?.key && cfg.tts?.voice);
 }
 
@@ -58,22 +72,25 @@ export function voiceReady(cfg: AppConfig, voiceId?: string): boolean {
   if (provider === "system") {
     return systemVoices.systemVoicesAvailable() && Boolean(voiceId || cfg.tts?.voice);
   }
-  if (provider === "chatterbox") return Boolean(cfg.tts?.baseUrl?.trim() && (voiceId || cfg.tts?.voice));
+  if (provider === "chatterbox" || provider === "openai-compatible") {
+    return Boolean(serverAddress(cfg) && (voiceId || cfg.tts?.voice));
+  }
   return Boolean(cfg.tts?.key && (voiceId || cfg.tts?.voice));
 }
 
 /** What the settings panel needs. Never includes the key — same write-only
- * rule as every other credential. baseUrl and model are Chatterbox
- * settings, not credentials, so they come back in full. */
+ * rule as every other credential. baseUrl and model are server settings,
+ * not credentials, so they come back in full. */
 export function describeVoice(cfg: AppConfig) {
   const provider = voiceProvider(cfg);
+  const serverProvider = provider === "chatterbox" || provider === "openai-compatible";
   return {
     configured: providerConfigured(cfg),
     ready: voiceConfigured(cfg),
     voice: cfg.tts?.voice ?? "",
     provider,
-    baseUrl: provider === "chatterbox" ? (cfg.tts?.baseUrl ?? "") : "",
-    model: provider === "chatterbox" ? (cfg.tts?.model ?? "") : "",
+    baseUrl: serverProvider ? (cfg.tts?.baseUrl ?? "") : "",
+    model: serverProvider ? (cfg.tts?.model ?? "") : "",
   };
 }
 
@@ -81,12 +98,23 @@ export function verifyKey(key: string) {
   return elevenlabs.verifyKey(key);
 }
 
+/** Verify a server-address engine before saving: a cheap speech probe
+ * against endpoints that may not expose a models/voices route. */
+export function verifyServer(baseUrl: string, key?: string, model?: string) {
+  return openaiCompatible.verifyKey(baseUrl, key, model || "tts-1");
+}
+
 export async function listVoices(cfg: AppConfig, run?: systemVoices.Runner): Promise<elevenlabs.Voice[]> {
   const provider = voiceProvider(cfg);
   if (provider === "system") return systemVoices.listSystemVoices(run);
   if (provider === "chatterbox") {
-    const baseUrl = cfg.tts?.baseUrl?.trim();
+    const baseUrl = serverAddress(cfg);
     return baseUrl ? chatterbox.listChatterboxVoices(baseUrl) : [];
+  }
+  if (provider === "openai-compatible") {
+    const baseUrl = serverAddress(cfg);
+    if (!baseUrl) return [];
+    return openaiCompatible.listVoices(baseUrl, cfg.tts?.key);
   }
   const key = cfg.tts?.key;
   if (!key) return [];
@@ -106,7 +134,7 @@ export function speak(cfg: AppConfig, text: string, voiceId?: string, run?: syst
     return systemVoices.synthesizeSystem(text, voice, run);
   }
   if (provider === "chatterbox") {
-    const baseUrl = cfg.tts?.baseUrl?.trim();
+    const baseUrl = serverAddress(cfg);
     if (!baseUrl) {
       throw new NoVoiceConfigured(
         "key",
@@ -116,6 +144,18 @@ export function speak(cfg: AppConfig, text: string, voiceId?: string, run?: syst
     const voice = voiceId || cfg.tts?.voice;
     if (!voice) throw new NoVoiceConfigured("voice");
     return chatterbox.synthesizeChatterbox(text, voice, baseUrl, cfg.tts?.model);
+  }
+  if (provider === "openai-compatible") {
+    const baseUrl = serverAddress(cfg);
+    if (!baseUrl) {
+      throw new NoVoiceConfigured(
+        "key",
+        "Add the address of your OpenAI-compatible server in Settings on the computer to turn on voice.",
+      );
+    }
+    const voice = voiceId || cfg.tts?.voice;
+    if (!voice) throw new NoVoiceConfigured("voice");
+    return openaiCompatible.synthesize(text, voice, baseUrl, cfg.tts?.key, cfg.tts?.model || "tts-1");
   }
   const key = cfg.tts?.key;
   if (!key) throw new NoVoiceConfigured("key");

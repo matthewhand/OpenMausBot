@@ -16010,10 +16010,16 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // patch SELECTS, not the one already saved, or pasting a Cartesia key
       // while switching from ElevenLabs validates against the wrong service
       const newTts = patch.tts;
-      // Chatterbox has no key at all — its credential is a local server
-      // address, and an ElevenLabs round trip would be the wrong test
+      // Server-address engines (Chatterbox, generic OpenAI-compatible) use
+      // an address — and an optional key for the generic one — so an
+      // ElevenLabs round trip would be the wrong test. Their address is
+      // verified through the voices list, not here.
       const selectedVoiceProvider = newTts?.provider ?? cfg.tts?.provider ?? "elevenlabs";
-      if (newTts?.key?.trim() && selectedVoiceProvider !== "chatterbox") {
+      if (
+        newTts?.key?.trim() &&
+        selectedVoiceProvider !== "chatterbox" &&
+        selectedVoiceProvider !== "openai-compatible"
+      ) {
         const check = await tts.verifyKey(newTts.key.trim());
         if (!check.ok) return json(res, 400, { error: check.message });
       }
