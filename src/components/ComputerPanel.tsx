@@ -47,6 +47,7 @@ import { browserAvailable, browserUnavailableReason, builtInBrowserEnabled } fro
 import { transitionComputerControlLease, type ComputerControlAction } from "@/lib/computer-control";
 import { LocalScreenPreview } from "./LocalScreenPreview";
 import { LinuxLocalControl } from "./LinuxLocalControl";
+import { canOpenExternalUrl } from "@/lib/loopback-viewer";
 import { MacLocalControl } from "./MacLocalControl";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import {
@@ -998,6 +999,11 @@ export function ComputerPanel({
       }
       if (!ownsConnection()) throw new DOMException("The selected conversation changed", "AbortError");
       if (!viewerUrl) throw new LocalizedPanelError("computer.err.noDesktopLink");
+      // A loopback desktop URL is dead on arrival from a LAN browser tab:
+      // fail with an explanation instead of opening a blank page.
+      if (!canOpenExternalUrl(viewerUrl, window.location.hostname)) {
+        throw new LocalizedPanelError("computer.err.loopbackOnLan");
+      }
 
       if (window.ogb?.desktopViewer) {
         const opened = await window.ogb.desktopViewer.open(viewerUrl, t("computer.viewerTitle", { name: bot.name }), bot.id);

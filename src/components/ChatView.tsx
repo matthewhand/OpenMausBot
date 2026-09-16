@@ -52,6 +52,7 @@ import { ThreadChip } from "./ThreadChip";
 import { VerifyCard } from "./VerifyCard";
 import { askText, runSteps, runSummary, showRun, skillPrompt, skillStaged } from "@/lib/verify-steps";
 import { ToolActivity } from "./ToolActivity";
+import { CommPopup } from "./CommPopup";
 import { ThreadRefText } from "./ThreadRefs";
 import { OptionCard, shouldHideOnboardingCard } from "./OptionCard";
 import { ApprovalCard } from "./ApprovalCard";
@@ -558,29 +559,44 @@ function PeerLabel({ peer }: { peer: PeerLine }) {
 
 /** A tool run: spinner while live, check/cross once settled. */
 function ActivityChip({ message, place = "auto" }: { message: Message; place?: EffectivePlace }) {
-  const { state, dispatch } = useStore();
   const tool = message.tool;
   if (!tool) return null;
   if (message.threadRef) return <ThreadChip message={message} />;
-  // bot⇄bot comm chip: opens the channel where the exchange lives
+  // bot⇄bot comm chip: opens the exchange in a popup so the person can read
+  // and chime in without leaving this conversation (re-applied from the fork
+  // after the upstream merge; the popup's Open room button still navigates).
   const comm = message.comm;
-  if (comm) {
-    const withBot = state.bots.find((b) => b.id === comm.withBotId);
-    return (
-      <div className="flex justify-start">
-        <button
-          onClick={() => dispatch({ type: "select", id: comm.groupId })}
-          title={t("chat.openConversationWith", { name: comm.withName })}
-          className="flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink"
-        >
-          <BotAvatar bot={withBot ?? { name: comm.withName, color: comm.withColor }} state="happy" size={16} />
-          <span className="max-w-[480px] truncate">{tool.name}</span>
-          <ChevronRight size={13} />
-        </button>
-      </div>
-    );
-  }
+  if (comm) return <CommExchangeChip comm={comm} toolName={tool.name} />;
   return <ToolActivity tool={tool} place={toolPlace(tool.name, place)} />;
+}
+
+/** Bot-to-bot exchange pill with a popup drill-down. Split out so the popup
+ * open-state lives in the chip, not in the memoized message list. */
+function CommExchangeChip({ comm, toolName }: { comm: NonNullable<Message["comm"]>; toolName: string }) {
+  const { state } = useStore();
+  const [open, setOpen] = useState(false);
+  const withBot = state.bots.find((b) => b.id === comm.withBotId);
+  return (
+    <div className="flex justify-start">
+      <button
+        onClick={() => setOpen(true)}
+        title={t("chat.openConversationWith", { name: comm.withName })}
+        className="flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink"
+      >
+        <BotAvatar bot={withBot ?? { name: comm.withName, color: comm.withColor }} state="happy" size={16} />
+        <span className="max-w-[480px] truncate">{toolName}</span>
+        <ChevronRight size={13} />
+      </button>
+      {open && (
+        <CommPopup
+          groupId={comm.groupId}
+          withName={comm.withName}
+          withColor={comm.withColor}
+          onClose={() => setOpen(false)}
+        />
+      )}
+    </div>
+  );
 }
 
 /** The settled transcript, memoized as one unit: during streaming every

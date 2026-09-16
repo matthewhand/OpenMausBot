@@ -788,6 +788,21 @@ describe("notification routing", () => {
       expect(once.revealThread).toEqual({ threadId: "t", nonce: 1 });
       expect(twice.revealThread?.nonce).toBe(2);
     });
+
+    it("opens the inspector focused on a tool event exactly once per chip click", () => {
+      const once = reducer(initialState, { type: "focusInspector", threadId: "t", toolName: "bash", at: 7 });
+      expect(once.inspectorOpen).toBe(true);
+      expect(once.inspectorFocus).toEqual({ threadId: "t", toolName: "bash", at: 7, nonce: 1, consumed: false });
+      // sibling surfaces yield, same as an explicit open
+      expect(once.settingsOpen).toBe(false);
+      expect(once.computerOpen).toBe(false);
+      const consumed = reducer(once, { type: "focusInspectorConsumed", nonce: 1 });
+      expect(consumed.inspectorFocus?.consumed).toBe(true);
+      // a stale nonce never un-consumes a newer focus
+      expect(reducer(consumed, { type: "focusInspectorConsumed", nonce: 0 }).inspectorFocus?.consumed).toBe(true);
+      const twice = reducer(consumed, { type: "focusInspector", threadId: "t", toolName: "bash", at: 8 });
+      expect(twice.inspectorFocus).toMatchObject({ nonce: 2, consumed: false });
+    });
   });
 
   it("identifies only the exact chat thread currently on screen", () => {

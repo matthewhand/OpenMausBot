@@ -25,7 +25,7 @@ import { t } from "@/lib/i18n";
 type Lens = "run" | "events" | "raw";
 
 export function InspectorPanel({ bot }: { bot: Bot }) {
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
   // Docked flush under the Windows caption corner: drop the header 16px.
   const { padClass } = useCaptionChrome();
   const threadId = bot.threadId;
@@ -171,6 +171,29 @@ export function InspectorPanel({ bot }: { bot: Bot }) {
     const el = listRef.current;
     if (el && stickToBottom.current) el.scrollTop = el.scrollHeight;
   }, [page?.entries.length, rows.length, lens]);
+
+  // One-shot deep link from a tool chip: jump to the events lens and expand
+  // the first row naming the tool. Runs again when rows arrive (the focus
+  // usually lands before the disk snapshot loads); the consumed flag keeps
+  // it exactly-once. A tool with no matching row still lands on the lens.
+  const focus = state.inspectorFocus;
+  useEffect(() => {
+    if (!focus || focus.consumed || focus.threadId !== threadId) return;
+    setLens("events");
+    const needle = focus.toolName.toLowerCase();
+    const match = rows.find(
+      (row) => row.summary.toLowerCase().includes(needle) || row.tag.toLowerCase().includes(needle),
+    );
+    if (match) {
+      setExpanded((prev) => {
+        if (prev.has(match.key)) return prev;
+        const next = new Set(prev);
+        next.add(match.key);
+        return next;
+      });
+    }
+    dispatch({ type: "focusInspectorConsumed", nonce: focus.nonce });
+  }, [focus, rows, threadId, dispatch]);
   const onScroll = () => {
     const el = listRef.current;
     if (!el) return;

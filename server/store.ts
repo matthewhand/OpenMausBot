@@ -255,6 +255,11 @@ export interface GroupRecord {
   bulletin: string;
   unread: boolean;
   createdAt: number;
+  /** Per-room hide from the sidebar, independent of archive: the room keeps
+   * working and stays reachable via search and the command palette. Absent =
+   * visible. Re-applied from the fork after the upstream merge; the renderer
+   * filter that reads it is still backlog. */
+  hidden?: boolean;
   /** true for auto-created bot⇄bot channels (ask_bot exchanges live here;
    * the user can open the channel and chip in) */
   dm?: boolean;
@@ -707,6 +712,11 @@ export interface BotRecord {
   rewound?: boolean;
   pinned?: boolean;
   hidden?: boolean;
+  /** Per-bot hide from the sidebar, independent of hidden/archive: the bot
+   * keeps working and stays reachable via search and the command palette.
+   * Absent = visible. Re-applied from the fork after the upstream merge;
+   * the renderer filter that reads it is still backlog. */
+  sidebarHidden?: boolean;
   /** Optional labeled divider used to organize this bot in the sidebar. */
   section?: string;
   /** the one message pinned to the top of this bot's active thread; a pin
@@ -1264,7 +1274,7 @@ export class Store {
     );
   }
 
-  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd" | "pinnedMessageId" | "section" | "setupCompletedAt" | "setupSkippedAt">>): GroupRecord | null {
+  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd" | "pinnedMessageId" | "section" | "setupCompletedAt" | "setupSkippedAt" | "hidden">>): GroupRecord | null {
     const group = this.group(id);
     if (!group) return null;
     if (Object.prototype.hasOwnProperty.call(patch, "section")) {

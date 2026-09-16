@@ -12,6 +12,8 @@ import {
   ClipboardCopy,
   Copy,
   Crown,
+  Eye,
+  EyeOff,
   FolderMinus,
   FolderPlus,
   Library,
@@ -394,6 +396,20 @@ function RoomContextMenu({
           {t("sidebar.section.moveToContext")}
         </button>
       )}
+      {!remoteClient && (
+        <button
+          onClick={() => {
+            dispatch({ type: "patchGroup", groupId: group.id, patch: { hidden: !group.hidden } });
+            onClose();
+          }}
+          className="flex w-full items-center gap-3 px-3.5 py-2 text-left text-[14px] text-ink hover:bg-raised/70"
+        >
+          {group.hidden
+            ? <Eye size={16} className="text-ink-secondary" />
+            : <EyeOff size={16} className="text-ink-secondary" />}
+          {group.hidden ? t("sidebar.room.show") : t("sidebar.room.hide")}
+        </button>
+      )}
       <button
         onClick={() => {
           void navigator.clipboard?.writeText(group.threadId);
@@ -748,6 +764,20 @@ export function BotContextMenu({
           bot.pinned ? <PinOff size={16} className="text-ink-secondary" /> : <Pin size={16} className="text-ink-secondary" />,
           bot.pinned ? t("sidebar.bot.unpin") : t("sidebar.bot.pin"),
           () => dispatch({ type: "updateBot", botId: bot.id, patch: { pinned: !bot.pinned } }),
+        ),
+        item(
+          bot.sidebarHidden ? <Eye size={16} className="text-ink-secondary" /> : <EyeOff size={16} className="text-ink-secondary" />,
+          bot.sidebarHidden ? t("sidebar.bot.show") : t("sidebar.bot.hide"),
+          () => {
+            dispatch({ type: "updateBot", botId: bot.id, patch: { sidebarHidden: !bot.sidebarHidden } });
+            // Hiding the open conversation would strand the main view: move
+            // to the next visible bot first (the patch itself is optimistic,
+            // so read the pre-click state already in hand).
+            if (!bot.sidebarHidden && state.selectedId === bot.id) {
+              const next = state.bots.find((c) => c.id !== bot.id && !c.hidden && !c.sidebarHidden);
+              if (next) dispatch({ type: "select", id: next.id });
+            }
+          },
         ),
         item(
           <Crown size={16} className={bot.chiefOfStaff ? "text-accent" : "text-ink-secondary"} />,
@@ -1344,9 +1374,11 @@ function ArchivedBotsPanel({
     setBusyId(bot.id);
     setError("");
     try {
+      // Restoring means fully back in the list: a bot tucked away before it
+      // was archived would otherwise vanish again with no visible toggle.
       const response = await api(`/api/bots/${bot.id}`, {
         method: "PATCH",
-        body: JSON.stringify({ hidden: false }),
+        body: JSON.stringify({ hidden: false, sidebarHidden: false }),
       });
       dispatch({ type: "botPatched", bot: response.bot });
       dispatch({ type: "select", id: bot.id });
@@ -1367,7 +1399,7 @@ function ArchivedBotsPanel({
         bots.map((bot) =>
           api(`/api/bots/${bot.id}`, {
             method: "PATCH",
-            body: JSON.stringify({ hidden: false }),
+            body: JSON.stringify({ hidden: false, sidebarHidden: false }),
           }),
         ),
       );
@@ -1618,7 +1650,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
     try {
       const response = await api(`/api/bots/${bot.id}`, {
         method: "PATCH",
-        body: JSON.stringify({ hidden: false }),
+        body: JSON.stringify({ hidden: false, sidebarHidden: false }),
       });
       dispatch({ type: "botPatched", bot: response.bot });
       dispatch({ type: "select", id: bot.id });
@@ -1651,18 +1683,27 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   // instantly from local state; transcript hits are the SearchResults
   // section below the list (debounced, lands on the message).
 
+  // Per-item sidebar hide (bots: sidebarHidden, rooms: hidden): folded out of
+  // the default list but still matched by search, so a tucked conversation
+  // is always reachable — and its own context menu (rendered on the matched
+  // row) is the way back. Archived (hidden) bots stay excluded always; they
+  // come back through Archived bots.
   const matchingBots = state.bots
     .filter((b) => !b.hidden)
     .filter(
       (b) =>
-        !q ||
-        b.name.toLowerCase().includes(q) ||
-        (b.title ?? "").toLowerCase().includes(q) ||
-        preview(b).toLowerCase().includes(q) ||
-        b.tasks?.some((task) => !task.routineRunId && task.title.toLowerCase().includes(q)) ||
-        b.projects?.some((folder) => folder.name.toLowerCase().includes(q)),
+        (!q && !b.sidebarHidden) ||
+        (q &&
+          (b.name.toLowerCase().includes(q) ||
+          (b.title ?? "").toLowerCase().includes(q) ||
+          preview(b).toLowerCase().includes(q) ||
+          b.tasks?.some((task) => !task.routineRunId && task.title.toLowerCase().includes(q)) ||
+          b.projects?.some((folder) => folder.name.toLowerCase().includes(q)))),
     );
-  const visibleGroups = state.groups.filter((g) => !q || g.name.toLowerCase().includes(q) || g.tasks?.some((task) => task.title.toLowerCase().includes(q)));
+  const visibleGroups = state.groups.filter((g) =>
+    (!q && !g.hidden) ||
+    (q && (g.name.toLowerCase().includes(q) || g.tasks?.some((task) => task.title.toLowerCase().includes(q)))),
+  );
   const {
     unsectionedChief,
     pinnedBots,

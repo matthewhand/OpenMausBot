@@ -2332,6 +2332,12 @@ function updateChannel(groupId: string, value: unknown): GroupRecord {
     if (typeof body.unread !== "boolean") throw Object.assign(new Error("unread must be true or false"), { status: 400 });
     patch.unread = body.unread;
   }
+  // Per-room sidebar hide, independent of archive. Display-only like unread:
+  // allowed through the client session scope (see clientGroupPatchViolation).
+  if (body.hidden !== undefined) {
+    if (typeof body.hidden !== "boolean") throw Object.assign(new Error("hidden must be true or false"), { status: 400 });
+    patch.hidden = body.hidden;
+  }
   if (body.memberIds !== undefined) {
     // A DM is the pair it was opened for; only real rooms have a roster.
     if (existing.dm) throw Object.assign(new Error("direct-message channels cannot change members"), { status: 400 });
@@ -13525,6 +13531,15 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "mascotBody", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
+      }
+      // Per-bot sidebar hide, independent of hidden/archive. Validated as a
+      // boolean (unlike the legacy passthrough keys above) so junk never
+      // persists; the renderer filter that reads it is still backlog.
+      if (body.sidebarHidden !== undefined) {
+        if (typeof body.sidebarHidden !== "boolean") {
+          return json(res, 400, { error: "sidebarHidden must be a boolean" });
+        }
+        patch.sidebarHidden = body.sidebarHidden;
       }
       const computerSpecified = Object.prototype.hasOwnProperty.call(body, "computer");
       let requestedComputer = existingBot?.computer;

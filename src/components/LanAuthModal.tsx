@@ -1,13 +1,24 @@
 import { useState } from "react";
 import { KeyRound, Loader2, ShieldAlert } from "lucide-react";
 import { readLanAuthToken, saveLanAuthToken } from "@/lib/lan-auth";
-import { useStore } from "@/state/store";
 
-export function LanAuthModal() {
-  const { state, dispatch } = useStore();
+// NOTE: this modal is currently unwired — nothing renders it yet. It used to
+// read fork store state (authError/authRequired) that did not survive the
+// upstream merge, so it now runs on props + the omb:auth-change window event
+// that saveLanAuthToken fires (see lib/lan-auth.ts). The remaining #16 work
+// is the trigger: rendering this on the server's 401 and retrying boot once
+// onAuthenticated fires. Preserved here (and in backup/fix-composer-2026-09-15)
+// so that port does not start from scratch.
+export function LanAuthModal({
+  initialError = null,
+  onAuthenticated,
+}: {
+  initialError?: string | null;
+  onAuthenticated?: () => void;
+}) {
   const [token, setToken] = useState(() => readLanAuthToken());
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(state.authError ?? null);
+  const [error, setError] = useState<string | null>(initialError);
 
   const handleSubmit = async (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -27,7 +38,7 @@ export function LanAuthModal() {
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error ?? "Invalid access token");
       saveLanAuthToken(trimmed);
-      dispatch({ type: "authRequired", required: false, error: null });
+      onAuthenticated?.();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Invalid access token");
     } finally {
@@ -69,10 +80,10 @@ export function LanAuthModal() {
             </p>
           </div>
 
-          {(error ?? state.authError) && (
+          {(error) && (
             <div className="flex items-start gap-2 rounded-xl bg-danger/10 p-3 text-[12.5px] text-danger">
               <ShieldAlert size={16} className="mt-0.5 shrink-0" />
-              <span>{error ?? state.authError}</span>
+              <span>{error}</span>
             </div>
           )}
 

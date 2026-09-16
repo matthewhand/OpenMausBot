@@ -208,6 +208,9 @@ export interface Group {
   createdAt: number;
   /** auto-created bot⇄bot channel (ask_bot exchanges mirror here) */
   dm?: boolean;
+  /** Per-room hide from the sidebar, independent of archive. Mirrors the
+   * server GroupRecord flag; rooms stay reachable via search. */
+  hidden?: boolean;
   busyBotId?: string | null;
   /** True for the whole orchestrated run, including hand-offs between members. */
   working?: boolean;
@@ -364,6 +367,9 @@ export interface Bot {
   voice?: string;
   pinned?: boolean;
   hidden?: boolean;
+  /** Per-bot hide from the sidebar, independent of hidden/archive. Mirrors
+   * the server BotRecord flag; bots stay reachable via search. */
+  sidebarHidden?: boolean;
   /** Sidebar section this bot renders under; absent = unsectioned. */
   section?: string;
   /** the one message pinned to the top of this bot's active thread */
@@ -706,6 +712,9 @@ export interface AppState {
   computerOpen: boolean;
   /** the per-thread event inspector (runtime stream + native protocol tee) */
   inspectorOpen: boolean;
+  /** one-shot deep link from a tool chip into the inspector: the panel opens,
+   * jumps to the events lens, and expands the first row naming the tool. */
+  inspectorFocus: { threadId: string; toolName: string; at: number; nonce: number; consumed: boolean } | null;
   appSettingsOpen: boolean;
   appSettingsSection: AppSettingsSection;
   shortcutsOpen: boolean;
@@ -872,7 +881,7 @@ export type Action =
   | {
       type: "patchGroup";
       groupId: string;
-      patch: Partial<Pick<Group, "name" | "bulletin" | "memberIds" | "defaultResponder" | "pinnedMessageId" | "section">>;
+      patch: Partial<Pick<Group, "name" | "bulletin" | "memberIds" | "defaultResponder" | "pinnedMessageId" | "section" | "hidden">>;
     }
   | { type: "deleteGroup"; groupId: string }
   | { type: "newGroupTask"; groupId: string }
@@ -956,6 +965,8 @@ export type Action =
   | { type: "toggleNewBot"; open?: boolean }
   | { type: "toggleComputer"; open?: boolean }
   | { type: "toggleInspector"; open?: boolean }
+  | { type: "focusInspector"; threadId: string; toolName: string; at: number }
+  | { type: "focusInspectorConsumed"; nonce: number }
   | { type: "focusMessage"; threadId: string; messageId: string }
   | { type: "focusMessageConsumed"; nonce: number }
   | { type: "toggleAppSettings"; open?: boolean; section?: AppSettingsSection }
@@ -1659,6 +1670,24 @@ export function reducer(state: AppState, action: Action): AppState {
         appSettingsOpen: open ? false : state.appSettingsOpen,
       };
     }
+    case "focusInspector":
+      return {
+        ...state,
+        inspectorOpen: true,
+        settingsOpen: false,
+        computerOpen: false,
+        appSettingsOpen: false,
+        inspectorFocus: {
+          threadId: action.threadId,
+          toolName: action.toolName,
+          at: action.at,
+          nonce: (state.inspectorFocus?.nonce ?? 0) + 1,
+          consumed: false,
+        },
+      };
+    case "focusInspectorConsumed":
+      if (!state.inspectorFocus || state.inspectorFocus.nonce !== action.nonce) return state;
+      return { ...state, inspectorFocus: { ...state.inspectorFocus, consumed: true } };
     case "toggleAppSettings": {
       const open = action.open ?? !state.appSettingsOpen;
       return {
@@ -1941,6 +1970,7 @@ export const initialState: AppState = {
   botCreationPending: false,
   computerOpen: false,
   inspectorOpen: false,
+  inspectorFocus: null,
   appSettingsOpen: false,
   appSettingsSection: "general",
   shortcutsOpen: false,
