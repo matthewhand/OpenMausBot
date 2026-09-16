@@ -81,14 +81,15 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
 
   if (!open) return null;
 
+  // NOTE: the fork's hideSidebarBots / hideInterBotChannels filters used to
+  // narrow these lists, but that sidebar state did not survive the upstream
+  // merge. The palette shows everything until the hide feature is re-wired
+  // against the upstream store (see backup/fix-composer-2026-09-15).
   const bots = rankByName(
-    state.bots.filter((b) => !b.hidden && (!state.hideSidebarBots || b.chiefOfStaff)),
+    state.bots.filter((b) => !b.hidden),
     q,
   );
-  const rooms = rankByName(
-    state.hideInterBotChannels ? state.groups.filter((g) => !g.dm) : state.groups,
-    q,
-  );
+  const rooms = rankByName(state.groups, q);
   const entries: PaletteEntry[] = [
     ...bots.map((bot): PaletteEntry => ({ kind: "bot", bot })),
     ...rooms.map((group): PaletteEntry => ({ kind: "room", group })),

@@ -837,9 +837,19 @@ describe("config status frames", () => {
       threads: { maxConcurrentPerBot: 10 },
       localVm: { mode: "per-bot", maxInstances: 3 },
       opencodeGo: { configured: true },
-      tts: { configured: true, ready: true, voice: "Ada" },
+      tts: { provider: "elevenlabs", configured: true, ready: true, voice: "Ada", baseUrl: "" },
       profile: { name: "Ian", email: "ian@example.test" },
       features: { skillAuthoring: true },
+      // Newer frame keys upstream added after the fork diverged; absent here
+      // means undefined, same as a server that does not send them.
+      imageGen: undefined,
+      language: undefined,
+      onboarding: undefined,
+      browserEngine: undefined,
+      browserProfiles: undefined,
+      edition: undefined,
+      budgets: undefined,
+      billing: undefined,
     });
   });
 });
