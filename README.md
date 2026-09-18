@@ -6,7 +6,7 @@
 
 **Your own team of AI bots, in a chat app.**
 
-<sub>An open-source version of **Grok Bot** — bring-your-own-agent, local-first, on the models you already have.</sub>
+<sub>An independent, open-source project inspired by **Grok Bot** — bring-your-own-agent, local-first, on the models you already have. Not affiliated with xAI.</sub>
 
 Every bot in the sidebar is a real agent — Claude or Codex running locally under the hood — with its own
 personality, its own model, its own cloud computer, and its own connected apps.
@@ -56,7 +56,7 @@ Talk to them like contacts. Watch them work. Approve what matters.
 
 ## Why
 
-One assistant in one box is the wrong shape for agents. OpenMausBot is an open-source take on **Grok Bot** —
+One assistant in one box is the wrong shape for agents. OpenMausBot is an independent, open-source project inspired by **Grok Bot** —
 it keeps the idea (AI as a *messaging app*: a roster of bots you chat with, each with its own personality,
 memory of its thread, model, computer, and apps) and rebuilds it open, local-first, and on the agents you
 already have:
@@ -169,13 +169,42 @@ Press the speaker on any reply, or switch a bot to read its answers out as they 
 to what ran overnight while you make breakfast. Hit **call** and it's a conversation: it hears you, tells
 you what it's doing while it works, and asks for approvals out loud.
 
-Choose your TTS provider: **ElevenLabs** (cloud, high quality) or **OpenAI-compatible** (local servers like
-Kokoro, or any service using the OpenAI audio API). Paste your credentials once in App Settings, pick a
-voice, and every bot can talk. Give a bot its own voice and a channel stops sounding like one person.
+Choose ElevenLabs, Fish Audio, built-in Mac voices, a local Chatterbox server, or any OpenAI-compatible server (like Kokoro) in an agent profile. Paste a cloud key once when needed, pick a voice, and every bot can talk.
+Give a bot its own voice and a channel stops sounding like one person.
 
 **Also in the box:** streaming replies with tool-run activity chips · native macOS dictation from the
 composer mic (on-device Apple speech recognition — desktop app) · SupaMaus cursor mascots with role-aware
 expressions · screenshots of the bot's work folded into the transcript.
+
+## Powered By
+
+<div align="center">
+
+![Claude](https://img.shields.io/badge/Claude-d97757?logo=claude&logoColor=white)
+![Codex](https://img.shields.io/badge/Codex-000000)
+![Grok](https://img.shields.io/badge/Grok%20CLI-000000?logo=x&logoColor=white)
+![Electron](https://img.shields.io/badge/Electron-2B2E3A?logo=electron&logoColor=9FEAF9)
+![React](https://img.shields.io/badge/React-20232A?logo=react&logoColor=61DAFB)
+![Vite](https://img.shields.io/badge/Vite-646CFF?logo=vite&logoColor=white)
+![Tailwind CSS](https://img.shields.io/badge/Tailwind%20CSS-0F172A?logo=tailwindcss&logoColor=38BDF8)
+![Composio](https://img.shields.io/badge/Composio-e6493a)
+![Cua](https://img.shields.io/badge/Cua%20Driver-1f2937)
+![ElevenLabs](https://img.shields.io/badge/ElevenLabs-000000?logo=elevenlabs&logoColor=white)
+![Fish Audio](https://img.shields.io/badge/Fish%20Audio-2563eb)
+![Polar](https://img.shields.io/badge/Polar-0062ff)
+
+</div>
+
+| Service | Purpose |
+|---|---|
+| **Claude · Codex · Grok** | The agents behind every bot, run through their local CLIs |
+| **Electron** | Desktop shells for macOS, Windows, and Ubuntu |
+| **React + Vite + Tailwind CSS** | The chat app UI and its build |
+| **Box** ([box.ascii.dev](https://box.ascii.dev)) | Each bot's cloud computer |
+| **Composio** | Connected apps — Gmail, Slack, GitHub, and more |
+| **Cua Driver** | Native computer use on your own machine |
+| **ElevenLabs · Fish Audio** | Hosted voices for bots that talk back |
+| **Polar** | One-time and monthly project support |
 
 ## How it works
 
@@ -211,7 +240,7 @@ flowchart LR
 | Drivers | `server/drivers/` | One per provider: Claude, Codex, and Grok Build over their local CLIs (stream-JSON / JSON-RPC / ACP), plus a cloud-computer agent. Unknown drivers degrade to "unavailable", never crash the fleet. |
 | Harness | `server/harness/` | Registry (configs → live instances) and the fan-in event bus every client folds. |
 | API | `server/index.ts` | Bots, turns, approvals, model catalog, computer lifecycle, connectors, config — HTTP + SSE. |
-| Voice | `server/tts/` | ElevenLabs, bring your own key. Runs on the harness so the key never reaches the UI; markdown is rewritten into something worth hearing before it is spoken. |
+| Voice | `server/tts/` | ElevenLabs, Fish Audio, built-in Mac voices, or local Chatterbox. Cloud keys stay on the harness; markdown is rewritten into something worth hearing before it is spoken. |
 | App | `src/` | The chat shell. Server-backed store, one reducer, zero client-side transports. |
 | Desktop | `electron/` | macOS, Windows, and Ubuntu shells with an embedded harness and platform capabilities; Apple speech stays macOS-only, Ubuntu Xorg has opt-in local control, and Wayland remains fail-closed. |
 
@@ -293,7 +322,9 @@ in the sidebar footer) when you want to enable its integration:
 |---|---|---|
 | Composio project key (`ak_…`) | Connect Gmail, GitHub, Slack, Notion, and other apps to your bots | [OpenMausBot Composio setup](docs/composio.md) |
 | Box API key | Give bots an isolated remote Linux computer with a desktop and terminal | [Box API key guide](https://docs.ascii.dev/box/api-keys) |
-| TTS provider | Read replies aloud and call your bots — choose ElevenLabs or OpenAI-compatible (Kokoro, etc.) | [ElevenLabs keys](https://elevenlabs.io/app/settings/api-keys) or [local Kokoro setup](docs/voice-mode.md) |
+| ElevenLabs key | Read replies aloud, and call your bots | [ElevenLabs API keys](https://elevenlabs.io/app/settings/api-keys) |
+| Fish Audio key | Read replies aloud with Fish Audio voices, and call your bots | [Fish Audio API keys](https://fish.audio/app/api-keys/) |
+| TTS provider | Read replies aloud with a local server — Chatterbox or any OpenAI-compatible endpoint (Kokoro, etc.) | [local Kokoro setup](docs/voice-mode.md) |
 **Custom MCP servers** are configured in the sidebar **Plugins** panel (puzzle icon in the footer), on the
 **Custom MCP** tab. No account or API key required — just point at your HTTP or SSE MCP server URL. See the
 [MCP servers directory](https://github.com/modelcontextprotocol/servers) for examples.
@@ -350,9 +381,8 @@ Early but real — the loop works end to end: message → agent → streamed rep
 computer use. macOS, Windows, and Ubuntu 24.04 x64 have released builds; Ubuntu remains a beta with the
 capability limits above. Rough edges to expect: hosted/mobile connectivity is still being built, and webhook
 triggers currently use the local receiver rather than an always-on hosted relay.
-Voice supports ElevenLabs and OpenAI-compatible providers (like local Kokoro), and calls are macOS-only for
-now (they ride the same on-device dictation as the composer mic) — see [`docs/voice-mode.md`](docs/voice-mode.md)
-for the design and the known gaps.
+Hosted voice needs an ElevenLabs or Fish Audio key; built-in Mac, local Chatterbox, and OpenAI-compatible (e.g. local Kokoro) voices need no cloud key. Calls are macOS-only for now (they ride the same on-device dictation as
+the composer mic) — see [`docs/voice-mode.md`](docs/voice-mode.md) for the design and the known gaps.
 
 Contributions welcome — the driver SPI in [`server/contracts.ts`](server/contracts.ts) is deliberately
 small; adding a provider is one file in [`server/drivers/`](server/drivers/) plus a one-line registration.

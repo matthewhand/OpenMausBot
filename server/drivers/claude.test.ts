@@ -1027,6 +1027,39 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(seen.argv).not.toContain("--setting-sources");
   });
 
+  it("loads the machine's own MCP servers when the turn asks, keeping the rest isolated", async () => {
+    await create();
+    const dump = join(scratch, "user-mcp.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-user-mcp", text: "hi", mcpFromUserConfig: true });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    // the Plugins → MCP servers switch: only the MCP half of the isolation
+    // goes; skills, hooks and the personal CLAUDE.md stay out
+    expect(seen.argv).not.toContain("--strict-mcp-config");
+    expect(seen.argv[seen.argv.indexOf("--setting-sources") + 1]).toBe("project");
+  });
+
+  it("mounts a url server in the CLI's own shape, header values in the private file", async () => {
+    await create();
+    const dump = join(scratch, "remote-mcp.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-remote-mcp",
+      text: "hi",
+      integrations: { custom: { docs: { type: "http", url: "https://docs.example/mcp", headers: { Authorization: "Bearer tok-docs" } } } },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    // the CLI connects itself; there is no process for the gate to stand between
+    expect(seen.mcpConfig.mcpServers.docs).toEqual({ type: "http", url: "https://docs.example/mcp", headers: { Authorization: "Bearer tok-docs" } });
+    expect(JSON.stringify(seen.argv)).not.toContain("tok-docs");
+  });
+
   it("preserves only the selected account's auth settings in a private file", async () => {
     const account = join(scratch, "account");
     mkdirSync(account);
@@ -1654,7 +1687,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       const openedBefore = recorder.events.filter((e) => e.type === "request.opened").length;
       await instance.adapter.interruptTurn(threadId);
       expect(instance.adapter.hasSession(threadId)).toBe(true);
-      await expect(instance.adapter.steer!(threadId, "replacement")).resolves.toBe(false);
+      await expect(instance.adapter.steer!(threadId, "replacement")).resolves.toBe("refused");
       expect(recorder.events).toContainEqual(expect.objectContaining({
         type: "request.resolved", requestId: "before-stop", behavior: "deny", source: "system",
       }));
@@ -1726,7 +1759,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     const { turnId } = await instance.adapter.sendTurn({ threadId: "t-steer", text: "first" });
     await recorder.until((e) => e.type === "item.completed" && e.itemType === "tool");
     expect(instance.adapter.capabilities.queueing).toBe(true);
-    await expect(instance.adapter.steer!("t-steer", "and also this")).resolves.toBe(true);
+    await expect(instance.adapter.steer!("t-steer", "and also this")).resolves.toBe("steered");
     // Hold the turn until the child has consumed the steer; an 800ms timer
     // can finish before a loaded CI runner resumes this test's continuation.
     await expect.poll(() => existsSync(received)).toBe(true);
@@ -1738,7 +1771,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     ) as { text: string };
     expect(reply.text).toContain("steered: and also this");
     expect(recorder.events.every((e) => e.turnId === turnId)).toBe(true);
-    await expect(instance.adapter.steer!("t-steer", "late")).resolves.toBe(false);
+    await expect(instance.adapter.steer!("t-steer", "late")).resolves.toBe("refused");
   });
 
   it("reuses the live process for the next compatible turn", async () => {
@@ -2455,6 +2488,15 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await expect(instance.reviewPermission?.("review this request")).resolves.toBe("fake generated text");
   });
 
+  it("stops the one-shot text call when its caller aborts mid-flight", async () => {
+    await create();
+    process.env.FAKE_CLAUDE_TEXT_HANG = "1";
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 100);
+    await expect(instance.generateText?.("summarize safely", { signal: controller.signal }))
+      .rejects.toThrow(/aborted/);
+  });
+
   it("stops permission review when its caller gives up", async () => {
     await create();
     const controller = new AbortController();
@@ -2499,6 +2541,7 @@ describe("ClaudeDriver resume recovery (fake CLI)", () => {
   afterEach(async () => {
     delete process.env.FAKE_CLAUDE_MODE;
     delete process.env.FAKE_CLAUDE_DUMP;
+    delete process.env.FAKE_CLAUDE_TEXT_HANG;
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -2525,12 +2568,34 @@ describe("ClaudeDriver resume recovery (fake CLI)", () => {
     const started = recorder.events.filter((e) => e.type === "session.started");
     expect(started.length).toBeGreaterThan(0);
     expect(started.at(-1)).not.toMatchObject({ sessionId: "a-session-claude-no-longer-has" });
+    expect(started.at(-1)).toMatchObject({ rebuilt: true });
     // and the new session is not blank: the prompt is the rebuild, once
     const seen = JSON.parse(readFileSync(dump, "utf8"));
     expect(seen.argv).not.toContain("--resume");
     const content = seen.prompt.message.content;
     const text = typeof content === "string" ? content : content.map((c: any) => c.text ?? "").join("");
     expect(text).toBe(REBUILD);
+  });
+
+  it("does not announce a replacement as rebuilt when there was nothing to replay", async () => {
+    // recoveryPromptFor falls back to the turn text when the harness attached
+    // no rebuild: that session holds the turn, not the conversation, and the
+    // harness must not credit it with a replay it never saw.
+    const dump = join(scratch, "no-replay.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "t-no-replay",
+      text: "what now?",
+      resumeCursor: "a-session-claude-no-longer-has",
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+    const started = recorder.events.filter((e) => e.type === "session.started");
+    expect(started.length).toBeGreaterThan(0);
+    expect(started.at(-1)).not.toMatchObject({ rebuilt: true });
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv).not.toContain("--resume");
+    const content = seen.prompt.message.content;
+    expect(typeof content === "string" ? content : content.map((c: any) => c.text ?? "").join("")).toBe("what now?");
   });
 
   it("recovers only once, then fails visibly", async () => {

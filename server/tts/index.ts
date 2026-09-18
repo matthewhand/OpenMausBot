@@ -1,18 +1,19 @@
-// Voice, wired to config. Four engines live behind this file: ElevenLabs
-// (elevenlabs.ts, needs a key), the Mac's built-in voices
-// (system-voices.ts, no key), a local Chatterbox server
-// (chatterbox.ts, an address instead of a key), and any OpenAI-compatible
-// server (openai-compatible.ts, e.g. Kokoro-FastAPI or LiteLLM — an
-// address, an optional key, and a model id). This file is only the part
-// that reads ~/.openmausbot/config.json, picks the engine, and decides
-// whether there is a voice at all.
+// Voice, wired to config. Five engines live behind this file: ElevenLabs
+// (elevenlabs.ts, needs a key), Fish Audio (fish.ts, needs its own key),
+// the Mac's built-in voices (system-voices.ts, no key), a local Chatterbox
+// server (chatterbox.ts, an address instead of a key), and any
+// OpenAI-compatible server (openai-compatible.ts, e.g. Kokoro-FastAPI or
+// LiteLLM — an address, an optional key, and a model id). This file is only
+// the part that reads ~/.openmausbot/config.json, picks the engine, and
+// decides whether there is a voice at all.
 import type { AppConfig } from "../config.ts";
 import * as chatterbox from "./chatterbox.ts";
 import * as elevenlabs from "./elevenlabs.ts";
+import * as fish from "./fish.ts";
 import * as openaiCompatible from "./openai-compatible.ts";
 import * as systemVoices from "./system-voices.ts";
 
-export type VoiceProvider = "elevenlabs" | "system" | "chatterbox" | "openai-compatible";
+export type VoiceProvider = "elevenlabs" | "fish" | "system" | "chatterbox" | "openai-compatible";
 
 export class NoVoiceConfigured extends Error {
   // a plain field rather than a constructor parameter property: the harness
@@ -33,7 +34,10 @@ export class NoVoiceConfigured extends Error {
 
 export function voiceProvider(cfg: AppConfig): VoiceProvider {
   const selected = cfg.tts?.provider;
-  return selected === "system" || selected === "chatterbox" || selected === "openai-compatible"
+  return selected === "fish" ||
+    selected === "system" ||
+    selected === "chatterbox" ||
+    selected === "openai-compatible"
     ? selected
     : "elevenlabs";
 }
@@ -51,6 +55,7 @@ export function providerConfigured(cfg: AppConfig): boolean {
   const provider = voiceProvider(cfg);
   if (provider === "system") return systemVoices.systemVoicesAvailable();
   if (provider === "chatterbox" || provider === "openai-compatible") return Boolean(serverAddress(cfg));
+  if (provider === "fish") return Boolean(cfg.tts?.fishKey);
   return Boolean(cfg.tts?.key);
 }
 
@@ -62,6 +67,7 @@ export function voiceConfigured(cfg: AppConfig): boolean {
   if (provider === "chatterbox" || provider === "openai-compatible") {
     return Boolean(serverAddress(cfg) && cfg.tts?.voice);
   }
+  if (provider === "fish") return Boolean(cfg.tts?.fishKey && cfg.tts?.voice);
   return Boolean(cfg.tts?.key && cfg.tts?.voice);
 }
 
@@ -75,6 +81,7 @@ export function voiceReady(cfg: AppConfig, voiceId?: string): boolean {
   if (provider === "chatterbox" || provider === "openai-compatible") {
     return Boolean(serverAddress(cfg) && (voiceId || cfg.tts?.voice));
   }
+  if (provider === "fish") return Boolean(cfg.tts?.fishKey && (voiceId || cfg.tts?.voice));
   return Boolean(cfg.tts?.key && (voiceId || cfg.tts?.voice));
 }
 
@@ -94,8 +101,8 @@ export function describeVoice(cfg: AppConfig) {
   };
 }
 
-export function verifyKey(key: string) {
-  return elevenlabs.verifyKey(key);
+export function verifyKey(provider: "elevenlabs" | "fish", key: string) {
+  return provider === "fish" ? fish.verifyKey(key) : elevenlabs.verifyKey(key);
 }
 
 /** Verify a server-address engine before saving: a cheap speech probe
@@ -110,6 +117,10 @@ export async function listVoices(cfg: AppConfig, run?: systemVoices.Runner): Pro
   if (provider === "chatterbox") {
     const baseUrl = serverAddress(cfg);
     return baseUrl ? chatterbox.listChatterboxVoices(baseUrl) : [];
+  }
+  if (provider === "fish") {
+    const key = cfg.tts?.fishKey;
+    return key ? fish.listVoices(key) : [];
   }
   if (provider === "openai-compatible") {
     const baseUrl = serverAddress(cfg);
@@ -144,6 +155,18 @@ export function speak(cfg: AppConfig, text: string, voiceId?: string, run?: syst
     const voice = voiceId || cfg.tts?.voice;
     if (!voice) throw new NoVoiceConfigured("voice");
     return chatterbox.synthesizeChatterbox(text, voice, baseUrl, cfg.tts?.model);
+  }
+  if (provider === "fish") {
+    const key = cfg.tts?.fishKey;
+    if (!key) {
+      throw new NoVoiceConfigured(
+        "key",
+        "Add a Fish Audio key in Settings on the computer to turn on voice.",
+      );
+    }
+    const voice = voiceId || cfg.tts?.voice;
+    if (!voice) throw new NoVoiceConfigured("voice");
+    return fish.synthesize(text, voice, key);
   }
   if (provider === "openai-compatible") {
     const baseUrl = serverAddress(cfg);
