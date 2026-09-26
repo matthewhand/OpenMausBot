@@ -12,6 +12,7 @@ import type { IncomingMessage } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
 
+import { isIpInCidrs, normalizeClientIp, parseBypassConfig, type Ipv4Cidr } from "./cidr.ts";
 import type { Scope, SessionRecord, SessionRegistry } from "./sessions.ts";
 import { denyReason as companionDenial } from "../companion/src/routes.ts";
 
@@ -327,6 +328,39 @@ function secureTokenMatch(actual: string | undefined, expected: string): boolean
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
+/** LAN access (docs/headless-lan-access.md): with OMB_AUTH_TOKEN set, every
+ * API caller must present it — loopback included — unless their source
+ * address is bypassed below. Read per request so a unit test can stub the
+ * environment; an empty value counts as unset, as in the docs' headless
+ * "no token" deployments. */
+function lanAuthToken(): string | null {
+  return process.env.OMB_AUTH_TOKEN || null;
+}
+
+/** Parsed OMB_LAN_BYPASS_CIDR ("127.0.0.1/32, 10.0.0.0/24", or `true` for
+ * every RFC1918 range plus loopback), re-parsed only when it changes. */
+let lanBypassCache: { raw: string; cidrs: Ipv4Cidr[] } | null = null;
+function lanBypassCidrs(): Ipv4Cidr[] {
+  const raw = process.env.OMB_LAN_BYPASS_CIDR ?? "";
+  if (!lanBypassCache || lanBypassCache.raw !== raw) lanBypassCache = { raw, cidrs: parseBypassConfig(raw) };
+  return lanBypassCache.cidrs;
+}
+
+/** Whether this request comes from a bypassed subnet. The source follows the
+ * pairing-lockout rule (requestSource): the socket peer, or the trusted local
+ * proxy's last X-Forwarded-For hop — never a header the peer itself wrote.
+ * A browser inside the subnet must still talk to itself or come from a
+ * loopback origin, so a foreign page cannot ride the machine's address into
+ * the API just because that machine is bypassed. */
+function lanBypassMatch(req: IncomingMessage): boolean {
+  const cidrs = lanBypassCidrs();
+  if (!cidrs.length) return false;
+  const source = normalizeClientIp(requestSource(req));
+  if (!source || !isIpInCidrs(source, cidrs)) return false;
+  const origin = headerValue(req.headers.origin);
+  return isAllowedOrigin(origin) || isSameOrigin(req);
+}
+
 /** Decide how this request is authenticated. Never throws. */
 export function resolveRequestAuth(req: IncomingMessage, options: ResolveOptions): RequestAuthResult {
   const method = req.method ?? "GET";
@@ -371,9 +405,29 @@ export function resolveRequestAuth(req: IncomingMessage, options: ResolveOptions
     return deny(401, "unauthorized: this session has expired or was revoked; pair this device again");
   }
 
+  // LAN token mode (docs/headless-lan-access.md): OMB_AUTH_TOKEN retires the
+  // loopback owner rule below for API paths. A matching token — the
+  // Authorization header, or ?access_token= for the EventSource, which
+  // cannot send one — or a source address in OMB_LAN_BYPASS_CIDR continues
+  // into that same owner path (and its checks); anything else is refused
+  // first, loopback included. Paired sessions above already authenticated.
+  // /api/internal/ is exempt: the spawned agent proxies never receive
+  // OMB_AUTH_TOKEN and authenticate with their own per-turn capability.
+  const lanToken = lanAuthToken();
+  let lanOwner = false;
+  if (lanToken && path.startsWith("/api/") && !path.startsWith("/api/internal/")) {
+    // The query form exists for EventSource, which cannot send a header
+    // (docs/headless-lan-access.md scopes it to /api/events); keeping it on
+    // the stream path alone stops a token landing in an access log for an
+    // ordinary API call.
+    const queryToken = path === options.streamPath ? options.url.searchParams.get("access_token") ?? undefined : undefined;
+    lanOwner = secureTokenMatch(bearer || queryToken, lanToken) || lanBypassMatch(req);
+    if (!lanOwner) return deny(401, "unauthorized: valid OMB_AUTH_TOKEN required");
+  }
+
   const proxied = isProxied(req);
   const loopback = !proxied && isLoopbackHost(headerValue(req.headers.host)) && isAllowedOrigin(headerValue(req.headers.origin));
-  if (loopback) {
+  if (loopback || lanOwner) {
     const companionToken = headerValue(req.headers["x-openmausbot-companion-auth"]);
     if (companionToken && options.loopbackMutationToken !== undefined) {
       if (
