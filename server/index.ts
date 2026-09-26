@@ -433,6 +433,7 @@ import {
 import { cookieMaxAgeSeconds, formatPairingCode, SessionRegistry, type Scope } from "./sessions.ts";
 import { describeBrand, loadBrand } from "./brand.ts";
 import { deliverSseFrame } from "./sse-fanout.ts";
+import { healthPayload } from "./health-payload.ts";
 import {
   PHONE_SECRET_PROTOCOL_VERSION,
   PhoneSecretBridge,
@@ -10253,20 +10254,25 @@ function configStatus() {
     browserProfiles: cfg.browserProfiles ?? [],
     // who may sign in with an emailed code (server/account-signin.ts)
     signIn: { admins: cfg.signIn?.admins ?? [], members: cfg.signIn?.members ?? [] },
+    // Custom MCP servers as the settings screen lists them: names, commands,
+    // URLs and credential key NAMES — listMcpServers never carries env or
+    // header values. configForAccess strips it for non-admin callers.
+    mcpServers: listMcpServers(cfg.mcpServers),
   };
 }
 
 function configForAccess(status: ReturnType<typeof configStatus>, admin: boolean) {
   if (admin) return status;
   // Configured-or-not is fine; an SSH alias, an email, a browser partition
-  // id, and the sign-in list are not a client's business. Preserve the
-  // source objects.
+  // id, the sign-in list and the MCP command lines are not a client's
+  // business. Preserve the source objects.
   return {
     ...status,
     signIn: { admins: [], members: [] },
     vps: { configured: status.vps.configured, sshAlias: "" },
     profile: { name: status.profile.name, email: "" },
     browserProfiles: status.browserProfiles.map((profile) => Object.fromEntries(Object.entries(profile).filter(([key]) => key !== "partitionId"))),
+    mcpServers: [],
   };
 }
 
@@ -10620,6 +10626,26 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
   }
   const path = url.pathname;
   const method = req.method ?? "GET";
+  // ── cross-origin access (docs/headless-lan-access.md) ────────────────
+  // With OMB_CORS_ORIGIN set every response carries the allow headers, and a
+  // preflight is answered here — OPTIONS never reaches the auth gate, so a
+  // browser can ask leave to send Authorization (or resume the stream with
+  // Last-Event-ID) before it is allowed to present a token. Credentials are
+  // only paired with an explicit origin, never with "*".
+  const corsOrigin = process.env.OMB_CORS_ORIGIN?.trim() || null;
+  if (corsOrigin) {
+    res.setHeader("access-control-allow-origin", corsOrigin);
+    res.setHeader("access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+    res.setHeader("access-control-allow-headers", "Content-Type, Authorization, Last-Event-ID");
+    if (corsOrigin !== "*") {
+      res.setHeader("access-control-allow-credentials", "true");
+      res.setHeader("vary", "Origin");
+    }
+    if (method === "OPTIONS") {
+      res.writeHead(204);
+      return res.end();
+    }
+  }
   /** scratch for route matches, shared by every `path.match` below */
   let m: RegExpMatchArray | null = null;
   let releaseWorkspaceRequest: (() => void) | undefined;
@@ -16306,7 +16332,11 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // child proves it is OURS by echoing its pid (a stray dev server has
     // the same API shape but a different pid)
     if (method === "GET" && path === "/api/health") {
-      return json(res, 200, { app: "openmausbot", pid: process.pid, static: Boolean(STATIC_DIR) });
+      // The caller cleared the gate above (session, LAN token, CIDR bypass or
+      // loopback), so this fuller identity asks nothing more of them:
+      // authRequired reports false. An unauthenticated stranger only ever
+      // saw the {app} probe before the gate.
+      return json(res, 200, healthPayload({ pid: process.pid, staticDirConfigured: Boolean(STATIC_DIR), authRequired: false }));
     }
     // The bots' browser engine: install it on this machine (agent-browser +
     // a Chrome for Testing, a one-time download), or ask how that is going.
