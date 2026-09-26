@@ -12,11 +12,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { ensureDirs } from "../../config.ts";
+import { ensureDirs, NATIVE_DIR } from "../../config.ts";
 import type { ProviderInstance } from "../../contracts.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import { createAcpDriver, skipSubscriptionAuthForLocalInject, type AcpSupport } from "./core.ts";
-import { GrokAgentDriver } from "./grok.ts";
+import { GrokAgentDriver, grokAcceptsUnadvertisedImages } from "./grok.ts";
 import { GeminiAgentDriver } from "./gemini.ts";
 import { KimiAgentDriver } from "./kimi.ts";
 import { DroidAgentDriver } from "./droid.ts";
@@ -42,6 +42,15 @@ const SELECT_MODEL_SUPPORT: AcpSupport = {
   isAuthenticated: () => true,
 };
 const SelectModelDriver = createAcpDriver(SELECT_MODEL_SUPPORT);
+
+/** Image input is an explicit per-harness opt-in. Keep these transport tests
+ * independent from production harnesses whose native image support has not
+ * been verified. */
+const NativeImageDriver = createAcpDriver({
+  ...SELECT_MODEL_SUPPORT,
+  driverKind: "nativeImageTest",
+  images: true,
+});
 
 /** Proves transformEnv can vary with the instance config, which is how the
  *  opencode driver picks its permission policy from `fullAuto`. */
@@ -156,7 +165,7 @@ describe("ACP decodeConfig", () => {
     expect(GrokAgentDriver.decodeConfig({ fullAuto: true }).fullAuto).toBe(true);
   });
 
-  it("does not advertise or accept local CUA in full-auto mode", async () => {
+  it("advertises per-bot local CUA but rejects legacy full-auto turns without a mode", async () => {
     const fullAuto = await GrokAgentDriver.create({
       instanceId: "grok-full-auto",
       displayName: "Grok Full Auto",
@@ -164,7 +173,7 @@ describe("ACP decodeConfig", () => {
       enabled: true,
       config: { cli: FAKE_CLI, fullAuto: true },
     });
-    expect(fullAuto.adapter.capabilities.localComputerMcp).toBe(false);
+    expect(fullAuto.adapter.capabilities.localComputerMcp).toBe(true);
     await expect(
       fullAuto.adapter.sendTurn({
         threadId: "t-full-auto-local",
@@ -210,6 +219,8 @@ describe("ACP turns (fake CLI)", () => {
   afterEach(async () => {
     delete process.env.FAKE_ACP_MODE;
     delete process.env.FAKE_ACP_DUMP;
+    delete process.env.FAKE_ACP_ALLOW_ALWAYS;
+    delete process.env.FAKE_ACP_PERMISSION_ANSWER;
     delete process.env.XAI_API_KEY;
     delete process.env.OPENCODE_API_KEY;
     delete process.env.CURSOR_API_KEY;
@@ -219,9 +230,36 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_MODELS;
     delete process.env.FAKE_ACP_MODEL_STICKS;
     delete process.env.FAKE_ACP_USAGE_ROOT;
+    delete process.env.FAKE_ACP_LOAD_NULL;
+    delete process.env.FAKE_ACP_IMAGE_CAPABILITY;
+    delete process.env.FAKE_ACP_GROK_VERSION;
+    delete process.env.FAKE_ACP_DUMP_PROMPT;
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
+  });
+
+  it("names the resolved executable when spawning it fails", async () => {
+    const missing = join(scratch, "resolved-managed-runtime");
+    const driver = createAcpDriver({
+      ...SELECT_MODEL_SUPPORT,
+      selectModel: undefined,
+      resolveCommand: async () => ({ command: missing }),
+    });
+    instance = await driver.create({
+      instanceId: "resolved-spawn-error",
+      displayName: "Resolved spawn error",
+      environment: {},
+      enabled: true,
+      config: { cli: "managed-alias", fullAuto: false },
+    });
+    recorder = recordEvents(instance.adapter);
+
+    await instance.adapter.sendTurn({ threadId: "t-resolved-spawn-error", text: "go" });
+    await recorder.until((event) => event.type === "turn.completed");
+    const error = recorder.events.find((event) => event.type === "runtime.error");
+    expect(error?.message).toContain(missing);
+    expect(error?.message).not.toContain("managed-alias");
   });
 
   it("normalizes a full turn into the canonical event sequence", async () => {
@@ -241,6 +279,12 @@ describe("ACP turns (fake CLI)", () => {
       "turn.completed",
     ]);
     expect(recorder.events.every((e) => e.turnId === turnId && e.provider === "grokAgent")).toBe(true);
+    expect(recorder.events.filter((event) => event.itemId === "tc-1")).toMatchObject([
+      { type: "item.started", input: expect.stringContaining("/fixture/readme.md") },
+      { type: "item.completed", output: expect.stringContaining("fixture file content") },
+    ]);
+    expect(JSON.stringify(recorder.events)).not.toContain("acp-input-secret");
+    expect(JSON.stringify(recorder.events)).not.toContain("acp-output-secret");
     const usage = recorder.events.find((e) => e.type === "thread.token-usage.updated")!;
     expect(usage).toMatchObject({ input: 10, output: 5 });
     const text = recorder.events.find((e) => e.type === "item.completed" && (e as any).itemType === "assistant_text")!;
@@ -248,6 +292,94 @@ describe("ACP turns (fake CLI)", () => {
     const done = recorder.events.at(-1)!;
     expect(done).toMatchObject({ type: "turn.completed", ok: true });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
+  });
+
+  it("sends images as negotiated ACP content blocks without copying bytes into diagnostics", async () => {
+    const dump = join(scratch, "image-prompt.json");
+    const imagePath = join(scratch, "tiny.webp");
+    const bytes = Buffer.from("private-acp-image-bytes");
+    const base64 = bytes.toString("base64");
+    writeFileSync(imagePath, bytes);
+    process.env.FAKE_ACP_DUMP = dump;
+    process.env.FAKE_ACP_DUMP_PROMPT = "1";
+    process.env.FAKE_ACP_IMAGE_CAPABILITY = "1";
+    await create(NativeImageDriver);
+
+    const { turnId } = await instance.adapter.sendTurn({
+      threadId: "t-acp-native-image",
+      text: "What is this?",
+      images: [{ path: imagePath, mime: "image/webp", bytes: bytes.length }],
+    });
+    await recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId);
+
+    expect(JSON.parse(readFileSync(`${dump}.prompt.json`, "utf8"))).toEqual([
+      { type: "text", text: "What is this?" },
+      { type: "image", data: base64, mimeType: "image/webp" },
+    ]);
+    const nativeLog = readFileSync(join(NATIVE_DIR, "t-acp-native-image.ndjson"), "utf8");
+    expect(nativeLog).not.toContain(base64);
+    expect(nativeLog).toContain(`[image data: ${base64.length} base64 chars]`);
+  });
+
+  it("fails clearly when an image-capable adapter meets an older ACP runtime", async () => {
+    const imagePath = join(scratch, "tiny.png");
+    writeFileSync(imagePath, "not-read-before-capability-check");
+    await create(NativeImageDriver);
+
+    const { turnId } = await instance.adapter.sendTurn({
+      threadId: "t-acp-image-unsupported",
+      text: "Inspect this",
+      images: [{ path: imagePath, mime: "image/png", bytes: 32 }],
+    });
+    const done = await recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId);
+
+    expect(done).toMatchObject({ ok: false, stopReason: "rpc_error" });
+    expect(recorder.events.find((event) => event.type === "runtime.error")?.message).toMatch(
+      /does not advertise ACP image input/,
+    );
+  });
+
+  it("keeps text-path fallback for adapters that do not advertise image input", async () => {
+    const dump = join(scratch, "text-fallback.json");
+    process.env.FAKE_ACP_DUMP = dump;
+    process.env.FAKE_ACP_DUMP_PROMPT = "1";
+    await create(SelectModelDriver);
+
+    const text = '<attached-image path="/private/image.png" name="image.png" />';
+    const { turnId } = await instance.adapter.sendTurn({
+      threadId: "t-acp-image-fallback",
+      text,
+      // A missing path proves the driver did not attempt native ingestion.
+      images: [{ path: join(scratch, "missing.png"), mime: "image/png", bytes: 12 }],
+    });
+    await recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId);
+
+    expect(JSON.parse(readFileSync(`${dump}.prompt.json`, "utf8"))).toEqual([{ type: "text", text }]);
+  });
+
+  it("sends native images on Grok's verified runtime even with the false capability", async () => {
+    const dump = join(scratch, "grok-image.json");
+    const imagePath = join(scratch, "grok.png");
+    const bytes = Buffer.from("synthetic-private-image");
+    writeFileSync(imagePath, bytes);
+    process.env.FAKE_ACP_DUMP = dump;
+    process.env.FAKE_ACP_DUMP_PROMPT = "1";
+    process.env.FAKE_ACP_GROK_VERSION = "1.0.25";
+    await create(GrokAgentDriver);
+    expect(instance.adapter.capabilities.images).toBe(true);
+    const { turnId } = await instance.adapter.sendTurn({
+      threadId: "t-grok-image", text: "Inspect", images: [{ path: imagePath, mime: "image/png", bytes: bytes.length }],
+    });
+    const done = await recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId);
+    expect(done).toMatchObject({ ok: true });
+    expect(JSON.parse(readFileSync(`${dump}.prompt.json`, "utf8"))).toContainEqual({ type: "image", data: bytes.toString("base64"), mimeType: "image/png" });
+    expect(readFileSync(join(NATIVE_DIR, "t-grok-image.ndjson"), "utf8")).not.toContain(bytes.toString("base64"));
+  });
+
+  it.each([null, {}, { _meta: { grokShell: true, agentVersion: "1.0.24" } },
+    { _meta: { grokShell: true, agentVersion: "1.0.25-preview" } },
+    { _meta: { grokShell: false, agentVersion: "1.0.25" } }])("does not assume image support for unknown Grok runtime %j", (init) => {
+    expect(grokAcceptsUnadvertisedImages(init)).toBe(false);
   });
 
   it("emits each assistant text block before the tool that follows it", async () => {
@@ -276,6 +408,27 @@ describe("ACP turns (fake CLI)", () => {
       .filter((e) => e.type === "item.completed" && (e as { itemType?: string }).itemType === "assistant_text")
       .map((e) => (e as { text: string }).text);
     expect(texts).toEqual(["before one", "before two", "after"]);
+  });
+
+  it("normalizes a structured ACP image block without treating it as text", async () => {
+    await create(GeminiAgentDriver, "image");
+    await instance.adapter.sendTurn({ threadId: "t-image", text: "draw it" });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const image = recorder.events.find(
+      (event) => event.type === "item.completed" && event.itemType === "assistant_image",
+    );
+    expect(image).toMatchObject({
+      type: "item.completed",
+      itemType: "assistant_image",
+      alt: "Generated image",
+    });
+    expect(image && "data" in image ? image.data : "").toMatch(/^iVBOR/);
+    expect(
+      recorder.events.some(
+        (event) => event.type === "item.completed" && event.itemType === "assistant_text",
+      ),
+    ).toBe(false);
   });
 
   it("reads token usage from the root of the prompt result", async () => {
@@ -475,6 +628,44 @@ describe("ACP turns (fake CLI)", () => {
     expect(instance.adapter.capabilities.customMcp).toBe(true);
   });
 
+  const remoteServers = {
+    docs: { type: "http" as const, url: "https://docs.example/mcp", headers: { Authorization: "Bearer tok-docs" } },
+    legacy: { type: "sse" as const, url: "https://old.example/sse", headers: {} },
+    notes: { command: "npx", args: [], env: {} },
+  };
+
+  it("keeps url servers out of a session with an agent that advertises no remote transport", async () => {
+    await create();
+    const dump = join(scratch, "remote-plain.json");
+    process.env.FAKE_ACP_DUMP = dump;
+    await instance.adapter.sendTurn({ threadId: "t-remote-plain", text: "go", integrations: { custom: remoteServers } });
+    await recorder.until((event) => event.type === "turn.completed");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.mcpServers.map((server: { name: string }) => server.name)).toEqual(["notes"]);
+  });
+
+  it("lists a url server in ACP's shape for an agent that advertises its transport", async () => {
+    process.env.FAKE_ACP_MCP_TRANSPORTS = "http";
+    try {
+      await create();
+      const dump = join(scratch, "remote-http.json");
+      process.env.FAKE_ACP_DUMP = dump;
+      await instance.adapter.sendTurn({ threadId: "t-remote-http", text: "go", integrations: { custom: remoteServers } });
+      await recorder.until((event) => event.type === "turn.completed");
+      const seen = JSON.parse(readFileSync(dump, "utf8"));
+      expect(seen.mcpServers).toContainEqual({
+        type: "http",
+        name: "docs",
+        url: "https://docs.example/mcp",
+        headers: [{ name: "Authorization", value: "Bearer tok-docs" }],
+      });
+      // the agent said http only, so the SSE entry stays out
+      expect(seen.mcpServers.map((server: { name: string }) => server.name)).toEqual(["docs", "notes"]);
+    } finally {
+      delete process.env.FAKE_ACP_MCP_TRANSPORTS;
+    }
+  });
+
   it("surfaces a permission ask as request.opened and completes once allowed", async () => {
     await create(GrokAgentDriver, "permission");
     await instance.adapter.sendTurn({
@@ -506,6 +697,174 @@ describe("ACP turns (fake CLI)", () => {
     });
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({ ok: true });
+  });
+
+  it("per-bot Ask surfaces permissions from a legacy full-auto instance", async () => {
+    process.env.FAKE_ACP_MODE = "permission";
+    const dump = join(scratch, "ask-permission-overrides-full-auto.json");
+    process.env.FAKE_ACP_DUMP = dump;
+    instance = await GrokAgentDriver.create({
+      instanceId: "grok-ask-override",
+      displayName: "Grok Ask Override",
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    recorder = recordEvents(instance.adapter);
+
+    await instance.adapter.sendTurn({
+      threadId: "t-ask-permission-override",
+      text: "go",
+      approvalMode: "ask",
+    });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    const argv = JSON.parse(readFileSync(dump, "utf8")).argv as string[];
+    expect(argv[argv.indexOf("--permission-mode") + 1]).toBe("default");
+
+    await instance.adapter.respondToRequest(
+      "t-ask-permission-override",
+      (opened as { requestId: string }).requestId,
+      { behavior: "allow" },
+    );
+    await recorder.until((e) => e.type === "turn.completed");
+  });
+
+  it("maps Auto-accept edits to Grok's native acceptEdits", async () => {
+    await create(GrokAgentDriver);
+    const dump = join(scratch, "grok-edits.json");
+    process.env.FAKE_ACP_DUMP = dump;
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-grok-edits", text: "go", approvalMode: "edits" });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    const argv = JSON.parse(readFileSync(dump, "utf8")).argv as string[];
+    expect(argv[argv.indexOf("--permission-mode") + 1]).toBe("acceptEdits");
+  });
+
+  it("hands 'Always allow this session' to the agent's own allow_always option", async () => {
+    process.env.FAKE_ACP_ALLOW_ALWAYS = "1";
+    const answer = join(scratch, "permission-answer.txt");
+    process.env.FAKE_ACP_PERMISSION_ANSWER = answer;
+    await create(GrokAgentDriver, "permission");
+    await instance.adapter.sendTurn({ threadId: "t-always-native", text: "go", approvalMode: "ask" });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    // the card may offer it: the driver can honor a session-wide allow
+    expect(opened).toHaveProperty("allowSession", true);
+    await instance.adapter.respondToRequest("t-always-native", (opened as { requestId: string }).requestId, { behavior: "allow", always: true });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(readFileSync(answer, "utf8")).toBe("allow-always");
+  });
+
+  it("remembers the exact operation for the session when the agent offers no allow_always", async () => {
+    // Grok 4.6 often omits allow_always. The driver then answers allow_once
+    // and repeats the person's answer for that exact operation on the
+    // resumed session — and only that operation, and only that session.
+    const answer = join(scratch, "permission-answer-once.txt");
+    process.env.FAKE_ACP_PERMISSION_ANSWER = answer;
+    await create(GrokAgentDriver, "permission");
+    await instance.adapter.sendTurn({ threadId: "t-always-memory", text: "go", approvalMode: "ask" });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    await instance.adapter.respondToRequest("t-always-memory", (opened as { requestId: string }).requestId, { behavior: "allow", always: true });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(readFileSync(answer, "utf8")).toBe("allow-once");
+
+    // same operation on the resumed session: answered without a card
+    const second = await instance.adapter.sendTurn({ threadId: "t-always-memory", text: "again", approvalMode: "ask", resumeCursor: "fake-acp-session" });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
+    expect(recorder.events.filter((e) => e.type === "request.opened")).toHaveLength(1);
+    expect(readFileSync(answer, "utf8")).toBe("allow-once");
+
+    // a fresh native session forgets it
+    const third = await instance.adapter.sendTurn({ threadId: "t-always-memory", text: "fresh", approvalMode: "ask" });
+    const reopened = await recorder.until((e) => e.type === "request.opened" && e.turnId === third.turnId);
+    await instance.adapter.respondToRequest("t-always-memory", (reopened as { requestId: string }).requestId, { behavior: "deny" });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === third.turnId);
+    expect(recorder.events.filter((e) => e.type === "request.opened")).toHaveLength(2);
+  });
+
+  it.each(["grok-4.6", "grok-4.5", "local-model"])(
+    "keeps native Grok Auto when selecting and resuming %s",
+    async (model) => {
+      await create(GrokAgentDriver);
+      const agents = { command: "node", args: ["/fixture/agents-proxy.mjs"], env: {} };
+      for (const resumeCursor of [undefined, "fake-acp-session"]) {
+        const dump = join(scratch, `grok-auto-${resumeCursor ? "resume" : "new"}.json`);
+        const threadId = `t-grok-auto-${model}-${resumeCursor ? "resume" : "new"}`;
+        process.env.FAKE_ACP_DUMP = dump;
+        const { turnId } = await instance.adapter.sendTurn({
+          threadId,
+          text: "read the roster",
+          model,
+          effort: "high",
+          approvalMode: "auto",
+          resumeCursor,
+          integrations: {
+            agents,
+            custom: { agents: { command: "must-not-shadow-agents", args: [], env: {} } },
+          },
+        });
+        await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+        const seen = JSON.parse(readFileSync(dump, "utf8"));
+        expect(seen.argv).toEqual([
+          "--permission-mode", "auto",
+          "agent", "-m", model, "--reasoning-effort", "high", "stdio",
+        ]);
+        const sessionMethod = resumeCursor ? "session/load" : "session/new";
+        const sent = readFileSync(join(NATIVE_DIR, `${threadId}.ndjson`), "utf8")
+          .trim().split("\n").map((line) => JSON.parse(line))
+          .find((entry) => entry.dir === "out" && entry.msg.method === sessionMethod);
+        expect(sent.msg.params.mcpServers).toEqual([{ name: "agents", ...agents, env: [] }]);
+        expect(JSON.parse(readFileSync(`${dump}.config.json`, "utf8"))).toEqual([
+          { method: "session/set_model", params: { sessionId: "fake-acp-session", modelId: model } },
+        ]);
+        expect(recorder.events.find((e) => e.type === "session.started" && e.turnId === turnId))
+          .toMatchObject({ model });
+      }
+    },
+  );
+
+  it.each([
+    ["ask", true, "default"],
+    ["full", true, "bypassPermissions"],
+    ["custom", true, "default"],
+    ["auto", false, "auto"],
+  ] as const)("Grok %s with agents mounted=%s overrides a legacy full-auto setting", async (approvalMode, mounted, nativeMode) => {
+    instance = await GrokAgentDriver.create({
+      instanceId: "grok-mode-override",
+      displayName: "Grok",
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    recorder = recordEvents(instance.adapter);
+    const dump = join(scratch, "grok-mode-override.json");
+    process.env.FAKE_ACP_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "t-grok-mode-override",
+      text: "continue",
+      approvalMode,
+      resumeCursor: "fake-acp-session",
+      integrations: mounted ? { agents: { command: "node", args: [], env: {} } } : undefined,
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(JSON.parse(readFileSync(dump, "utf8")).argv).toEqual([
+      "--permission-mode", nativeMode, "agent", "stdio",
+    ]);
+  });
+
+  it("keeps residual Grok Auto permissions interactive", async () => {
+    await create(GrokAgentDriver, "permission");
+    await instance.adapter.sendTurn({
+      threadId: "t-grok-auto-permission",
+      text: "run the command",
+      approvalMode: "auto",
+      integrations: { agents: { command: "node", args: [], env: {} } },
+    });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({ requestType: "permission", tool: "shell" });
+    expect(recorder.events.some((e) => e.type === "request.resolved")).toBe(false);
+    await instance.adapter.respondToRequest("t-grok-auto-permission", opened.requestId!, { behavior: "deny" });
+    expect(await recorder.until((e) => e.type === "request.resolved"))
+      .toMatchObject({ behavior: "deny", source: "user" });
+    await recorder.until((e) => e.type === "turn.completed");
   });
 
   it("grok fails closed when the CLI advertises no cached_token (needs login)", async () => {
@@ -656,6 +1015,35 @@ describe("ACP turns (fake CLI)", () => {
     expect(done).toMatchObject({ ok: true });
   });
 
+  it("reuses a resume cursor when session/load returns a session", async () => {
+    await create(GrokAgentDriver);
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-truthy",
+      text: "go",
+      resumeCursor: "resumed-cursor-1",
+    });
+
+    const started = await recorder.until((e) => e.type === "session.started");
+    expect(started).toMatchObject({ sessionId: "resumed-cursor-1" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+  });
+
+  it("falls through to session/new when session/load returns null", async () => {
+    process.env.FAKE_ACP_LOAD_NULL = "1";
+    await create(GrokAgentDriver);
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-null",
+      text: "go",
+      resumeCursor: "gone-cursor",
+    });
+
+    const started = await recorder.until((e) => e.type === "session.started");
+    expect(started).toMatchObject({ sessionId: "fake-acp-session" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+  });
+
   it("applyTurnEnv sees the picker model after resolveTurnModel", async () => {
     const dump = join(scratch, "turn-env.json");
     process.env.FAKE_ACP_DUMP = dump;
@@ -705,6 +1093,28 @@ describe("ACP turns (fake CLI)", () => {
     await recorder.until((e) => e.type === "turn.completed");
 
     expect(JSON.parse(readFileSync(dump, "utf8")).env.TEST_POLICY).toBe("auto");
+  });
+
+  it("per-bot Ask overrides a legacy full-auto instance for the whole turn", async () => {
+    const dump = join(scratch, "ask-overrides-full-auto.json");
+    process.env.FAKE_ACP_DUMP = dump;
+    instance = await EnvPolicyDriver.create({
+      instanceId: "policy-override-test",
+      displayName: undefined,
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    recorder = recordEvents(instance.adapter);
+
+    await instance.adapter.sendTurn({
+      threadId: "t-policy-override",
+      text: "go",
+      approvalMode: "ask",
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    expect(JSON.parse(readFileSync(dump, "utf8")).env.TEST_POLICY).toBe("ask");
   });
 
   it("declares effort levels for Grok only", async () => {

@@ -6,11 +6,16 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { soulFile, soulHash } from "./bot-folder.ts";
+import { flushProfileHistory, readHistory, recordProfileChange } from "./profile-versions.ts";
 import { DATA_DIR } from "./config.ts";
 import type { ModelSelection } from "./contracts.ts";
 import * as mdb from "./message-db.ts";
 import { peerAllowKey } from "./peer-approval-key.ts";
+import { canAccessTeam } from "./peer-roster.ts";
 import { Store, type BotRecord } from "./store.ts";
+import type { TeamSetupRequest } from "../shared/team-setup.ts";
+import { SECTION_CONTEXTS_FILE } from "./section-context.ts";
 
 const selection = (): ModelSelection => ({ instanceId: "claude", model: "claude-sonnet-5" });
 
@@ -19,22 +24,165 @@ describe("Store", () => {
     rmSync(DATA_DIR, { recursive: true, force: true });
   });
 
-  it("createBot seeds a greeting and an onboarding card", () => {
+  it("commits a confirmed model switch once, preserving siblings and rolling back failed writes", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.patchBot(bot.id, { approvalMode: "full", alwaysAllow: ["old-tool"] });
+    const first = store.activeTask(bot.id)!;
+    const sibling = store.createTask(bot.id)!;
+    const next = { instanceId: "codex", model: "fixture-model" };
+    const save = vi.spyOn(store as unknown as { saveBots(bots: BotRecord[]): void }, "saveBots");
+    store.switchTaskModel(bot.id, first.threadId, next, false, true);
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(store.projectBotForTask(bot.id, first.threadId)).toMatchObject({ modelSelection: next, approvalMode: "ask", alwaysAllow: [] });
+    expect(bot).toMatchObject({ modelSelection: selection(), approvalMode: "full" });
+    expect(sibling).toMatchObject({ modelSelection: selection(), approvalMode: "full", alwaysAllow: ["old-tool"] });
+    delete sibling.approvalMode;
+    delete sibling.autoApprove;
+    delete sibling.alwaysAllow;
+    save.mockImplementationOnce(() => { throw new Error("disk full"); });
+    expect(() => store.switchTaskModel(bot.id, first.threadId, next, true, true)).toThrow("disk full");
+    expect(bot).toMatchObject({ modelSelection: selection(), approvalMode: "full" });
+    store.switchTaskModel(bot.id, first.threadId, next, true, true);
+    expect(bot).toMatchObject({ modelSelection: next, approvalMode: "ask", alwaysAllow: [] });
+    expect(sibling).toMatchObject({ modelSelection: selection(), approvalMode: "full", alwaysAllow: ["old-tool"] });
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)).toMatchObject({ modelSelection: next, approvalMode: "ask" });
+    expect(reloaded.taskByThread(bot.id, sibling.threadId)).toMatchObject({ modelSelection: selection(), approvalMode: "full" });
+  });
+
+  it("createBot seeds a greeting without promising engine-specific tools", () => {
     const store = new Store(selection);
     const bot = store.createBot();
 
     const messages = store.messagesFor(bot.threadId);
-    expect(messages).toHaveLength(2);
-    expect(messages[0]).toMatchObject({ role: "bot", kind: "text" });
-    expect(messages[1].kind).toBe("options");
-    expect(messages[1].card?.options.length).toBeGreaterThan(1);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      role: "bot",
+      kind: "text",
+      text: `Hi, I'm ${bot.name}. What would you like me to do?`,
+    });
     expect(bot.modelSelection).toEqual(selection());
   });
 
-  it("dismisses the onboarding quiz when the user talks, and leaves live asks", () => {
+  it("clears provider-owned voice ids as one durable mutation", () => {
+    const store = new Store(selection);
+    const first = store.createBot();
+    const second = store.createBot();
+    store.patchBot(first.id, { voice: "provider-a-1" });
+    store.patchBot(second.id, { voice: "provider-a-2" });
+
+    const save = vi.spyOn(store as unknown as { saveBots(bots: BotRecord[]): void }, "saveBots");
+    save.mockImplementationOnce(() => { throw new Error("disk full"); });
+    expect(() => store.clearVoiceSelections()).toThrow("disk full");
+    expect(first.voice).toBe("provider-a-1");
+    expect(second.voice).toBe("provider-a-2");
+
+    expect(store.clearVoiceSelections().map((bot) => bot.id).sort()).toEqual([first.id, second.id].sort());
+    expect(first.voice).toBeUndefined();
+    expect(second.voice).toBeUndefined();
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(first.id)?.voice).toBeUndefined();
+    expect(reloaded.bot(second.id)?.voice).toBeUndefined();
+  });
+
+  it("restarts with legacy bot and group migrations despite an unreadable team registry, without permitting later team writes", () => {
+    const original = new Store(selection);
+    const bot = original.createBot({ name: "Legacy bot", section: "Research" });
+    const group = original.createGroup("Legacy group", [bot.id], false, "Engineering");
+    original.appendMessage(group.threadId, { role: "user", kind: "text", text: "Keep the group conversation" });
+    const botMessages = original.messagesFor(bot.threadId);
+    const groupMessages = original.messagesFor(group.threadId);
+    const bots = JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8"));
+    const groups = JSON.parse(readFileSync(join(DATA_DIR, "groups.json"), "utf8"));
+    delete bots[0].tasks; delete bots[0].soulHash;
+    delete groups[0].tasks; delete groups[0].defaultResponder;
+    writeFileSync(join(DATA_DIR, "bots.json"), JSON.stringify(bots));
+    writeFileSync(join(DATA_DIR, "groups.json"), JSON.stringify(groups));
+    const malformed = '{"version":1,"contexts":';
+    writeFileSync(SECTION_CONTEXTS_FILE, malformed);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const restored = new Store(selection);
+      expect(restored.bot(bot.id)?.tasks?.[0].threadId).toBe(bot.threadId);
+      expect(restored.group(group.id)?.tasks?.[0].threadId).toBe(group.threadId);
+      expect(restored.group(group.id)?.defaultResponder).toEqual({ kind: "member", botId: bot.id });
+      expect(restored.messagesFor(bot.threadId)).toEqual(botMessages);
+      expect(restored.messagesFor(group.threadId)).toEqual(groupMessages);
+      expect(JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8"))[0].tasks).toHaveLength(1);
+      expect(JSON.parse(readFileSync(join(DATA_DIR, "groups.json"), "utf8"))[0].tasks).toHaveLength(1);
+      expect(warning.mock.calls.some(([message]) => String(message).includes("[teams] Startup could not register"))).toBe(true);
+      const beforeBots = structuredClone(restored.bots);
+      const beforeGroups = structuredClone(restored.groups);
+      const beforeBotsFile = readFileSync(join(DATA_DIR, "bots.json"), "utf8");
+      const beforeGroupsFile = readFileSync(join(DATA_DIR, "groups.json"), "utf8");
+      expect(() => restored.setBotsSection([bot.id], "Do not create")).toThrow(/left unchanged/);
+      expect(() => restored.createBot({ name: "Must not appear", section: "Do not create" })).toThrow(/left unchanged/);
+      expect(() => restored.createGroup("Must not appear", [bot.id], false, "Do not create")).toThrow(/left unchanged/);
+      expect(() => restored.patchGroup(group.id, { name: "Must not rename", section: "Do not create" })).toThrow(/left unchanged/);
+      expect(restored.bots).toEqual(beforeBots);
+      expect(restored.groups).toEqual(beforeGroups);
+      expect(readFileSync(join(DATA_DIR, "bots.json"), "utf8")).toBe(beforeBotsFile);
+      expect(readFileSync(join(DATA_DIR, "groups.json"), "utf8")).toBe(beforeGroupsFile);
+      expect(new Store(selection).messagesFor(group.threadId)).toEqual(groupMessages);
+      expect(readFileSync(SECTION_CONTEXTS_FILE, "utf8")).toBe(malformed);
+    } finally { warning.mockRestore(); }
+  });
+
+  it("messagesTail reads a bounded page via SQL on a fresh Store, and older messages still load in full", () => {
+    const store = new Store(selection);
+    const bot = store.createBot({}, { seedMessages: false });
+    for (let i = 0; i < 10; i++) {
+      store.appendMessage(bot.threadId, { role: "user", kind: "text", text: `message ${i}` });
+    }
+
+    // a brand-new Store: its in-memory cache has never seen this thread, so
+    // this exercises the SQL LIMIT fast path, not an in-memory slice
+    const reloaded = new Store(selection);
+    const tail = reloaded.messagesTail(bot.threadId, 3);
+    expect(tail.messages.map((m) => m.text)).toEqual(["message 7", "message 8", "message 9"]);
+    expect(tail.hasMore).toBe(true);
+    expect(tail.activeLeafId).toBe(tail.messages.at(-1)!.id);
+
+    // older messages still load in full on the same (now-cached) instance
+    expect(reloaded.messagesFor(bot.threadId).map((m) => m.text)).toEqual(
+      Array.from({ length: 10 }, (_, i) => `message ${i}`),
+    );
+
+    // asking for at least as many messages as exist: the whole thread, hasMore false
+    const whole = new Store(selection).messagesTail(bot.threadId, 100);
+    expect(whole.messages).toHaveLength(10);
+    expect(whole.hasMore).toBe(false);
+  });
+
+  it("caches a complete tail but never caches a zero-message page as an empty thread", () => {
+    const store = new Store(selection);
+    const bot = store.createBot({}, { seedMessages: false });
+    store.appendMessage(bot.threadId, { role: "user", kind: "text", text: "keep this" });
+    const read = vi.spyOn(mdb, "readThread");
+    try {
+      const fresh = new Store(selection);
+      expect(fresh.messagesTail(bot.threadId, 10)).toMatchObject({ hasMore: false });
+      read.mockClear();
+      expect(fresh.messagesFor(bot.threadId)).toHaveLength(1);
+      expect(read).not.toHaveBeenCalled();
+
+      const zeroPage = new Store(selection);
+      expect(zeroPage.messagesTail(bot.threadId, 0)).toMatchObject({ messages: [], hasMore: true });
+      expect(zeroPage.messagesFor(bot.threadId)[0]?.text).toBe("keep this");
+    } finally {
+      read.mockRestore();
+    }
+  });
+
+  it("dismisses an open options card when the user talks, and leaves live asks", () => {
     const store = new Store(selection);
     const bot = store.createBot();
-    const quiz = store.messagesFor(bot.threadId)[1]!;
+    const quiz = store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "options",
+      card: { title: "Quick question", subtitle: "", options: ["A", "B"] },
+    });
     expect(quiz.card?.dismissed).toBeUndefined();
 
     store.appendMessage(bot.threadId, { role: "user", kind: "text", text: "hi" });
@@ -58,11 +206,16 @@ describe("Store", () => {
     expect(store.messagesFor(bot.threadId).find((m) => m.id === ask.id)?.card?.dismissed).toBeUndefined();
   });
 
-  it("does not dismiss the quiz for bot-authored messages", () => {
+  it("does not dismiss an open options card for bot-authored messages", () => {
     const store = new Store(selection);
     const bot = store.createBot();
+    const quiz = store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "options",
+      card: { title: "Quick question", subtitle: "", options: ["A", "B"] },
+    });
     store.appendMessage(bot.threadId, { role: "bot", kind: "text", text: "still here" });
-    expect(store.messagesFor(bot.threadId)[1]?.card?.dismissed).toBeUndefined();
+    expect(store.messagesFor(bot.threadId).find((m) => m.id === quiz.id)?.card?.dismissed).toBeUndefined();
   });
 
   it("marks only the last assistant message from a settled provider turn as terminal", () => {
@@ -96,7 +249,7 @@ describe("Store", () => {
   it("addTaskUsage accumulates settled-turn totals per task and survives a restart", () => {
     const store = new Store(selection);
     const bot = store.createBot();
-    expect(store.addTaskUsage(bot.id, bot.threadId, { input: 1200, output: 300, cachedInput: 1000, costUsd: null })).toEqual({
+    expect(store.addTaskUsage(bot.id, bot.threadId, { input: 1200, output: 300, cachedInput: 1000, costUsd: null })).toMatchObject({
       input: 1200,
       output: 300,
       cachedInput: 1000,
@@ -113,13 +266,19 @@ describe("Store", () => {
     expect(store.addTaskUsage(bot.id, "no-such-thread", { input: 5, output: 5, costUsd: null })).toBeNull();
 
     const reloaded = new Store(selection);
-    expect(reloaded.taskByThread(bot.id, bot.threadId)?.usage).toEqual({
+    expect(reloaded.taskByThread(bot.id, bot.threadId)?.usage).toMatchObject({
       input: 2010,
       output: 400,
       cachedInput: 1010,
       costUsd: null,
       turns: 4,
     });
+    // the last turn stands on its own, and the context reading survives a turn that did not report one
+    const withContext = store.addTaskUsage(bot.id, bot.threadId, { input: 300, output: 40, cachedInput: 250, costUsd: null, context: { tokens: 142_000, window: 272_000 } });
+    expect(withContext).toMatchObject({ lastTurn: { input: 300, output: 40, cachedInput: 250, costUsd: null }, context: { tokens: 142_000, window: 272_000 } });
+    const kept = store.addTaskUsage(bot.id, bot.threadId, { input: 5, output: 1, costUsd: null, context: { tokens: 0 } });
+    expect(kept).toMatchObject({ lastTurn: { input: 5, output: 1, costUsd: null }, context: { tokens: 142_000, window: 272_000 } });
+    expect(kept?.lastTurn).not.toHaveProperty("cachedInput");
   });
 
   it("chain-inserts a late turn artifact after its anchor without stealing the leaf", () => {
@@ -241,6 +400,68 @@ describe("Store", () => {
     expect(back.busy).toBe(false);
     const messages = reloaded.messagesFor(bot.threadId);
     expect(messages.at(-1)).toMatchObject({ role: "user", text: "hi there" });
+  });
+
+  it("revokes an unconfirmed elevated approval grant before startup work", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.patchBot(bot.id, {
+      approvalMode: "full",
+      approvalGrant: {
+        requestId: "123e4567-e89b-42d3-a456-426614174000",
+        mode: "full",
+        phase: "confirmed",
+      },
+    });
+
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)).toMatchObject({
+      approvalMode: "ask",
+      autoApprove: false,
+    });
+    expect(reloaded.bot(bot.id)).not.toHaveProperty("approvalGrant");
+
+    const persisted: BotRecord[] = JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8"));
+    expect(persisted.find((candidate) => candidate.id === bot.id)).toMatchObject({
+      approvalMode: "ask",
+      autoApprove: false,
+    });
+    expect(persisted.find((candidate) => candidate.id === bot.id)).not.toHaveProperty("approvalGrant");
+  });
+
+  it.each(["prepared", "confirmed", "activated", "committed"] as const)("revokes a thread-scoped grant after restart in phase %s", (phase) => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const target = store.createTask(bot.id, "Target")!;
+    store.patchBot(bot.id, { approvalMode: "full", approvalGrant: {
+      requestId: "123e4567-e89b-42d3-a456-426614174000", mode: "full", phase, threadId: target.threadId,
+    } });
+    // Even a crash between writing the thread and clearing the journal
+    // must not leave an unacknowledged elevated conversation executable.
+    store.patchTask(bot.id, target.threadId, { approvalMode: "full" });
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.approvalMode).toBe("ask");
+    expect(reloaded.bot(bot.id)?.approvalGrant).toBeUndefined();
+    expect(reloaded.projectBotForTask(bot.id, target.threadId)?.approvalMode).toBe("ask");
+  });
+
+  it.each(["prepared", "confirmed", "activated", "committed"] as const)("recovers a composer-only grant in phase %s without downgrading other threads", (phase) => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const target = store.createTask(bot.id, "Target")!;
+    const sibling = store.createTask(bot.id, "Other work")!;
+    store.patchBot(bot.id, { approvalMode: "full", approvalGrant: {
+      requestId: "123e4567-e89b-42d3-a456-426614174000", mode: "custom", phase, threadId: target.threadId, threadOnly: true,
+    } });
+    store.patchTask(bot.id, target.threadId, { approvalMode: "custom" });
+    store.patchTask(bot.id, sibling.threadId, { approvalMode: "full" });
+    expect(store.projectBotForTask(bot.id, sibling.threadId)?.approvalGrant).toBeUndefined();
+    expect(store.projectBotForTask(bot.id, target.threadId)?.approvalGrant?.phase).toBe(phase);
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.approvalMode).toBe("full");
+    expect(reloaded.bot(bot.id)?.approvalGrant).toBeUndefined();
+    expect(reloaded.projectBotForTask(bot.id, target.threadId)?.approvalMode).toBe("ask");
+    expect(reloaded.projectBotForTask(bot.id, sibling.threadId)?.approvalMode).toBe("full");
   });
 
   it("normalizes persisted cloud backends without changing valid or absent values", () => {
@@ -404,6 +625,22 @@ describe("Store", () => {
     expect(reloaded.bot(bot.id)?.modelSelection.effort).toBe("high");
   });
 
+  it("stores variants independently and seeds future conversations from the bot default", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const first = bot.threadId;
+    const second = store.createTask(bot.id, "Second")!;
+    const chosen = { instanceId: "opencodeGo", model: "provider/model", variant: "low" };
+    store.switchTaskModel(bot.id, first, chosen, false, false);
+    expect(store.projectBotForTask(bot.id, second.threadId)!.modelSelection).toEqual(selection());
+    store.patchBot(bot.id, { modelSelection: { ...chosen, variant: "minimal" } });
+    const future = store.createTask(bot.id, "Future")!;
+    const reloaded = new Store(selection);
+    expect(reloaded.projectBotForTask(bot.id, first)!.modelSelection).toEqual(chosen);
+    expect(reloaded.projectBotForTask(bot.id, second.threadId)!.modelSelection).toEqual(selection());
+    expect(reloaded.projectBotForTask(bot.id, future.threadId)!.modelSelection).toEqual({ ...chosen, variant: "minimal" });
+  });
+
   it("keeps one persisted Chief of Staff per section and supports handoff", () => {
     const store = new Store(selection);
     const first = store.createBot({ section: "Work" });
@@ -453,6 +690,56 @@ describe("Store", () => {
     expect(reloaded.bot(teammate.id)?.section).toBe("Launch");
     expect(reloaded.bots.filter((bot) => bot.section === "Launch" && bot.chiefOfStaff).map((bot) => bot.id))
       .toEqual([incumbent.id]);
+  });
+
+  it.each([null, "Renamed"])("revokes exact old team grants before changing the empty team to %s", (nextName) => {
+    const store = new Store(selection);
+    const chief = store.createBot({ section: "Office" });
+    store.setChiefOfStaff(chief.id);
+    store.setBotsSection([], "Delivery");
+    store.setBotsSection([], "Delivery East");
+    store.patchBot(chief.id, { managedSections: ["Delivery", " Delivery ", "Delivery East", ""] });
+    const announcements: string[] = [];
+    store.onChange(change => { if (change.type === "bot") announcements.push(change.botId); });
+
+    expect(store.changeEmptySection("Delivery", nextName)).toBeUndefined();
+    expect(chief.managedSections).toEqual(["Delivery East", ""]);
+    expect(canAccessTeam(chief, "Delivery")).toBe(false);
+    expect(announcements).toEqual([chief.id]);
+    store.setBotsSection([], "Delivery");
+    const reloaded = new Store(selection);
+    expect(reloaded.sections).toContain("Delivery");
+    expect(canAccessTeam(reloaded.bot(chief.id)!, "Delivery")).toBe(false);
+    expect(canAccessTeam(reloaded.bot(chief.id)!, "Delivery East")).toBe(true);
+    expect(canAccessTeam(reloaded.bot(chief.id)!, "")).toBe(true);
+  });
+
+  it("keeps grants when an empty-team rename is a no-op or rejected", () => {
+    const store = new Store(selection);
+    const chief = store.createBot({ section: "Office" });
+    store.setChiefOfStaff(chief.id);
+    for (const name of ["Delivery", "Existing"]) store.setBotsSection([], name);
+    store.patchBot(chief.id, { managedSections: ["Delivery"] });
+    const changes: string[] = [];
+    store.onChange(change => { changes.push(change.type); });
+    expect(store.changeEmptySection("Delivery", "Delivery")).toBeUndefined();
+    expect(store.changeEmptySection("Delivery", "Existing")).toContain("already exists");
+    expect(changes).toEqual([]);
+    expect(chief.managedSections).toEqual(["Delivery"]);
+    expect(new Store(selection).bot(chief.id)?.managedSections).toEqual(["Delivery"]);
+  });
+
+  it("does not free a team name when its grant revocation cannot persist", () => {
+    const store = new Store(selection);
+    const chief = store.createBot({ section: "Office" });
+    store.setChiefOfStaff(chief.id);
+    store.setBotsSection([], "Delivery");
+    store.patchBot(chief.id, { managedSections: ["Delivery"] });
+    (store as unknown as { saveBots: () => void }).saveBots = () => { throw new Error("disk unavailable"); };
+    expect(() => store.changeEmptySection("Delivery", null)).toThrow("disk unavailable");
+    expect(store.sections).toContain("Delivery");
+    expect(chief.managedSections).toEqual(["Delivery"]);
+    expect(new Store(selection).sections).toContain("Delivery");
   });
 
   it("rejects unavailable or Chief-conflicting section assignments without changing bots", () => {
@@ -506,7 +793,11 @@ describe("Store", () => {
   it("patchMessage merges card patches and returns null for unknown ids", () => {
     const store = new Store(selection);
     const bot = store.createBot();
-    const card = store.messagesFor(bot.threadId)[1];
+    const card = store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "options",
+      card: { title: "Quick question", subtitle: "", options: ["A", "B"] },
+    });
 
     const patched = store.patchMessage(bot.threadId, card.id, {
       card: { ...card.card!, answered: "Work & projects" },
@@ -518,7 +809,11 @@ describe("Store", () => {
   it("keeps memory and SQLite pending when a card patch cannot persist", () => {
     const store = new Store(selection);
     const bot = store.createBot();
-    const card = store.messagesFor(bot.threadId)[1]!;
+    const card = store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "options",
+      card: { title: "Quick question", subtitle: "", options: ["A", "B"] },
+    });
     const update = vi.spyOn(mdb, "updateMessage").mockImplementationOnce(() => {
       throw new Error("simulated SQLite failure");
     });
@@ -560,7 +855,7 @@ describe("Store", () => {
     const user = store.appendMessage(bot.threadId, { role: "user", kind: "text", text: "hi" });
 
     const messages = store.messagesFor(bot.threadId);
-    expect(user.parentId).toBe(messages[1].id); // follows the onboarding card
+    expect(user.parentId).toBe(messages[0].id); // follows the greeting
     expect(store.activeLeaf(bot.threadId)).toBe(user.id);
     expect(store.activePath(bot.threadId).map((m) => m.id)).toEqual(messages.map((m) => m.id));
   });
@@ -570,10 +865,21 @@ describe("Store", () => {
     const bot = store.createBot();
     const original = store.appendMessage(bot.threadId, { role: "user", kind: "text", text: "v1" });
     const reply = store.appendMessage(bot.threadId, { role: "bot", kind: "text", text: "answer to v1" });
+    const events: Array<Record<string, unknown>> = [];
+    store.onChange((e) => events.push(e as unknown as Record<string, unknown>));
 
     const edited = store.branchMessage(bot.threadId, original.id, "v2")!;
     expect(edited.parentId).toBe(original.parentId); // sibling, not child
     expect(store.activeLeaf(bot.threadId)).toBe(edited.id);
+    // Clients learn the new leaf from a thread frame, right after the
+    // message: a branched message does not chain onto their current leaf,
+    // so without this frame the edit stays hidden until the reply's
+    // snapshot lands. The order matters — the leaf must name a message
+    // the client already has.
+    expect(events.filter((e) => e.type === "message" || e.type === "thread")).toEqual([
+      { type: "message", threadId: bot.threadId, message: edited },
+      { type: "thread", threadId: bot.threadId, activeLeafId: edited.id },
+    ]);
 
     const path = store.activePath(bot.threadId);
     expect(path.map((m) => m.text)).toContain("v2");
@@ -704,10 +1010,14 @@ describe("Store change stream", () => {
     expect(store.messagesFor(bot.threadId).at(-1)).toBe(m);
   });
 
-  it("emits a card patch after a user message hides the onboarding quiz", () => {
+  it("emits a card patch after a user message hides an open options card", () => {
     const store = new Store(selection);
     const bot = store.createBot();
-    const quiz = store.messagesFor(bot.threadId)[1]!;
+    const quiz = store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "options",
+      card: { title: "Quick question", subtitle: "", options: ["A", "B"] },
+    });
     const events = record(store);
     const m = store.appendMessage(bot.threadId, { role: "user", kind: "text", text: "hi" });
     expect(events.map((event) => event.type)).toEqual(["message", "message.patch"]);
@@ -719,11 +1029,11 @@ describe("Store change stream", () => {
     });
   });
 
-  it("announces a new bot before its onboarding messages", () => {
+  it("announces a new bot before its greeting", () => {
     const store = new Store(selection);
     const events = record(store);
     const bot = store.createBot();
-    expect(events.map((event) => event.type)).toEqual(["bot", "message", "message"]);
+    expect(events.map((event) => event.type)).toEqual(["bot", "message"]);
     expect(events[0]).toEqual({ type: "bot", botId: bot.id });
     expect(events.slice(1).every((event) => event.threadId === bot.threadId)).toBe(true);
   });
@@ -737,8 +1047,11 @@ describe("Store change stream", () => {
     store.branchMessage(bot.threadId, first.id, "b");
     store.setActiveLeaf(bot.threadId, first.id);
     store.toggleReaction(bot.threadId, first.id, "👍", "user");
-    expect(events.map((e) => e.type)).toEqual(["message.patch", "message", "thread", "message.patch"]);
-    expect(events[2]).toMatchObject({ type: "thread", threadId: bot.threadId, activeLeafId: expect.any(String) });
+    // branchMessage emits message THEN thread (the fork moves the leaf);
+    // setActiveLeaf emits thread; a reaction is a patch
+    expect(events.map((e) => e.type)).toEqual(["message.patch", "message", "thread", "thread", "message.patch"]);
+    expect(events[2]).toMatchObject({ type: "thread", threadId: bot.threadId, activeLeafId: (events[1] as any).message.id });
+    expect(events[3]).toMatchObject({ type: "thread", threadId: bot.threadId, activeLeafId: expect.any(String) });
   });
 
   it("announces screen frames whose pixels are pruned", () => {
@@ -754,6 +1067,215 @@ describe("Store change stream", () => {
       { type: "message.patch", threadId: bot.threadId, message: { ...first, png: undefined } },
       { type: "message", threadId: bot.threadId, message: newest },
     ]);
+  });
+
+  it("createTask records which bot opened a thread, and the record survives a reload", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const opener = store.createBot();
+    const own = store.createTask(bot.id, "By a person")!;
+    expect(own).not.toHaveProperty("openedBy");
+    const opened = store.createTask(bot.id, "By a bot", false, undefined, { botId: opener.id, name: opener.name, at: 7 })!;
+    expect(opened.openedBy).toEqual({ botId: opener.id, name: opener.name, at: 7 });
+    // a bot must never move what the person is looking at
+    expect(store.bot(bot.id)!.threadId).toBe(own.threadId);
+    // the handoff id arrives after the thread exists (it needs the thread id)
+    expect(store.setTaskOpenedBy(bot.id, opened.threadId, { botId: opener.id, name: opener.name, delegationId: "d-1", at: 7 })!.openedBy)
+      .toEqual({ botId: opener.id, name: opener.name, delegationId: "d-1", at: 7 });
+    expect(store.setTaskOpenedBy(bot.id, "no-such-thread", { botId: opener.id, name: opener.name, at: 7 })).toBeNull();
+    const reloaded = new Store(selection);
+    expect(reloaded.taskByThread(bot.id, opened.threadId)?.openedBy).toEqual({ botId: opener.id, name: opener.name, delegationId: "d-1", at: 7 });
+    expect(reloaded.taskByThread(bot.id, own.threadId)).not.toHaveProperty("openedBy");
+  });
+
+  it("resolvePairConversation keeps one conversation per bot pair, whatever the turn or the person is looking at", () => {
+    const store = new Store(selection);
+    const recipient = store.createBot({ name: "Scout" });
+    const sender = store.createBot({ name: "Clive" });
+    const other = store.createBot({ name: "Ada" });
+    const idle = { working: () => false };
+    const selected = store.activeTask(recipient.id)!;
+    const first = store.resolvePairConversation(sender, recipient.id, idle)!;
+    expect(first.created).toBe(true);
+    // the sender's name, never the brief: an 80-character slice of an
+    // assignment is the sidebar row nobody can read
+    expect(first.task.title).toBe("@Clive");
+    expect(first.task.openedBy).toMatchObject({ botId: sender.id, name: "Clive", kind: "pair" });
+    expect(first.task.threadId).not.toBe(selected.threadId);
+    // the person is still looking at what they were looking at
+    expect(store.bot(recipient.id)!.threadId).toBe(selected.threadId);
+    // every later send from that sender continues it — nothing about a
+    // turn, a request key or the recipient's selected thread takes part
+    store.switchTask(recipient.id, first.task.threadId);
+    const second = store.resolvePairConversation(sender, recipient.id, idle)!;
+    const third = store.resolvePairConversation(sender, recipient.id, { label: "unused while idle", working: () => false })!;
+    expect([second.task.threadId, third.task.threadId]).toEqual([first.task.threadId, first.task.threadId]);
+    expect([second.created, third.created]).toEqual([false, false]);
+    // a different sender gets its own line, not this one
+    const elsewhere = store.resolvePairConversation(other, recipient.id, idle)!;
+    expect(elsewhere.task.threadId).not.toBe(first.task.threadId);
+    expect(elsewhere.task.title).toBe("@Ada");
+    expect(store.tasks(recipient.id)).toHaveLength(3);
+    expect(store.resolvePairConversation(sender, "no-such-bot", idle)).toBeNull();
+    const reloaded = new Store(selection);
+    expect(reloaded.resolvePairConversation(sender, recipient.id, idle)!.task.threadId).toBe(first.task.threadId);
+  });
+
+  it("resolvePairConversation adopts the sender's most recent old thread instead of adding one more row", () => {
+    const store = new Store(selection);
+    const recipient = store.createBot({ name: "Scout" });
+    const sender = store.createBot({ name: "Clive" });
+    const other = store.createBot({ name: "Ada" });
+    const idle = { working: () => false };
+    const brief = "Implement and independently verify the CSV export for the reporting page";
+    const header = "Add the header row to that export";
+    // the rows a 0.1.76 server left behind: one per assignment, titled with
+    // a sliced brief, all opened by the same sender, each holding the
+    // request that named it
+    // "most recently active" is the last thing said there, not the hour the
+    // row was opened: the one opened later has been silent for longer
+    const older = store.createTask(recipient.id, brief, false, undefined, { botId: sender.id, name: "Clive", at: 60 })!;
+    const newer = store.createTask(recipient.id, header, false, undefined, { botId: sender.id, name: "Clive", at: 20 })!;
+    const closed = store.createTask(recipient.id, "Already tidied away", false, undefined, { botId: sender.id, name: "Clive", at: 30 })!;
+    store.setTaskClosedBy(recipient.id, closed.threadId, { botId: sender.id, name: "Clive", at: 31 });
+    // a start_thread handoff is the sender's own named job, tracked by its
+    // delegation id — adoption leaves it alone
+    const handoff = store.createTask(recipient.id, "Review PR 12", false, undefined, { botId: sender.id, name: "Clive", delegationId: "d-9", at: 40 })!;
+    const stranger = store.createTask(recipient.id, "From someone else", false, undefined, { botId: other.id, name: "Ada", at: 50 })!;
+    store.appendMessage(older.threadId, { role: "bot", kind: "text", text: `@Scout ${brief}`, at: 1_000 });
+    store.appendMessage(newer.threadId, { role: "bot", kind: "text", text: `@Scout ${header}`, at: 2_000 });
+    const before = store.tasks(recipient.id).length;
+    const adopted = store.resolvePairConversation(sender, recipient.id, idle)!;
+    expect(adopted.created).toBe(false);
+    expect(adopted.task.threadId).toBe(newer.threadId);
+    expect(store.tasks(recipient.id)).toHaveLength(before);
+    expect(adopted.task.title).toBe("@Clive");
+    // adoption is not a new conversation: it keeps the hour it was opened
+    expect(adopted.task.openedBy).toEqual({ botId: sender.id, name: "Clive", kind: "pair", at: 20 });
+    // nothing is deleted or closed on the way
+    expect(store.taskByThread(recipient.id, older.threadId)!.title).toBe(brief.slice(0, 80));
+    expect(store.taskByThread(recipient.id, closed.threadId)!.closedBy).toBeDefined();
+    expect(store.taskByThread(recipient.id, handoff.threadId)!.openedBy).toMatchObject({ delegationId: "d-9" });
+    expect(store.taskByThread(recipient.id, handoff.threadId)!.title).toBe("Review PR 12");
+    expect(store.taskByThread(recipient.id, stranger.threadId)!.openedBy).toEqual({ botId: other.id, name: "Ada", at: 50 });
+    // and the next send continues the adopted one
+    expect(store.resolvePairConversation(sender, recipient.id, idle)!.task.threadId).toBe(newer.threadId);
+    expect(store.tasks(recipient.id)).toHaveLength(before);
+  });
+
+  it("resolvePairConversation adopts a hand-renamed thread without overwriting the name the person typed", () => {
+    const store = new Store(selection);
+    const recipient = store.createBot({ name: "Scout" });
+    const sender = store.createBot({ name: "Clive" });
+    const idle = { working: () => false };
+    const brief = "Implement and independently verify the CSV export for the reporting page";
+    const row = store.createTask(recipient.id, brief, false, undefined, { botId: sender.id, name: "Clive", at: 10 })!;
+    store.appendMessage(row.threadId, { role: "bot", kind: "text", text: `@Scout ${brief}`, at: 1_000 });
+    // the person gave the row a name of their own; the machine's slice is
+    // gone, so adoption has nothing to recognise as its own and must not
+    // guess
+    store.renameTask(recipient.id, row.threadId, "Reporting exports");
+    const adopted = store.resolvePairConversation(sender, recipient.id, idle)!;
+    expect(adopted.created).toBe(false);
+    expect(adopted.task.threadId).toBe(row.threadId);
+    expect(adopted.task.title).toBe("Reporting exports");
+    expect(adopted.task.openedBy).toMatchObject({ botId: sender.id, kind: "pair" });
+    // it is the pair conversation all the same: the next send continues it
+    expect(store.resolvePairConversation(sender, recipient.id, idle)!.task.threadId).toBe(row.threadId);
+    expect(store.taskByThread(recipient.id, row.threadId)!.title).toBe("Reporting exports");
+    expect(store.tasks(recipient.id)).toHaveLength(2);
+  });
+
+  it("first-message titling reports the peer provenance adoption relies on, and a late retitle cannot undo an adoption rename", () => {
+    const store = new Store(selection);
+    const recipient = store.createBot({ name: "Scout" });
+    const sender = store.createBot({ name: "Clive" });
+    const idle = { working: () => false };
+    const brief = "Verify the export";
+    // a peer-opened row that was still untitled when its assignment landed:
+    // the first message names it, and the record it gets back carries the
+    // provenance that must keep any generated title away from the row
+    const row = store.createTask(recipient.id, undefined, false, undefined, { botId: sender.id, name: "Clive", at: 10 })!;
+    store.appendMessage(row.threadId, { role: "bot", kind: "text", text: `@Scout ${brief}`, at: 1_000 });
+    const titled = store.titleTaskFromFirstMessage(recipient.id, `@Scout ${brief}`, row.threadId);
+    expect(titled?.title).toBe(`@Scout ${brief}`);
+    expect(titled?.openedBy?.botId).toBe(sender.id);
+    // the row a person's assignment named: adoption renames it to the
+    // sender, and a generated title arriving later finds nothing to replace
+    const named = store.createTask(recipient.id, brief, false, undefined, { botId: sender.id, name: "Clive", at: 20 })!;
+    store.appendMessage(named.threadId, { role: "bot", kind: "text", text: `@Scout ${brief}`, at: 2_000 });
+    const adopted = store.resolvePairConversation(sender, recipient.id, idle)!;
+    expect(adopted.created).toBe(false);
+    expect(adopted.task.title).toBe("@Clive");
+    expect(store.retitleTask(recipient.id, named.threadId, `@Scout ${brief}`, "Export verification")).toBeNull();
+    expect(store.taskByThread(recipient.id, named.threadId)!.title).toBe("@Clive");
+  });
+
+  it("channel first-message titling reports the row it named, and a late retitle cannot undo a rename", () => {
+    const store = new Store(selection);
+    const bot = store.createBot({ name: "Scout" });
+    const group = store.createGroup("Ops", [bot.id])!;
+    const task = store.activeGroupTask(group.id)!;
+    const titled = store.titleGroupTaskFromFirstMessage(group.id, "Audit the payroll", task.threadId);
+    expect(titled?.threadId).toBe(task.threadId);
+    expect(titled?.title).toBe("Audit the payroll");
+    // a person's rename wins over anything generated later
+    store.renameGroupTask(group.id, task.threadId, "Payroll audit");
+    expect(store.retitleGroupTask(group.id, task.threadId, "Audit the payroll", "Payroll checks")).toBeNull();
+    expect(store.activeGroupTask(group.id)!.title).toBe("Payroll audit");
+    // and where nothing intervened, the generated title lands once — a
+    // second answer aimed at the same snippet finds nothing to replace
+    const fresh = store.createGroupTask(group.id)!.threadId;
+    const freshSnippet = store.titleGroupTaskFromFirstMessage(group.id, "Draft the announcement", fresh)!.title;
+    expect(store.retitleGroupTask(group.id, fresh, freshSnippet, "Draft announcement")).toMatchObject({ threadId: fresh });
+    expect(store.retitleGroupTask(group.id, fresh, freshSnippet, "A second opinion")).toBeNull();
+    expect(store.groupTaskByThread(group.id, fresh)!.title).toBe("Draft announcement");
+  });
+
+  it("resolvePairConversation reopens a closed pair conversation and gives concurrent work its own thread", () => {
+    const store = new Store(selection);
+    const recipient = store.createBot({ name: "Scout" });
+    const sender = store.createBot({ name: "Clive" });
+    const idle = { working: () => false };
+    const pair = store.resolvePairConversation(sender, recipient.id, idle)!.task;
+    // closed once its result was read; picking it back up must not open a
+    // second line between the same two bots
+    store.setTaskClosedBy(recipient.id, pair.threadId, { botId: sender.id, name: "Clive", at: 5 });
+    const reopened = store.resolvePairConversation(sender, recipient.id, idle)!;
+    expect(reopened.task.threadId).toBe(pair.threadId);
+    expect(reopened.created).toBe(false);
+    expect(store.taskByThread(recipient.id, pair.threadId)).not.toHaveProperty("closedBy");
+    // a second assignment arriving while that one is still working gets its
+    // own thread, named by the caller's label
+    const busy = { working: (threadId: string) => threadId === pair.threadId };
+    const work = store.resolvePairConversation(sender, recipient.id, { ...busy, label: "Header row" })!;
+    expect(work.created).toBe(true);
+    expect(work.task.threadId).not.toBe(pair.threadId);
+    expect(work.task.title).toBe("@Clive · Header row");
+    expect(work.task.openedBy).toMatchObject({ botId: sender.id, kind: "work" });
+    // no label is still honest and short, never the brief
+    expect(store.resolvePairConversation(sender, recipient.id, busy)!.task.title).toBe("@Clive · parallel work");
+    // a work thread is never mistaken for the pair conversation afterwards
+    expect(store.resolvePairConversation(sender, recipient.id, idle)!.task.threadId).toBe(pair.threadId);
+    expect(store.tasks(recipient.id).filter((task) => task.openedBy?.kind === "pair")).toHaveLength(1);
+    expect(store.tasks(recipient.id).filter((task) => task.openedBy?.kind === "work")).toHaveLength(2);
+  });
+
+  it("setTaskClosedBy stamps who closed a thread, survives a reload, and null reopens it", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const closer = store.createBot();
+    const task = store.createTask(bot.id, "Helper")!;
+    expect(task).not.toHaveProperty("closedBy");
+    expect(store.setTaskClosedBy(bot.id, task.threadId, { botId: closer.id, name: closer.name, at: 9 })!.closedBy)
+      .toEqual({ botId: closer.id, name: closer.name, at: 9 });
+    expect(store.setTaskClosedBy(bot.id, "no-such-thread", { botId: closer.id, name: closer.name, at: 9 })).toBeNull();
+    expect(new Store(selection).taskByThread(bot.id, task.threadId)?.closedBy).toEqual({ botId: closer.id, name: closer.name, at: 9 });
+    // the person picking the thread back up clears the stamp entirely
+    expect(store.setTaskClosedBy(bot.id, task.threadId, null)).not.toHaveProperty("closedBy");
+    expect(new Store(selection).taskByThread(bot.id, task.threadId)).not.toHaveProperty("closedBy");
+    // the HTTP task PATCH cannot forge or clear it
+    expect(store.patchTask(bot.id, task.threadId, { closedBy: { botId: closer.id, name: closer.name, at: 1 } } as never)).not.toHaveProperty("closedBy");
   });
 
   it("every bot write emits a bot event carrying only the id (the wire shape is the caller's)", () => {
@@ -875,8 +1397,14 @@ describe("Store redacts bot-authored secrets on write", () => {
     const reply = store.appendMessage(bot.threadId, { role: "bot", kind: "text", text: `Your key is ${key}` });
     expect(reply.text).not.toContain(key);
     expect(reply.text).toContain("«redacted");
-    const chip = store.appendMessage(bot.threadId, { role: "bot", kind: "activity", tool: { name: `Bash: export TOKEN=${key}`, ok: true } });
+    const chip = store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: `Bash: export TOKEN=${key}`, ok: true, summary: `export TOKEN=${key}` },
+    });
     expect(chip.tool?.name).not.toContain(key);
+    expect(chip.tool?.summary).not.toContain(key);
+    expect(chip.tool?.summary).toContain("«redacted");
     const card = store.appendMessage(bot.threadId, {
       role: "bot",
       kind: "options",
@@ -916,6 +1444,33 @@ describe("Store redacts bot-authored secrets on write", () => {
     if (routineCard.card?.routineRequest?.operation.action !== "create") throw new Error("missing routine payload");
     expect(routineCard.card.routineRequest.operation.routine.name).not.toContain(key);
     expect(routineCard.card.routineRequest.operation.routine.instructions).not.toContain(key);
+    const profileCard = store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "options",
+      card: {
+        title: "Update profile?",
+        subtitle: "Why: because you asked",
+        options: ["Confirm", "Cancel"],
+        requestId: "profile-request",
+        tool: "update_profile",
+        profileRequest: {
+          version: 1,
+          requestId: "profile-request",
+          botId: bot.id,
+          threadId: bot.threadId,
+          targetBotId: bot.id,
+          targetName: `Scout ${key}`,
+          createdAt: 1,
+          reason: `because you asked about ${key}`,
+          changes: { name: "Kiwi" },
+          before: { name: "Scout", soul: `token ${key}` },
+          expectedRevision: "r",
+        },
+      },
+    });
+    expect(profileCard.card?.profileRequest?.targetName).not.toContain(key);
+    expect(profileCard.card?.profileRequest?.reason).not.toContain(key);
+    expect(profileCard.card?.profileRequest?.before.soul).not.toContain(key);
     const skillCard = store.appendMessage(bot.threadId, {
       role: "bot",
       kind: "options",
@@ -1025,19 +1580,19 @@ describe("Store task usage", () => {
   it("banks each turn's tokens and cost on the task, counting turns", () => {
     const store = new Store(selection);
     const bot = store.createBot();
-    expect(store.addTaskUsage(bot.id, bot.threadId, { input: 100, output: 20, costUsd: 0.01 })).toEqual({
+    expect(store.addTaskUsage(bot.id, bot.threadId, { input: 100, output: 20, costUsd: 0.01 })).toMatchObject({
       input: 100,
       output: 20,
       costUsd: 0.01,
       turns: 1,
     });
-    expect(store.addTaskUsage(bot.id, bot.threadId, { input: 50, output: 5, costUsd: 0.005 })).toEqual({
+    expect(store.addTaskUsage(bot.id, bot.threadId, { input: 50, output: 5, costUsd: 0.005 })).toMatchObject({
       input: 150,
       output: 25,
       costUsd: 0.015,
       turns: 2,
     });
-    expect(store.taskByThread(bot.id, bot.threadId)?.usage).toEqual({ input: 150, output: 25, costUsd: 0.015, turns: 2 });
+    expect(store.taskByThread(bot.id, bot.threadId)?.usage).toMatchObject({ input: 150, output: 25, costUsd: 0.015, turns: 2 });
   });
 
   it("keeps cost null until some turn reports one, then sums only reported costs", () => {
@@ -1051,7 +1606,7 @@ describe("Store task usage", () => {
   it("counts a turn that reported no tokens at all", () => {
     const store = new Store(selection);
     const bot = store.createBot();
-    expect(store.addTaskUsage(bot.id, bot.threadId, { costUsd: null })).toEqual({ input: 0, output: 0, costUsd: null, turns: 1 });
+    expect(store.addTaskUsage(bot.id, bot.threadId, { costUsd: null })).toMatchObject({ input: 0, output: 0, costUsd: null, turns: 1 });
   });
 
   it("ignores an unknown task", () => {
@@ -1158,5 +1713,164 @@ describe("Store task working folder — cloud runs", () => {
     expect(store.taskByThread(bot.id, bot.threadId)?.cwd).toBeNull();
     // and it stays pinned even if a host run follows
     expect(store.pinTaskCwd(bot.id, bot.threadId)).toBeNull();
+  });
+});
+
+describe("soul", () => {
+  beforeEach(() => {
+    rmSync(DATA_DIR, { recursive: true, force: true });
+  });
+
+  it("seeds an empty soul with its hash and writes the SOUL.md mirror on create", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    expect(bot.soul).toBe("");
+    expect(bot.soulHash).toBe(soulHash(""));
+    expect(readFileSync(soulFile(bot.id), "utf8")).toBe("");
+  });
+
+  it("setSoul rewrites the record, the hash, the mirror, and clears drift", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.patchBot(bot.id, { soulDrift: true });
+    const updated = store.setSoul(bot.id, "Be brief.");
+    expect(updated?.soul).toBe("Be brief.");
+    expect(updated?.soulHash).toBe(soulHash("Be brief."));
+    expect(updated?.soulDrift).toBe(false);
+    expect(readFileSync(soulFile(bot.id), "utf8")).toBe("Be brief.");
+    expect(store.setSoul("nope", "x")).toBeNull();
+  });
+
+  it("backfills old bots' mirrors before the first non-soul history change", async () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const raw = JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8")) as Record<string, unknown>[];
+    for (const record of raw) {
+      delete record.soul;
+      delete record.soulHash;
+    }
+    writeFileSync(join(DATA_DIR, "bots.json"), JSON.stringify(raw));
+    rmSync(join(DATA_DIR, "bots", bot.id), { recursive: true, force: true });
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.soul).toBe("");
+    expect(reloaded.bot(bot.id)?.soulHash).toBe(soulHash(""));
+    expect(readFileSync(soulFile(bot.id), "utf8")).toBe("");
+    reloaded.patchBot(bot.id, { title: "Tracker" });
+    recordProfileChange(bot.id, "user", "api", { title: "" }, { title: "Tracker" });
+    await flushProfileHistory(bot.id);
+    expect(readHistory(bot.id)).toMatchObject([{ field: "title", after: "Tracker" }]);
+  });
+
+  it("preserves externally edited mirrors on reload", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.setSoul(bot.id, "canonical");
+    writeFileSync(soulFile(bot.id), "user edit");
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.soul).toBe("canonical");
+    expect(readFileSync(soulFile(bot.id), "utf8")).toBe("user edit");
+  });
+
+  it("keeps all profile fields, the receipt and mirror unchanged when persistence fails", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const before = JSON.parse(JSON.stringify(bot));
+    const save = vi.spyOn(store as unknown as { saveBots(bots: BotRecord[]): void }, "saveBots")
+      .mockImplementationOnce(() => { throw new Error("disk full"); });
+    expect(() => store.patchBotProfile(bot.id, { name: "Kiwi", soul: "new", lastProfileRequestId: "card" })).toThrow("disk full");
+    expect(bot).toEqual(before);
+    expect(readFileSync(soulFile(bot.id), "utf8")).toBe("");
+    expect(JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8"))[0].name).toBe(before.name);
+    save.mockRestore();
+    const emit = vi.fn();
+    store.onChange(emit);
+    store.patchBotProfile(bot.id, { name: "Kiwi", soul: "new", lastProfileRequestId: "card" });
+    expect(emit).toHaveBeenCalledTimes(1);
+    expect(new Store(selection).bot(bot.id)).toMatchObject({ name: "Kiwi", soul: "new", lastProfileRequestId: "card" });
+  });
+
+  it("keeps runtime revocations effective in memory even when persistence fails", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.patchBot(bot.id, { browser: true });
+    const save = vi.spyOn(store as unknown as { saveBots(bots: BotRecord[]): void }, "saveBots")
+      .mockImplementationOnce(() => { throw new Error("disk full"); });
+    expect(() => store.patchBot(bot.id, { browser: false })).toThrow("disk full");
+    expect(bot.browser).toBe(false);
+    save.mockRestore();
+  });
+
+  it("deleteBot removes the bot folder with the workspace", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    expect(existsSync(soulFile(bot.id))).toBe(true);
+    store.deleteBot(bot.id);
+    expect(existsSync(join(DATA_DIR, "bots", bot.id))).toBe(false);
+  });
+
+  it("reviewed setup freezes legacy thread settings and persists valid team grants and its receipt on reload", () => {
+    const store = new Store(selection);
+    const chief = store.createBot({ name: "Clive", section: "Operations" });
+    const bot = store.createBot({ name: "Patch", section: "Operations" });
+    store.patchBot(chief.id, { chiefOfStaff: true, managedSections: Array.from({ length: 99 }, (_, i) => `Team ${i}`) });
+    store.patchBot(bot.id, { approvalMode: "edits", autoApprove: false, alwaysAllow: ["Read"] });
+    const task = bot.tasks![0];
+    delete task.modelSelection; delete task.approvalMode; delete task.autoApprove; delete task.alwaysAllow;
+    const name = "T".repeat(60);
+    const request: TeamSetupRequest = { version: 1, requestId: "setup-reload", botId: chief.id, threadId: chief.threadId,
+      reason: "Requested", createdAt: 1, requesterRevision: "fixture", newTeams: [name], operations: [
+        { action: "update", botId: bot.id, fields: { section: name, modelSelection: { instanceId: "codex", model: "fixture" } } },
+      ] };
+    const original = structuredClone(store.bots);
+    const save = vi.spyOn(store as unknown as { saveBots(bots: BotRecord[]): void }, "saveBots")
+      .mockImplementationOnce(() => { throw new Error("disk full"); });
+    expect(() => store.applyTeamSetup(request)).toThrow("disk full");
+    expect(store.bots).toEqual(original); save.mockRestore();
+    const result = store.applyTeamSetup(request);
+    expect(store.applyTeamSetup(request)).toEqual(result);
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(chief.id)?.managedSections).toHaveLength(100);
+    expect(reloaded.bot(chief.id)?.managedSections).toContain(name);
+    expect(reloaded.bot(chief.id)?.lastTeamSetupReceipt?.requestId).toBe(request.requestId);
+    expect(reloaded.bot(bot.id)).toMatchObject({ section: name, modelSelection: { instanceId: "codex", model: "fixture" } });
+    expect(reloaded.bot(bot.id)?.tasks?.[0]).toMatchObject({ modelSelection: selection(), approvalMode: "edits", autoApprove: false, alwaysAllow: ["Read"] });
+    expect(() => reloaded.applyTeamSetup({ ...request, requestId: "too-many", newTeams: ["Overflow"] })).toThrow(/scope/);
+    expect(() => reloaded.applyTeamSetup({ ...request, requestId: "too-long", newTeams: ["X".repeat(61)] })).toThrow(/scope/);
+    expect(reloaded.bot(chief.id)?.managedSections).toHaveLength(100);
+  });
+
+  it("reviewed deletion saves its receipt with removal before deleting any bot files", () => {
+    const store = new Store(selection); const chief = store.createBot(); const bot = store.createBot();
+    const request: TeamSetupRequest = { version: 1, requestId: "delete-reload", botId: chief.id, threadId: chief.threadId,
+      reason: "Requested", createdAt: 1, requesterRevision: "fixture", newTeams: [], operations: [],
+      deletion: { botId: bot.id, name: bot.name, expectedRevision: "fixture" } };
+    const save = vi.spyOn(store as unknown as { saveBots(bots: BotRecord[]): void }, "saveBots")
+      .mockImplementationOnce(() => { throw new Error("disk full"); });
+    expect(() => store.deleteBot(bot.id, request)).toThrow("disk full");
+    expect(store.bot(bot.id)).toBe(bot); expect(store.bot(chief.id)?.lastTeamSetupReceipt).toBeUndefined();
+    expect(existsSync(soulFile(bot.id))).toBe(true); expect(store.messagesFor(bot.threadId)).toHaveLength(1);
+    save.mockRestore(); expect(store.deleteBot(bot.id, request)).toBe(true);
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)).toBeNull();
+    expect(reloaded.bot(chief.id)?.lastTeamSetupReceipt).toMatchObject({ requestId: request.requestId, result: { state: "applied" } });
+  });
+
+  it("setSoul still returns the updated record when the mirror write fails", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const folder = join(DATA_DIR, "bots", bot.id);
+    // Make the bot's folder path unwritable by putting a *file* there:
+    // writeSoulMirror's mkdirSync(folder) then fails with ENOTDIR.
+    rmSync(folder, { recursive: true, force: true });
+    writeFileSync(folder, "not a directory");
+    try {
+      const call = () => store.setSoul(bot.id, "Be brief.");
+      expect(call).not.toThrow();
+      const updated = call();
+      expect(updated?.soul).toBe("Be brief.");
+      expect(updated?.soulHash).toBe(soulHash("Be brief."));
+    } finally {
+      rmSync(folder, { force: true });
+    }
   });
 });

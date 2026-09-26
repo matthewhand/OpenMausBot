@@ -7,11 +7,20 @@ import {
 } from "./workspace-credentials.mjs";
 
 describe("workspace credential migration", () => {
+  it("stores the router key separately while keeping provider settings", () => {
+    const result = migrateWorkspaceCredentials({ imageGen: {
+      provider: "custom", key: "openai-only", customApiKey: "router-only",
+      customUrl: "http://127.0.0.1:4000/v1", customModel: "local/image",
+    } }, {});
+    expect(result.credentials).toEqual({ openaiImageApiKey: "openai-only", customImageApiKey: "router-only" });
+    expect(result.config.imageGen).toEqual({ provider: "custom", customUrl: "http://127.0.0.1:4000/v1", customModel: "local/image" });
+    expect(workspaceCredentialEnv(result.credentials)).toEqual({ OMB_OPENAI_IMAGE_KEY: "openai-only", OMB_CUSTOM_IMAGE_KEY: "router-only" });
+  });
   it("moves every plaintext secret into the store and deletes the field", () => {
     const config = {
       xai: { key: "xai-secret", url: "https://api.example.test/v1" },
       box: { token: "box-secret" },
-      tts: { key: "tts-secret", voice: "narrator" },
+      tts: { key: "tts-secret", fishKey: "fish-secret", voice: "narrator" },
       imageGen: { key: "image-secret" },
       opencodeGo: { apiKey: "ocg-secret" },
       profile: { name: "Ada" },
@@ -23,6 +32,7 @@ describe("workspace credential migration", () => {
       xaiApiKey: "xai-secret",
       boxToken: "box-secret",
       ttsKey: "tts-secret",
+      fishAudioKey: "fish-secret",
       opencodeGoApiKey: "ocg-secret",
       openaiImageApiKey: "image-secret",
     });
@@ -116,6 +126,7 @@ describe("workspace credential env", () => {
         xaiApiKey: "xai-secret",
         boxToken: "box-secret",
         ttsKey: "tts-secret",
+        fishAudioKey: "fish-secret",
         opencodeGoApiKey: "ocg-secret",
         openaiImageApiKey: "image-secret",
         composioApiKey: "ak_handled-separately",
@@ -124,6 +135,7 @@ describe("workspace credential env", () => {
       XAI_API_KEY: "xai-secret",
       BOX_TOKEN: "box-secret",
       OMB_TTS_KEY: "tts-secret",
+      OMB_FISH_AUDIO_API_KEY: "fish-secret",
       OPENCODE_API_KEY: "ocg-secret",
       OMB_OPENAI_IMAGE_KEY: "image-secret",
     });

@@ -1,9 +1,9 @@
 import { z } from "zod";
-import type { JsonValue } from "../../server/schema.ts";
+import type { JsonValue } from "../../shared/json";
 
 export interface LocalVmWorkspaceBot {
   id: string;
-  computer?: "cloud" | "vm" | "local" | "off";
+  computer?: "cloud" | "vm" | "local" | "browser" | "off";
   hidden?: boolean;
 }
 

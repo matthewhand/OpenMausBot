@@ -1,9 +1,22 @@
 import { describe, expect, it } from "vitest";
 
 import { createBotPackageExport } from "./package-export.ts";
+import { parseBotPackage, renderBotPackageMarkdown } from "./bot-package.ts";
 import type { BotRecord } from "./store.ts";
 
 describe("package export", () => {
+  it("preserves the exact cron and timezone through export and import", () => {
+    const schedule = { type: "cron" as const, expression: "0 9 L * *", timeZone: "America/New_York" };
+    const exported = createBotPackageExport({
+      name: "Monthly team", authorName: "Tester", groups: [],
+      bots: [{ id: "b1", threadId: "t1", name: "Lead", color: "green", createdAt: 1 } as BotRecord],
+      routines: [{ id: "r1", name: "Close the month", prompt: "Prepare a report", target: "bot", botId: "b1",
+        runOn: "maus", enabled: true, schedule, durationMinutes: 30, nextRunAt: 1, createdAt: 1, updatedAt: 1 }],
+    });
+    expect(exported.package.routines?.[0]).toMatchObject({ schedule, enabledAfterInstall: false });
+    expect(parseBotPackage(renderBotPackageMarkdown(exported)).package.routines?.[0]?.schedule).toEqual(schedule);
+  });
+
   it("keeps collaboration structure while excluding runtime authority and state", () => {
     const exported = createBotPackageExport({
       name: "Launch Crew",
@@ -15,6 +28,7 @@ describe("package export", () => {
           name: "Lead",
           title: "Chief",
           description: "Coordinates",
+          soul: "Preserve the mission.\n",
           notifications: true,
           color: "purple",
           unread: false,
@@ -23,6 +37,7 @@ describe("package export", () => {
           chiefOfStaff: true,
           composio: true,
           cwd: "/private/path",
+          approvalMode: "full",
           autoApprove: true,
           alwaysAllow: ["everything"],
           installedPackage: {
@@ -45,27 +60,87 @@ describe("package export", () => {
         unread: false,
         createdAt: 1,
       }],
-      routines: [{
-        id: "private-routine-id",
-        name: "Release check",
-        prompt: "Verify release readiness.",
-        botId: "private-id",
-        runOn: "maus",
-        enabled: true,
-        schedule: { type: "daily", time: "09:00", weekdays: [1] },
-        durationMinutes: 30,
-        attachments: [{
-          id: "private-attachment",
-          kind: "file",
-          name: "private.txt",
-          path: "/private/calendar/context.txt",
-          size: 42,
+      routines: [
+        {
+          id: "private-routine-id",
+          name: "Release check",
+          prompt: "Verify release readiness.",
+          target: "bot",
+          botId: "private-id",
+          runOn: "maus",
+          enabled: true,
+          schedule: { type: "daily", time: "09:00", weekdays: [1] },
+          durationMinutes: 30,
+          attachments: [{
+            id: "private-attachment",
+            kind: "file",
+            name: "private.txt",
+            path: "/private/calendar/context.txt",
+            size: 42,
+          }],
+          nextRunAt: 123,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+        {
+          id: "private-room-routine-id",
+          name: "Team release review",
+          prompt: "Review the release together.",
+          target: "room-goal",
+          groupId: "private-room-id",
+          botId: "private-id",
+          runOn: "maus",
+          enabled: true,
+          schedule: { type: "daily", time: "10:00", weekdays: [1] },
+          durationMinutes: 30,
+          nextRunAt: 456,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+        {
+          id: "private-interval-routine-id",
+          name: "Frequent release check",
+          prompt: "Watch release readiness.",
+          target: "bot",
+          botId: "private-id",
+          runOn: "maus",
+          enabled: true,
+          schedule: {
+            type: "interval",
+            everyMinutes: 15,
+            anchorAt: 1_788_254_400_000,
+            weekdays: [1, 3, 5],
+            window: { start: "09:00", end: "17:00" },
+            endsAt: 1_790_843_400_000,
+          },
+          durationMinutes: 30,
+          timeoutMinutes: 20,
+          nextRunAt: 789,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      skillsByBot: new Map([[
+        "private-id",
+        [{
+          name: "source-check",
+          description: "Check sources.",
+          source: "conversation:source-check",
+          instructions: "---\nname: source-check\ndescription: Check sources.\n---\n\n# Source check\n",
         }],
-        nextRunAt: 123,
-        createdAt: 1,
-        updatedAt: 1,
-      }],
+      ]]),
     });
+    expect(exported.package.routines).toHaveLength(2);
+    expect(exported.package.agents[0].soul).toBe("Preserve the mission.\n");
+    expect(exported.package.routines?.[1]?.schedule).toEqual({
+      type: "interval",
+      everyMinutes: 15,
+      anchorAt: 1_788_254_400_000,
+      weekdays: [1, 3, 5],
+      window: { start: "09:00", end: "17:00" },
+      endsAt: 1_790_843_400_000,
+    });
+    expect(exported.package.routines?.[1]?.timeoutMinutes).toBe(20);
 
     expect(exported).toMatchObject({
       format: "openmaus.package",
@@ -73,11 +148,45 @@ describe("package export", () => {
         chiefOfStaff: "lead",
         requirements: { apps: [{ slug: "github" }] },
         rooms: [{ members: ["lead"], defaultResponder: { kind: "agent", agent: "lead" } }],
-        routines: [{ agent: "lead", enabledAfterInstall: false }],
+        routines: [
+          { agent: "lead", enabledAfterInstall: false },
+          { agent: "lead", enabledAfterInstall: false },
+        ],
         playbooks: [{ key: "launch" }],
+        skills: { entries: [{ name: "source-check" }] },
+        agents: [{ skills: ["source-check"] }],
       },
     });
-    expect(JSON.stringify(exported)).not.toMatch(/private-id|private-thread|private-engine|secret-model|secret-session|private\/path|private-attachment|autoApprove|alwaysAllow|nextRunAt/);
+    expect(JSON.stringify(exported)).not.toMatch(/private-id|private-thread|private-engine|secret-model|secret-session|private\/path|private-attachment|approvalMode|autoApprove|alwaysAllow|nextRunAt/);
+  });
+
+  it.each([
+    { instructions: "---\nname: shared\ndescription: Shared\n---\ntwo" },
+    { description: "Different" }, { source: "other" }, { license: "MIT" }, { compatibility: "Other" },
+  ])("refuses conflicting portable skill content across selected bots: %j", (patch) => {
+    const bot = (id: string): BotRecord => ({
+      id,
+      threadId: `thread-${id}`,
+      name: id,
+      title: "Researcher",
+      description: "Researches leads",
+      notifications: true,
+      color: "green",
+      unread: false,
+      modelSelection: { instanceId: "engine", model: "model", effort: "medium" },
+      resumeCursors: {},
+      createdAt: 1,
+    });
+    expect(() => createBotPackageExport({
+      name: "Conflicting Skills",
+      bots: [bot("one"), bot("two")],
+      groups: [],
+      routines: [],
+      skillsByBot: new Map([
+        ["one", [{ name: "shared", description: "Shared", instructions: "---\nname: shared\ndescription: Shared\n---\none" }]],
+        ["two", [{ name: "shared", description: "Shared", instructions: "---\nname: shared\ndescription: Shared\n---\none", ...patch }]],
+      ]),
+    })).toThrow("conflicting content");
   });
 
   it("shares one identical playbook definition across multiple bots", () => {
@@ -116,4 +225,5 @@ describe("package export", () => {
       ["qualify"],
     ]);
   });
+
 });

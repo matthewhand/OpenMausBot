@@ -1,0 +1,21 @@
+# Dev Caddy front door for OpenMausBot (opt-in).
+#
+# Same shape as deploy/local/Caddyfile (encode + /hooks/* split +
+# streaming-safe reverse proxy), but pointed at the DEV service names and
+# ports instead of the production 127.0.0.1:8799/:8800 pair:
+#   app     -> omb:<OMB_PORT, default 8802>
+#   webhooks -> omb:<OMB_WEBHOOK_PORT, default 8800>
+#
+# Started only with: docker compose -f deploy/docker-compose.dev.yml --profile caddy up -d
+:80 {
+	encode zstd gzip
+	handle /hooks/* {
+		reverse_proxy omb:{$OMB_WEBHOOK_PORT:8800}
+	}
+	handle {
+		reverse_proxy omb:{$OMB_PORT:8802} {
+			header_up X-Forwarded-Proto {http.vars.scheme}
+			flush_interval -1
+		}
+	}
+}

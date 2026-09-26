@@ -3,10 +3,10 @@
 Your bots keep running on the laptop. This is the phone you watch them from,
 answer their approvals on, and send them the next thing.
 
-The laptop stays the only machine that owns agent processes, credentials,
-transcripts and computers. The phone owns nothing — it is a second client of the
-same harness the desktop app talks to, through the restricted sidecar described in
-[`docs/ios-companion.md`](../docs/ios-companion.md).
+The laptop stays the only machine that persists agent processes, credentials,
+transcripts and computers. The phone owns no copy — it is a second client of
+the same harness the desktop app talks to, through the restricted sidecar
+described in [`docs/ios-companion.md`](../docs/ios-companion.md).
 
 ## Status
 
@@ -14,6 +14,17 @@ Built and verified against a real harness on both a simulator and an iPhone:
 QR handoff, Bonjour discovery, manual LAN and Tailscale pairing, the roster, paged chat,
 streaming replies, shared sidebar sections, the computer view, and — the one that matters — an approval
 raised by a bot on the Mac, answered on the phone, with the bot carrying on.
+
+Pending API-key cards can also be completed on a freshly QR-paired phone.
+The native secure field supports iOS Password AutoFill (Apple Passwords is the
+free built-in option; enabled third-party providers work too), then CryptoKit
+encrypts the value for the paired computer before it enters the network. The
+phone clears the native field immediately; it may retain only the exact
+ciphertext in memory for an idempotent retry, and never persists it. The
+sidecar, hosted relay, transcript and SQLite database retain no plaintext copy.
+Submission requires Secure phone access (HTTPS) or Tailscale; local Wi-Fi chat
+still works, but the app does not send a reusable device token with a credential
+request over cleartext LAN HTTP.
 
 The app also installs an iOS Share extension. From any app's Share sheet, a
 person can choose **OpenMausBot**, review the paired computer and destination,
@@ -37,6 +48,27 @@ real `URLSession` tests:
 
 `EventStreamTests` catches that class by driving a real `URLSession`.
 [`TESTING.md`](TESTING.md) is the end-to-end runbook.
+
+## Threads on iPhone and iPad
+
+Tap **Threads** beneath a bot on the home screen to expand its conversations.
+Desktop folders appear in the same order, with working, queued, waiting and
+unread state shown on each thread. Search matches thread and folder names.
+Internal routine runs are kept out of this list.
+
+Inside a chat, tap the bot/thread name in the header to switch conversations,
+create a thread, or rename/delete one. In the thread picker, tap **Select** to
+choose several idle threads and delete them after one confirmation. The thread
+currently open on the phone stays in place; switch to one you want to keep
+before selecting the others. Tap the avatar for bot settings.
+Picking a bot thread is local to the phone; it does not move the desktop's
+selection. Draft text and attachments stay with their original thread while
+switching in that chat. Updates also lists sibling conversations separately.
+Group conversations retain their existing shared, serial switching behavior.
+
+Folder creation, moving threads between folders and folder reordering remain
+desktop actions. See the [isolated thread checks](../docs/verification/ios-threads.md)
+for simulator verification and its limits.
 
 ## Layout
 

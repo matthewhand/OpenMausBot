@@ -8,9 +8,6 @@
 // or Escape instead, which is honest and cannot feed back. (Full-duplex
 // barge-in needs AEC on the capture path — a follow-up, not a footnote.)
 //
-// The LAN/browser UI has no Swift helper, so capture falls back to the
-// Web Speech API. Same half-duplex rule; Chrome/Edge need a secure origin.
-//
 // Turn-taking uses a small silence endpointer in the native helper. Apple's
 // buffer-backed recognizer does not finalize on silence by itself: the helper
 // has to end the audio stream, which then produces the final transcript.
@@ -25,23 +22,16 @@ import { Loader2, Phone, PhoneOff, X } from "lucide-react";
 
 import { useStore, visibleMessages, type Bot } from "@/state/store";
 import { currentCall, deferCallCleanup, endCall, startCall, useOnCall } from "@/lib/call";
-import {
-  callSpeechAvailable,
-  onSpeechEnd,
-  onSpeechTranscript,
-  primeBrowserMic,
-  speechEndUserMessage,
-  speechStart,
-  speechStop,
-} from "@/lib/speech-capture";
 import { speaker } from "@/lib/tts";
+import { localSystemVoiceActive } from "@/lib/local-voice";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
-import { MausAvatar } from "./Avatar";
+import { BotAvatar } from "./Avatar";
 import { isRoutineApproval, isSkillApproval, pendingApprovals, spokenApprovalPrompt } from "./PendingApproval";
 import { cn } from "@/lib/cn";
 import { track } from "@/lib/analytics";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
+import { callCapabilityHelp } from "@/lib/call-capability";
 
 /** Spoken answers to a permission card. Anything else is read as a reply
  * to the bot, not as consent — an approval must never be granted by a
@@ -83,13 +73,18 @@ export function CallTargetButton({
   onStart: () => void;
 }) {
   const { state, dispatch } = useStore();
-  const { ready: capabilitiesReady } = useDesktopCapabilities();
+  const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
   const active = useOnCall() === targetId;
-  const supported = callSpeechAvailable();
-  const configured = Boolean(state.config?.tts?.configured);
+  const capabilityHelp = capabilitiesReady
+    ? callCapabilityHelp(capabilities, Boolean(window.ogb?.speechStart))
+    : null;
+  const supported = capabilitiesReady && !capabilityHelp;
+  const localVoice = localSystemVoiceActive();
+  const configured = localVoice || Boolean(state.config?.tts?.configured);
   const everyTargetHasVoice = voices.length > 0 && voices.every((voice) => Boolean(voice));
   const voiceReady =
-    configured && (requireExplicitVoices ? everyTargetHasVoice : Boolean(state.config?.tts?.ready || everyTargetHasVoice));
+    localVoice ||
+    (configured && (requireExplicitVoices ? everyTargetHasVoice : Boolean(state.config?.tts?.ready || everyTargetHasVoice)));
   const unavailable = !active && (!capabilitiesReady || !supported || !voiceReady);
   const voiceSetupRequired = capabilitiesReady && supported && !voiceReady;
   const [helpOpen, setHelpOpen] = useState(false);
@@ -101,24 +96,24 @@ export function CallTargetButton({
     : !capabilitiesReady
       ? "Checking call availability"
       : !supported
-        ? "Calls currently need Chrome, Edge, or the macOS desktop app"
+        ? capabilityHelp?.label ?? "Call unavailable"
         : !configured
-          ? "Add a TTS provider in App Settings to make calls"
+          ? "Set up a voice in an agent profile to make calls"
           : !voiceReady
             ? "Pick a voice in an agent profile to make calls"
             : `Call ${targetName}`;
 
   const reason = !capabilitiesReady
     ? "Checking whether this device can make calls."
-    : !supported
-      ? "Calls need Chrome or Edge speech recognition, or the macOS desktop app."
-      : !configured
-        ? "Configure a TTS provider in App Settings — ElevenLabs, OpenAI-compatible, or built-in Mac voices — so the bot can speak during calls."
-        : !voiceReady
-          ? voices.length > 1
-            ? "Give every channel member a voice before starting a channel call."
-            : "Choose a voice before starting a call."
-          : "";
+    : capabilityHelp
+      ? capabilityHelp.reason
+        : !configured
+          ? "Set up ElevenLabs, Fish Audio, Chatterbox, or a built-in Mac voice so the bot can speak during calls."
+          : !voiceReady
+            ? voices.length > 1
+              ? "Give every group member a voice before starting a group call."
+              : "Choose a voice before starting a call."
+            : "";
 
   useEffect(() => {
     if (!helpOpen) return;
@@ -149,7 +144,7 @@ export function CallTargetButton({
             return;
           }
           onStart();
-          void primeBrowserMic().finally(() => startCall(targetId));
+          startCall(targetId);
         }}
         aria-expanded={unavailable ? helpOpen : undefined}
         aria-controls={unavailable ? helpId : undefined}
@@ -179,13 +174,25 @@ export function CallTargetButton({
         >
           <div className="text-[13px] font-medium text-ink">Call unavailable</div>
           <div className="mt-1 text-[12px] leading-[1.45] text-ink-secondary">{reason}</div>
+          {capabilityHelp?.action === "choose-local-workspace" && (
+            <button
+              type="button"
+              onClick={() => {
+                setHelpOpen(false);
+                void window.ogb?.workspaces?.menu();
+              }}
+              className="mt-2.5 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-medium text-white hover:brightness-110"
+            >
+              Choose This computer
+            </button>
+          )}
           {voiceSetupRequired && (
             <button
               type="button"
               onClick={() => {
                 setHelpOpen(false);
                 if (setupBotId && setupBotId !== targetId) dispatch({ type: "select", id: setupBotId });
-                dispatch({ type: "toggleSettings", open: true });
+                dispatch({ type: "toggleSettings", open: true, section: "voice" });
               }}
               className="mt-2.5 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-medium text-white hover:brightness-110"
             >
@@ -257,7 +264,7 @@ function Call({ bot }: { bot: Bot }) {
   }, []);
 
   const hush = useCallback(() => {
-    void speechStop();
+    void window.ogb?.speechStop();
   }, []);
 
   const listen = useCallback(() => {
@@ -265,7 +272,7 @@ function Call({ bot }: { bot: Bot }) {
     move("listening");
     setHeard("");
     setNote(null);
-    void speechStart({ endpointMs: CALL_ENDPOINT_MS }).catch(() => {
+    void window.ogb?.speechStart({ endpointMs: CALL_ENDPOINT_MS }).catch(() => {
       if (alive.current && currentCall() === bot.id) {
         setNote("The microphone couldn't start. Check Microphone and Speech Recognition access.");
       }
@@ -313,7 +320,9 @@ function Call({ bot }: { bot: Bot }) {
 
   // ── the microphone ───────────────────────────────────────────────────
   useEffect(() => {
-    const offTranscript = onSpeechTranscript((line) => {
+    const bridge = window.ogb;
+    if (!bridge) return;
+    const offTranscript = bridge.onSpeechTranscript((line) => {
       if (!alive.current || currentCall() !== bot.id || phaseRef.current !== "listening") return;
       if (line.error) {
         setNote("Dictation stopped unexpectedly. Check Microphone and Speech Recognition access.");
@@ -380,7 +389,7 @@ function Call({ bot }: { bot: Bot }) {
       const openQuestion = askedQuestion.current;
       if (openQuestion) {
         askedQuestion.current = null;
-        dispatch({ type: "answerCard", botId: bot.id, messageId: openQuestion.messageId, answer: said });
+        dispatch({ type: "answerCard", botId: bot.id, threadId: bot.threadId, messageId: openQuestion.messageId, answer: said });
         move("working");
         return;
       }
@@ -388,11 +397,18 @@ function Call({ bot }: { bot: Bot }) {
       move("sending");
       dispatch({ type: "send", botId: bot.id, text: said, threadId: bot.threadId });
     });
-    const offEnd = onSpeechEnd(({ code, reason }) => {
+    const offEnd = bridge.onSpeechEnd(({ code, reason }) => {
       if (!alive.current || currentCall() !== bot.id) return;
-      const failure = speechEndUserMessage(code, reason);
-      if (failure) {
-        setNote(failure);
+      if (code === 2) {
+        setNote("Calls need macOS dictation, which isn't available here yet.");
+        return;
+      }
+      if (code === 1) {
+        setNote(
+          reason === "helper-build-failed"
+            ? "The dictation helper couldn't be built. Install Apple's Command Line Tools and try again."
+            : "Dictation needs Microphone + Speech Recognition access in System Settings.",
+        );
         return;
       }
       // the helper exits after every final result; if we are still meant
@@ -404,7 +420,7 @@ function Call({ bot }: { bot: Bot }) {
     return () => {
       offTranscript();
       offEnd();
-      void speechStop();
+      void window.ogb?.speechStop();
     };
     // busy/approval are intentionally initial snapshots. Their live changes
     // are handled below without tearing down native event listeners.
@@ -541,7 +557,7 @@ function Call({ bot }: { bot: Bot }) {
         <X size={18} />
       </button>
 
-      <MausAvatar color={bot.color} bodyId={bot.mascotBody ?? undefined} state={mascotState} size={220} animated trackPointer />
+      <BotAvatar bot={bot} state={mascotState} size={220} animated trackPointer />
 
       <div className="flex flex-col items-center gap-1.5 text-center">
         <div className="text-[20px] font-medium text-ink">{bot.name}</div>

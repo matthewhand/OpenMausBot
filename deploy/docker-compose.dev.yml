@@ -1,7 +1,14 @@
-# Dev OpenMausBot: Node 24 image, no Caddy, host folder bind-mounted.
+# Dev OpenMausBot: Node 24 image, no Caddy by default, host folder bind-mounted.
 #
 #   cp .env.example .env    # set OMB_DEV_HOME; OMB_AUTH_TOKEN optional on a trusted LAN
 #   docker compose -f docker-compose.dev.yml up -d --build
+#
+# Opt-in Caddy front door (same routing shape as the production
+# compose.yaml + deploy/local/Caddyfile, but aimed at the dev ports):
+#   docker compose -f docker-compose.dev.yml --profile caddy up -d --build
+# This publishes :80 as ${OMB_HTTP_PORT:-8080} and splits /hooks/* to the
+# webhook port, so LAN review can exercise webhooks without duplicating
+# Caddy config.
 #
 # OMB_DEV_HOME defaults to the login home. Set it to a subfolder to sandbox.
 # The server binds OMB_HOST (default 0.0.0.0) so published ports actually reach it.
@@ -25,6 +32,7 @@ services:
       OMB_AUTH_TOKEN: ${OMB_AUTH_TOKEN:-}
       OMB_CORS_ORIGIN: ${OMB_CORS_ORIGIN:-*}
       OMB_WEBHOOK_PORT: ${OMB_WEBHOOK_PORT:-8800}
+      OMB_PUBLIC_URL: ${OMB_PUBLIC_URL:-http://localhost:${OMB_HTTP_PORT:-8080}}
     volumes:
       - ${OMB_DEV_HOME:?set OMB_DEV_HOME in deploy/.env}:/host-home
     ports:
@@ -35,3 +43,25 @@ services:
       timeout: 5s
       start_period: 20s
       retries: 3
+
+  caddy:
+    image: ${CADDY_IMAGE:-caddy:2}
+    profiles: ["caddy"]
+    restart: unless-stopped
+    ports:
+      - "${OMB_HTTP_PORT:-8080}:80"
+    environment:
+      OMB_PORT: ${OMB_PORT:-8802}
+      OMB_WEBHOOK_PORT: ${OMB_WEBHOOK_PORT:-8800}
+    volumes:
+      - ./Caddyfile.dev:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      omb:
+        condition: service_healthy
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -23,15 +23,26 @@ import {
   IMAGE_LAYER_VERSION,
   MANAGED_LABEL,
 } from "./container-computer.ts";
-import { isValidSshAlias, vpsSshAlias, type AppConfig } from "./config.ts";
-import { augmentedPath } from "./env-path.ts";
+import { DATA_DIR, isValidSshAlias, vpsSshAlias, type AppConfig } from "./config.ts";
+import { augmentedPath, resolveCliSpawn } from "./env-path.ts";
+import { prepareVpsSsh } from "./vps-ssh.ts";
+import { loadEnvironmentId } from "./environment.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 
 export const VPS_IMAGE = CUA_IMAGE;
 export const VPS_MANAGED_LABEL = "com.openmausbot.vps";
 export const VPS_CONTAINER_LABEL = "com.openmausbot.container";
+export const VPS_ENVIRONMENT_LABEL = "com.openmausbot.environment";
 export const VPS_VIEWER_LABEL = "com.openmausbot.vps-viewer";
 export const VPS_CONTAINER_PREFIX = "openmausbot-vps";
+// The same durable id is also served by the environment discovery endpoint.
+// Resolve it lazily: index must finish legacy data migration and acquire the
+// writer lease before either provider may create the new data directory.
+let vpsEnvironmentIdCache: string | null = null;
+function vpsEnvironmentId(): string {
+  if (!vpsEnvironmentIdCache) vpsEnvironmentIdCache = loadEnvironmentId(DATA_DIR);
+  return vpsEnvironmentIdCache;
+}
 // SIGTERM must give ssh + docker time to tear down the remote exec before the
 // SIGKILL escalation; 1s was routinely too short over a WAN round-trip, and an
 // orphaned remote exec keeps the driver socket busy for the next command.
@@ -39,12 +50,40 @@ const COMMAND_TIMEOUT_KILL_GRACE_MS = 5_000;
 
 const CONTAINER_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/;
 const CONTAINER_ID = /^[a-f0-9]{12,64}$/i;
+const FULL_CONTAINER_ID = /^[a-f0-9]{64}$/i;
+const MANAGED_VPS_CONTAINER_NAME = /^openmausbot-vps-[a-z0-9]{1,12}-[a-f0-9]{12}$/;
 const IMAGE_ID = /^sha256:[a-f0-9]{64}$/i;
 const PIDS_LIMIT = 512;
 const SCREENSHOT_PATH = "/tmp/openmausbot-vps-preview.png";
+// The Cua XFCE base includes Pillow in its existing Python environment. Keep
+// this panel-only conversion in the transfer exec: no extra SSH round trip,
+// image rebuild, driver settings change, or second temporary image. Older
+// containers without Pillow can still return the original PNG.
+const SCREENSHOT_TRANSFER = `/opt/venv/bin/python -I -c 'import base64, io, sys
+from PIL import Image
+with Image.open(sys.argv[1]) as image:
+    image.thumbnail((1280, 1280))
+    output = io.BytesIO()
+    image.convert("RGB").save(output, format="JPEG", quality=70)
+sys.stdout.write(base64.b64encode(output.getvalue()).decode("ascii"))' "$1" 2>/dev/null || { base64 < "$1" | tr -d "\\n"; }`;
 const INTERNAL_VIEWER_PORT = 6901;
 const VIEWER_VERSION = "1";
 const lifecycleLocks = new Map<string, Promise<void>>();
+
+/** Pin one SSH destination for a complete provider operation. The shared app
+ * config is reloaded in place, so retaining it across awaits could otherwise
+ * inspect one host and start/remove a container on another. */
+function snapshotVpsConfig(cfg: AppConfig): AppConfig {
+  const sshAlias = vpsSshAlias(cfg);
+  return sshAlias ? { vps: { sshAlias } } : {};
+}
+
+/** Settings uses this as the reverse side of its config-transition lock: an
+ * alias cannot move while a lifecycle action that started first still owns a
+ * container lock, including ownerless inventory removals. */
+export function vpsLifecycleBusy(): boolean {
+  return lifecycleLocks.size > 0;
+}
 // A held lock means a lifecycle mutation (worst case: a 10-minute image
 // build) is running. Waiting it out would wedge Sleep and the screenshot
 // poll behind it, so acquisition fails fast instead.
@@ -54,6 +93,10 @@ const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
 // pattern as container-computer's screenshotStatusCache, and the same TTL.
 const STATUS_CACHE_TTL_MS = 10_000;
 const statusCache = new Map<string, { status: VpsComputerStatus; expiresAt: number }>();
+const SCREENSHOT_BUDGET_MS = 45_000;
+const SCREENSHOT_CLEANUP_BUDGET_MS = 10_000;
+type VpsScreenshot = { png: string; format: "png" | "jpeg" };
+const pendingScreenshots = new Map<string, Promise<VpsScreenshot>>();
 const viewerConnections = new Map<string, { privateIp: string; password: string }>();
 const desktopTunnels = new Map<
   string,
@@ -71,6 +114,19 @@ export type VpsCommandRunner = (
 ) => Promise<{ stdout: string; stderr: string }>;
 
 export type VpsLifecycleAction = "provision" | "start" | "stop" | "remove";
+
+/** Whether a turn may prepare or start the VPS container rather than only
+ * reuse a running one. Explicit Cloud always may; Auto only when the person
+ * switched on Start VPS automatically — except for unattended runs. A
+ * scheduled routine has nobody present to choose Cloud, and a container that
+ * idled out between runs would otherwise leave every scheduled job without
+ * its computer, which is exactly what people reported. Starting a self-hosted
+ * container costs nothing that needs consent. */
+export function vpsStartsForTurn(input: { wants: "cloud" | "vm" | "local" | "off" | undefined; autoStartVps?: boolean; automationSource?: string }): boolean {
+  if (input.wants === "cloud") return true;
+  if (input.wants !== undefined) return false;
+  return input.autoStartVps === true || Boolean(input.automationSource);
+}
 
 export interface VpsComputerStatus {
   configured: boolean;
@@ -95,6 +151,29 @@ export interface VpsComputerStatus {
   image_id: string | null;
 }
 
+export interface ManagedVpsOwner {
+  botId: string;
+  name: string;
+  inUse: boolean;
+}
+
+export interface ManagedVpsInventoryInstance {
+  name: string;
+  state: "created" | "restarting" | "running" | "removing" | "paused" | "exited" | "dead" | "unknown";
+  ownerBotId: string | null;
+  ownerName: string | null;
+  orphaned: boolean;
+  inUse: boolean;
+}
+
+export interface ManagedVpsInventory {
+  configured: boolean;
+  available: boolean;
+  sshAlias: string | null;
+  problem: string | null;
+  instances: ManagedVpsInventoryInstance[];
+}
+
 function containerNamePart(botId: string): string {
   return botId.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 12) || "bot";
 }
@@ -116,13 +195,16 @@ export function vpsDockerArgs(alias: string, args: string[]): string[] {
  * loopback port on this computer and forwards it to noVNC on the container's
  * private bridge address. Every caller-controlled component is validated
  * before it becomes an argv value. */
-export function vpsSshTunnelArgs(alias: string, localPort: number, privateIp: string): string[] {
+export function vpsSshTunnelArgs(alias: string, localPort: number, privateIp: string, configPath: string | null = null): string[] {
   if (!isValidSshAlias(alias)) throw new Error("invalid VPS SSH config alias");
   if (!Number.isInteger(localPort) || localPort < 1024 || localPort > 65535) {
     throw new Error("invalid VPS viewer port");
   }
   if (!privateDockerIpv4(privateIp)) throw new Error("invalid VPS private container address");
   return [
+    // the app's config shares the connection every other VPS command holds,
+    // so the viewer tunnel comes up without its own handshake
+    ...(configPath ? ["-F", configPath] : []),
     "-N",
     "-o",
     "BatchMode=yes",
@@ -218,9 +300,13 @@ function tailCollector() {
 
 export function defaultRunner(args: string[], options: VpsCommandOptions = {}): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn("docker", args, {
+    const command = resolveCliSpawn("docker", args);
+    // docker's SSH transport runs the first `ssh` on PATH: the app's shim,
+    // which shares one connection across every command of this VPS.
+    const ssh = prepareVpsSsh(DATA_DIR, augmentedPath());
+    const child = spawn(command.command, command.args, {
       shell: false,
-      env: { ...process.env, PATH: augmentedPath() },
+      env: { ...process.env, PATH: ssh.path },
       stdio: ["pipe", "pipe", "pipe"],
     });
     const stdout = tailCollector();
@@ -458,8 +544,14 @@ async function computeVpsComputerStatus(
       detail?.Image === inspectedImageId &&
       imageLabelsMatch(labels) &&
       labels?.[VPS_VIEWER_LABEL] === VIEWER_VERSION;
+    const environmentLabel = labels?.[VPS_ENVIRONMENT_LABEL];
     status.managed =
-      labels?.[VPS_MANAGED_LABEL] === "1" && labels?.[VPS_CONTAINER_LABEL] === status.container_name;
+      labels?.[VPS_MANAGED_LABEL] === "1" &&
+      labels?.[VPS_CONTAINER_LABEL] === status.container_name &&
+      // A bot-scoped status is proof that the deterministic legacy container
+      // still maps to a bot present in this installation. New containers must
+      // carry this installation's durable environment label.
+      (environmentLabel === undefined || environmentLabel === vpsEnvironmentId());
     status.network = hasNoPublishedPorts(detail?.HostConfig, detail?.NetworkSettings?.Networks) ? "private" : "unsafe";
     status.mounts = hasNoHostMounts(detail ?? {}) ? "none" : "unsafe";
     status.security = dockerSecurityIsHardened(detail?.HostConfig, { restartPolicy: "unless-stopped" })
@@ -559,15 +651,178 @@ export async function vpsComputerStatus(
   botId: string,
   runner: VpsCommandRunner = defaultRunner,
 ): Promise<VpsComputerStatus> {
+  cfg = snapshotVpsConfig(cfg);
   const key = vpsLockKey(cfg, botId);
   const cacheable = runner === defaultRunner && key !== null;
   if (cacheable) {
+    // A capture already checks this exact target. Let it finish instead of
+    // opening another six SSH connections while its readiness check is cold.
+    await pendingScreenshots.get(key)?.catch(() => {});
     const cached = statusCache.get(key);
     if (cached && cached.expiresAt > Date.now()) return cached.status;
   }
   const status = await computeVpsComputerStatus(cfg, botId, runner);
   if (cacheable) statusCache.set(key, { status, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
   return status;
+}
+
+const VPS_INVENTORY_LIMIT = 256;
+const VPS_INVENTORY_STATES = new Set<ManagedVpsInventoryInstance["state"]>([
+  "created",
+  "restarting",
+  "running",
+  "removing",
+  "paused",
+  "exited",
+  "dead",
+]);
+
+function inventoryFailure(alias: string, error: unknown): ManagedVpsInventory {
+  const detail = (error instanceof Error ? error.message : String(error))
+    .replace(/[\r\n\t]+/g, " ")
+    .trim()
+    .slice(0, 200);
+  return {
+    configured: true,
+    available: false,
+    sshAlias: alias,
+    problem: `Docker over SSH could not list managed computers${detail ? `: ${detail}` : ""}`,
+    instances: [],
+  };
+}
+
+function managedVpsState(value: unknown, running: unknown): ManagedVpsInventoryInstance["state"] {
+  const state = typeof value === "string" ? value.toLowerCase() : "";
+  if (VPS_INVENTORY_STATES.has(state as ManagedVpsInventoryInstance["state"])) {
+    return state as ManagedVpsInventoryInstance["state"];
+  }
+  if (running === true) return "running";
+  if (running === false) return "exited";
+  return "unknown";
+}
+
+/** Read-only account inventory for Settings. This intentionally uses only
+ * `container ls` and `container inspect`: opening Settings must never create,
+ * start, stop, or probe a desktop. The second managed label and deterministic
+ * name are both revalidated before a container is shown as removable. */
+async function scanManagedVpsComputers(
+  cfg: AppConfig,
+  owners: ManagedVpsOwner[],
+  runner: VpsCommandRunner = defaultRunner,
+): Promise<{ inventory: ManagedVpsInventory; containerIds: Map<string, string> }> {
+  const alias = vpsSshAlias(cfg);
+  if (!alias) {
+    return {
+      inventory: { configured: false, available: false, sshAlias: null, problem: null, instances: [] },
+      containerIds: new Map(),
+    };
+  }
+
+  try {
+    const listed = await runner(vpsDockerArgs(alias, [
+      "container",
+      "ls",
+      "--all",
+      "--filter",
+      `label=${VPS_MANAGED_LABEL}=1`,
+      "--format",
+      "{{.ID}}",
+    ]), { timeoutMs: 20_000 });
+    const ids = [...new Set(listed.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean))];
+    if (ids.length > VPS_INVENTORY_LIMIT || ids.some((id) => !CONTAINER_ID.test(id))) {
+      throw new Error("the VPS returned an invalid or unexpectedly large managed-container list");
+    }
+    if (ids.length === 0) {
+      return {
+        inventory: { configured: true, available: true, sshAlias: alias, problem: null, instances: [] },
+        containerIds: new Map(),
+      };
+    }
+
+    const inspected = await runner(
+      vpsDockerArgs(alias, ["container", "inspect", ...ids]),
+      { timeoutMs: 20_000 },
+    );
+    const details = JSON.parse(inspected.stdout) as unknown;
+    if (!Array.isArray(details) || details.length !== ids.length) {
+      throw new Error("the VPS returned an incomplete managed-container inventory");
+    }
+
+    const ownerByName = new Map(owners.map((owner) => [vpsContainerName(owner.botId), owner]));
+    const seenIds = new Set<string>();
+    const seenNames = new Set<string>();
+    const containerIds = new Map<string, string>();
+    const instances: ManagedVpsInventoryInstance[] = [];
+    for (const raw of details) {
+      if (!raw || typeof raw !== "object") throw new Error("the VPS returned a malformed managed container");
+      const detail = raw as {
+        Id?: unknown;
+        Name?: unknown;
+        Config?: { Labels?: unknown };
+        State?: { Status?: unknown; Running?: unknown };
+      };
+      const id = typeof detail.Id === "string" ? detail.Id.toLowerCase() : "";
+      const name = typeof detail.Name === "string" ? detail.Name.replace(/^\//, "") : "";
+      const labels = detail.Config?.Labels;
+      const listedId = ids.find((candidate) => id.startsWith(candidate.toLowerCase()));
+      if (
+        !FULL_CONTAINER_ID.test(id) ||
+        !listedId ||
+        seenIds.has(listedId) ||
+        !MANAGED_VPS_CONTAINER_NAME.test(name) ||
+        seenNames.has(name) ||
+        !labels ||
+        typeof labels !== "object" ||
+        (labels as Record<string, unknown>)[VPS_MANAGED_LABEL] !== "1" ||
+        (labels as Record<string, unknown>)[VPS_CONTAINER_LABEL] !== name
+      ) {
+        throw new Error("the VPS returned a managed container whose identity could not be verified");
+      }
+      const owner = ownerByName.get(name);
+      const environmentLabel = (labels as Record<string, unknown>)[VPS_ENVIRONMENT_LABEL];
+      seenIds.add(listedId);
+      seenNames.add(name);
+      // A foreign installation can legitimately share this Docker daemon and
+      // therefore appears in the label-filtered provider response. Count the
+      // row as inspected, but never return an identifier that could make it
+      // removable. Unlabelled pre-environment containers remain manageable
+      // only while their deterministic name still maps to a local bot.
+      if (environmentLabel !== vpsEnvironmentId() && !(environmentLabel === undefined && owner)) {
+        continue;
+      }
+      containerIds.set(name, id);
+      instances.push({
+        name,
+        state: managedVpsState(detail.State?.Status, detail.State?.Running),
+        ownerBotId: owner?.botId ?? null,
+        ownerName: owner?.name ?? null,
+        orphaned: !owner,
+        inUse: owner?.inUse === true,
+      });
+    }
+    if (seenIds.size !== ids.length) {
+      throw new Error("the VPS returned an incomplete managed-container inventory");
+    }
+    instances.sort((left, right) =>
+      Number(left.orphaned) - Number(right.orphaned) ||
+      (left.ownerName ?? left.name).localeCompare(right.ownerName ?? right.name),
+    );
+    return {
+      inventory: { configured: true, available: true, sshAlias: alias, problem: null, instances },
+      containerIds,
+    };
+  } catch (error) {
+    return { inventory: inventoryFailure(alias, error), containerIds: new Map() };
+  }
+}
+
+export async function listManagedVpsComputers(
+  cfg: AppConfig,
+  owners: ManagedVpsOwner[],
+  runner: VpsCommandRunner = defaultRunner,
+): Promise<ManagedVpsInventory> {
+  cfg = snapshotVpsConfig(cfg);
+  return (await scanManagedVpsComputers(cfg, owners, runner)).inventory;
 }
 
 export function vpsContainerRunArgs(
@@ -588,6 +843,8 @@ export function vpsContainerRunArgs(
     `${VPS_MANAGED_LABEL}=1`,
     "--label",
     `${VPS_CONTAINER_LABEL}=${containerName}`,
+    "--label",
+    `${VPS_ENVIRONMENT_LABEL}=${vpsEnvironmentId()}`,
     "--label",
     `${VPS_VIEWER_LABEL}=${VIEWER_VERSION}`,
     "--label",
@@ -746,12 +1003,73 @@ function vpsLockKey(cfg: AppConfig, botId: string): string | null {
   return alias ? `${alias}:${vpsContainerName(botId)}` : null;
 }
 
+/** Permanently remove one inventory row. The fresh inventory read happens
+ * while holding the same per-container lock as provision/start/stop, so a
+ * stale Settings tab can never delete a replacement container. */
+export async function removeManagedVpsComputer(
+  cfg: AppConfig,
+  owners: ManagedVpsOwner[],
+  containerName: string,
+  confirmName: string,
+  runner: VpsCommandRunner = defaultRunner,
+): Promise<{ removed: true; name: string }> {
+  cfg = snapshotVpsConfig(cfg);
+  const alias = vpsSshAlias(cfg);
+  if (!alias) {
+    throw Object.assign(new Error("VPS is not configured — add an SSH config alias in Connections"), { status: 409 });
+  }
+  if (!MANAGED_VPS_CONTAINER_NAME.test(containerName)) {
+    throw Object.assign(new Error("invalid managed VPS computer name"), { status: 400 });
+  }
+  const key = `${alias}:${containerName}`;
+  return withVpsLifecycleLock(key, async () => {
+    const scan = await scanManagedVpsComputers(cfg, owners, runner);
+    const inventory = scan.inventory;
+    if (!inventory.available) {
+      throw Object.assign(new Error(inventory.problem ?? "VPS computer inventory is unavailable"), { status: 503 });
+    }
+    const instance = inventory.instances.find((candidate) => candidate.name === containerName);
+    if (!instance) throw Object.assign(new Error("managed VPS computer not found"), { status: 404 });
+    if (instance.inUse) {
+      throw Object.assign(new Error("this VPS computer is in use — stop its bot's work first"), { status: 409 });
+    }
+    if (confirmName !== instance.name) {
+      throw Object.assign(new Error("confirmation no longer matches this VPS computer — refresh and try again"), { status: 400 });
+    }
+
+    const containerId = scan.containerIds.get(instance.name);
+    if (!containerId || !FULL_CONTAINER_ID.test(containerId)) {
+      throw Object.assign(new Error("the VPS computer identity could not be revalidated"), { status: 409 });
+    }
+    try {
+      // Use the immutable ID from the same inspect, not the mutable name. A
+      // VPS administrator replacing a same-name container between inspect
+      // and rm must not redirect this explicit removal to the replacement.
+      await runner(vpsDockerArgs(alias, ["rm", "-f", containerId]), { timeoutMs: 2 * 60_000 });
+    } catch (error) {
+      const detail = (error instanceof Error ? error.message : String(error))
+        .replace(/[\r\n\t]+/g, " ")
+        .trim()
+        .slice(0, 200);
+      throw Object.assign(
+        new Error(`The VPS refused to remove this computer${detail ? `: ${detail}` : ""}`),
+        { status: 502 },
+      );
+    }
+    statusCache.delete(key);
+    viewerConnections.delete(key);
+    if (instance.ownerBotId) stopDesktopTunnel(instance.ownerBotId);
+    return { removed: true, name: instance.name };
+  });
+}
+
 export async function vpsComputerAction(
   action: VpsLifecycleAction,
   cfg: AppConfig,
   botId: string,
   runner: VpsCommandRunner = defaultRunner,
 ): Promise<VpsComputerStatus> {
+  cfg = snapshotVpsConfig(cfg);
   const alias = vpsSshAlias(cfg);
   if (!alias) throw Object.assign(new Error("VPS is not configured — add an SSH config alias in App Settings → Connections"), { status: 409 });
   const key = `${alias}:${vpsContainerName(botId)}`;
@@ -836,6 +1154,7 @@ export async function inspectVpsForAuto(
   botId: string,
   runner: VpsCommandRunner = defaultRunner,
 ): Promise<VpsComputerStatus> {
+  cfg = snapshotVpsConfig(cfg);
   const key = vpsLockKey(cfg, botId);
   return key
     ? withVpsLifecycleLock(key, () => computeVpsComputerStatus(cfg, botId, runner))
@@ -851,6 +1170,7 @@ export async function vpsComputerJoin(
   botId: string,
   runner: VpsCommandRunner = defaultRunner,
 ): Promise<{ joinUrl: string; state: "running" }> {
+  cfg = snapshotVpsConfig(cfg);
   const alias = vpsSshAlias(cfg);
   if (!alias) throw Object.assign(new Error("VPS is not configured"), { status: 409 });
 
@@ -876,9 +1196,10 @@ export async function vpsComputerJoin(
   }
 
   const localPort = await unusedLoopbackPort();
-  const child = spawn("ssh", vpsSshTunnelArgs(alias, localPort, connection.privateIp), {
+  const ssh = prepareVpsSsh(DATA_DIR, augmentedPath());
+  const child = spawn("ssh", vpsSshTunnelArgs(alias, localPort, connection.privateIp, ssh.configPath), {
     shell: false,
-    env: { ...process.env, PATH: augmentedPath() },
+    env: { ...process.env, PATH: ssh.path },
     stdio: ["ignore", "ignore", "pipe"],
     windowsHide: true,
   });
@@ -958,12 +1279,33 @@ export async function vpsComputerScreenshot(
   cfg: AppConfig,
   botId: string,
   runner: VpsCommandRunner = defaultRunner,
-): Promise<{ png: string; format: "png" | "jpeg" }> {
+): Promise<VpsScreenshot> {
+  cfg = snapshotVpsConfig(cfg);
   const alias = vpsSshAlias(cfg);
   if (!alias) throw Object.assign(new Error("VPS is not configured"), { status: 409 });
   const key = `${alias}:${vpsContainerName(botId)}`;
+  const pending = pendingScreenshots.get(key);
+  if (pending) return pending;
   const cacheable = runner === defaultRunner;
-  return withVpsLifecycleLock(key, async () => {
+  const deadline = Date.now() + SCREENSHOT_BUDGET_MS;
+  const workDeadline = deadline - SCREENSHOT_CLEANUP_BUDGET_MS;
+  let budgetExpired = false;
+  const timeoutError = () => Object.assign(new Error("The VPS screen preview timed out. Retry the preview when the connection recovers."), { status: 504 });
+  // Clamp each command and wait through the runner's termination grace,
+  // rather than racing its promise and releasing the lock before cleanup.
+  const boundedRunner: VpsCommandRunner = async (args, options = {}) => {
+    const remaining = workDeadline - Date.now() - COMMAND_TIMEOUT_KILL_GRACE_MS;
+    if (remaining <= 0) { budgetExpired = true; throw timeoutError(); }
+    try {
+      const result = await runner(args, { ...options, timeoutMs: Math.min(options.timeoutMs ?? 120_000, remaining) });
+      if (Date.now() >= workDeadline) { budgetExpired = true; throw timeoutError(); }
+      return result;
+    } catch (error) {
+      if (Date.now() >= workDeadline - COMMAND_TIMEOUT_KILL_GRACE_MS) budgetExpired = true;
+      throw budgetExpired ? timeoutError() : error;
+    }
+  };
+  const capture = withVpsLifecycleLock(key, async () => {
     // Same shape as containerComputerScreenshot's screenshotStatusCache: the
     // poller runs every few seconds, and re-verifying the whole container
     // between frames multiplied every frame's SSH cost.
@@ -971,12 +1313,17 @@ export async function vpsComputerScreenshot(
     const status =
       cached && cached.expiresAt > Date.now()
         ? cached.status
-        : await computeVpsComputerStatus(cfg, botId, runner);
+        : await computeVpsComputerStatus(cfg, botId, boundedRunner);
+    // Status converts transport errors into displayable state. A deadline is
+    // still a timeout, not evidence that this container became incompatible.
+    if (budgetExpired) {
+      if (cacheable) statusCache.delete(key);
+      throw timeoutError();
+    }
     if (!status.ready) {
       if (cacheable) statusCache.delete(key);
       throw Object.assign(new Error(status.problem ?? "The VPS computer is not ready"), { status: 409 });
     }
-    if (cacheable) statusCache.set(key, { status, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
     const containerRef = status.container_id ?? status.container_name;
     // The ref goes straight into docker argv, and a cached status is one
     // more step removed from the inspect that produced it — revalidate the
@@ -984,8 +1331,9 @@ export async function vpsComputerScreenshot(
     if (!CONTAINER_ID.test(containerRef) && !CONTAINER_NAME.test(containerRef)) {
       throw Object.assign(new Error("the VPS container reference is malformed"), { status: 409 });
     }
+    let frame: VpsScreenshot;
     try {
-      await runner(
+      await boundedRunner(
         vpsDockerArgs(
           alias,
           cuaExecArgs(
@@ -995,29 +1343,39 @@ export async function vpsComputerScreenshot(
         ),
         { timeoutMs: 30_000 },
       );
-      const encoded = (await runner(vpsDockerArgs(alias, [
+      const encoded = (await boundedRunner(vpsDockerArgs(alias, [
         "exec",
         "-u",
         "cua",
         "-e",
         "HOME=/home/cua",
         containerRef,
-        "base64",
-        "-w0",
+        "sh",
+        "-c",
+        SCREENSHOT_TRANSFER,
+        "openmausbot-preview",
         SCREENSHOT_PATH,
       ]), { timeoutMs: 30_000 })).stdout.trim();
       const checked = wholeScreenshot(Buffer.from(encoded, "base64"));
       if (!checked.ok) throw Object.assign(new Error("Cua Driver returned an incomplete VPS screenshot"), { status: 502 });
-      return { png: encoded, format: checked.mime === "image/jpeg" ? "jpeg" : "png" };
+      frame = { png: encoded, format: checked.mime === "image/jpeg" ? "jpeg" : "png" };
     } catch (error) {
       // The failure may mean the world changed (container stopped, link
       // dropped); a cached "ready" would keep the poller failing for a TTL.
       if (cacheable) statusCache.delete(key);
       throw error;
     } finally {
-      await runner(vpsDockerArgs(alias, ["exec", "-u", "cua", containerRef, "rm", "-f", SCREENSHOT_PATH]), {
-        timeoutMs: 10_000,
+      const cleanupMs = Math.min(5_000, deadline - Date.now() - COMMAND_TIMEOUT_KILL_GRACE_MS);
+      if (cleanupMs > 0) await runner(vpsDockerArgs(alias, ["exec", "-u", "cua", containerRef, "rm", "-f", SCREENSHOT_PATH]), {
+        timeoutMs: cleanupMs,
       }).catch(() => {});
     }
+    // Start the TTL after transfer and cleanup; a slow but healthy frame must
+    // not return with its own readiness cache already expired.
+    if (cacheable) statusCache.set(key, { status, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
+    return frame;
   });
+  pendingScreenshots.set(key, capture);
+  try { return await capture; }
+  finally { if (pendingScreenshots.get(key) === capture) pendingScreenshots.delete(key); }
 }

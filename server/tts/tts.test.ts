@@ -13,6 +13,10 @@ const seen: Array<{ method: string; url: string; headers: Record<string, string>
 let refuse: { status: number; body: unknown } | null = null;
 
 const MP3 = Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x11, 0x22, 0x33, 0x44]);
+const WAV = Buffer.from("RIFF....WAVEfmt ");
+/** flipped by tests that want the server to have no /v1/models route */
+let modelsFail = false;
+let stubBase = "";
 
 beforeAll(async () => {
   server = createServer((req, res) => {
@@ -40,29 +44,62 @@ beforeAll(async () => {
           voices: [{ voice_id: "v-1", name: "Rachel", labels: { accent: "american", description: "calm" } }],
         });
       }
-      if (path === "/voices") {
-        // OpenAI-compatible voices endpoint
-        return send(200, [
-          { id: "af_heart", name: "Heart", description: "Warm female voice" },
-          { id: "am_adam", name: "Adam", description: "Clear male voice" },
-        ]);
-      }
       if (path.startsWith("/v1/text-to-speech/")) {
         res.writeHead(200, { "content-type": "audio/mpeg" });
         return res.end(MP3);
       }
-      if (path === "/audio/speech" || path === "/v1/audio/speech") {
-        // OpenAI-compatible speech endpoint
+      if (path === "/model") {
+        const query = new URL(req.url ?? "/", "http://stub").searchParams;
+        if (query.get("self") === "true" && req.headers.authorization !== "Bearer fish-key") {
+          return send(401, { message: "unauthorized" });
+        }
+        if (query.get("self") === "true" && query.get("page_number") === "1") {
+          return send(200, {
+            total: 3,
+            has_more: true,
+            items: [
+              { _id: "fish-1", type: "tts", state: "trained", title: "Narrator", description: "Warm and measured" },
+              { _id: "svc-1", type: "svc", state: "trained", title: "Not a TTS voice" },
+              { _id: "fish-training", type: "tts", state: "training", title: "Not ready" },
+            ],
+          });
+        }
+        if (query.get("self") === "true" && query.get("page_number") === "2") {
+          return send(200, {
+            total: 3,
+            has_more: false,
+            items: [{ _id: "fish-2", type: "tts", state: "trained", title: "Studio Voice", description: "" }],
+          });
+        }
+        return send(200, {
+          total: 1,
+          has_more: false,
+          items: [
+            { _id: "fish-1", type: "tts", state: "trained", title: "Narrator", description: "Warm and measured" },
+            { _id: "fish-failed", type: "tts", state: "failed", title: "Failed" },
+          ],
+        });
+      }
+      if (path === "/v1/tts") {
         res.writeHead(200, { "content-type": "audio/mpeg" });
         return res.end(MP3);
+      }
+      if (path === "/v1/audio/speech") {
+        res.writeHead(200, { "content-type": "audio/wav" });
+        return res.end(WAV);
+      }
+      if (path === "/v1/models") {
+        if (modelsFail) return send(404, { detail: "no models route" });
+        return send(200, { data: [{ id: "alex" }, { id: "turbo-en" }] });
       }
       send(404, { detail: "no such stub route" });
     });
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const port = (server.address() as { port: number }).port;
-  process.env.OMB_ELEVENLABS_API = `http://127.0.0.1:${port}/v1`;
-  process.env.OMB_OPENAI_TTS_BASE = `http://127.0.0.1:${port}`;
+  stubBase = `http://127.0.0.1:${port}`;
+  process.env.OMB_ELEVENLABS_API = `${stubBase}/v1`;
+  process.env.OMB_FISH_AUDIO_API = stubBase;
 });
 
 afterAll(() => new Promise<void>((r) => server.close(() => r())));
@@ -70,11 +107,12 @@ afterAll(() => new Promise<void>((r) => server.close(() => r())));
 /** The module reads its base URL at import time, so tests import after the
  * stub is listening. */
 const voice = () => import("./index.ts");
+const fish = () => import("./fish.ts");
 
 const cfg = (tts: AppConfig["tts"]): AppConfig => ({ tts });
 
 describe("configuration", () => {
-  it("needs both a key and a voice before it can speak (ElevenLabs)", async () => {
+  it("needs both a key and a voice before it can speak", async () => {
     const { voiceConfigured, voiceReady } = await voice();
     expect(voiceConfigured({})).toBe(false);
     expect(voiceConfigured(cfg({ key: "k" }))).toBe(false);
@@ -84,64 +122,26 @@ describe("configuration", () => {
     expect(voiceReady({}, "v-per-bot")).toBe(false);
   });
 
-  it("needs baseUrl and voice for OpenAI-compatible (key optional)", async () => {
-    const { voiceConfigured, voiceReady } = await voice();
-    const openaiCfg = (tts: AppConfig["tts"]): AppConfig => ({ tts: { provider: "openai-compatible", ...tts } });
-    expect(voiceConfigured(openaiCfg({}))).toBe(false);
-    expect(voiceConfigured(openaiCfg({ baseUrl: "http://localhost" }))).toBe(false);
-    expect(voiceConfigured(openaiCfg({ voice: "v-1" }))).toBe(false);
-    expect(voiceConfigured(openaiCfg({ baseUrl: "http://localhost", voice: "v-1" }))).toBe(true);
-    // key is optional for local servers
-    expect(voiceReady(openaiCfg({ baseUrl: "http://localhost" }), "v-per-bot")).toBe(true);
-  });
-
-  it("defaults to elevenlabs when provider is not set", async () => {
-    const { describeVoice } = await voice();
-    const described = describeVoice(cfg({ key: "sk-secret", voice: "v-1" }));
-    expect(described.provider).toBe("elevenlabs");
-  });
-
   it("never reports the key itself", async () => {
     const { describeVoice } = await voice();
     const described = describeVoice(cfg({ key: "sk-secret", voice: "v-1" }));
-    expect(described.configured).toBe(true);
-    expect(described.ready).toBe(true);
-    expect(described.voice).toBe("v-1");
-    expect(described.provider).toBe("elevenlabs");
+    expect(described).toEqual({ configured: true, ready: true, voice: "v-1", provider: "elevenlabs", baseUrl: "", model: "" });
     expect(JSON.stringify(described)).not.toContain("sk-secret");
   });
 
-  it("reports baseUrl and model for OpenAI-compatible (not a secret)", async () => {
-    const { describeVoice } = await voice();
-    const described = describeVoice(cfg({ provider: "openai-compatible", baseUrl: "http://localhost", model: "kokoro", voice: "v-1" }));
-    expect(described.baseUrl).toBe("http://localhost");
-    expect(described.model).toBe("kokoro");
-    expect(described.configured).toBe(true);
-  });
-
-  it("distinguishes 'no key' from 'no voice picked' for ElevenLabs", async () => {
+  it("distinguishes 'no key' from 'no voice picked'", async () => {
     // the two need different instructions, so they are different errors
     const { speak, NoVoiceConfigured } = await voice();
     expect(() => speak({}, "hi")).toThrow(NoVoiceConfigured);
-    expect(() => speak({}, "hi")).toThrow(NoVoiceConfigured);
-    expect(() => speak({}, "hi")).toThrow(/key/i);
     expect(() => speak({}, "hi")).toThrow(
       "Add an ElevenLabs key in Settings on the computer to turn on voice.",
     );
-    expect(() => speak(cfg({ key: "k" }), "hi")).toThrow(/Pick a voice/i);
     expect(() => speak(cfg({ key: "k" }), "hi")).toThrow(
       "Pick a voice in the agent profile.",
     );
   });
 
-  it("distinguishes 'no baseUrl' from 'no voice' for OpenAI-compatible", async () => {
-    const { speak } = await voice();
-    const openaiCfg = (tts: AppConfig["tts"]): AppConfig => ({ tts: { provider: "openai-compatible", ...tts } });
-    expect(() => speak(openaiCfg({}), "hi")).toThrow(/base url/i);
-    expect(() => speak(openaiCfg({ baseUrl: "http://localhost" }), "hi")).toThrow(/voice/i);
-  });
-
-  it("lists no voices without a key for ElevenLabs, rather than calling out", async () => {
+  it("lists no voices without a key, rather than calling out", async () => {
     seen.length = 0;
     const { listVoices } = await voice();
     expect(await listVoices({})).toEqual([]);
@@ -159,14 +159,14 @@ describe("ElevenLabs", () => {
     refuse = null;
     seen.length = 0;
     const { verifyKey } = await voice();
-    expect(await verifyKey("el-key", "elevenlabs")).toEqual({ ok: true });
+    expect(await verifyKey("elevenlabs", "el-key")).toEqual({ ok: true });
     expect(seen.map((r) => r.url.split("?")[0])).not.toContain("/v1/user");
   });
 
   it("says what to do when the key is genuinely refused", async () => {
     refuse = { status: 401, body: { detail: "invalid api key" } };
     const { verifyKey } = await voice();
-    const result = await verifyKey("nope", "elevenlabs");
+    const result = await verifyKey("elevenlabs", "nope");
     refuse = null;
     expect(result.ok).toBe(false);
     // names scopes, because "get a fresh key" is the wrong advice when the
@@ -213,79 +213,101 @@ describe("ElevenLabs", () => {
   });
 });
 
-describe("OpenAI-compatible", () => {
-  const port = () => (server.address() as { port: number }).port;
-  const baseUrl = () => `http://127.0.0.1:${port()}`;
-  const openaiCfg = (tts: AppConfig["tts"]): AppConfig => ({
-    tts: { provider: "openai-compatible", baseUrl: baseUrl(), ...tts },
+describe("Fish Audio", () => {
+  const ready = { provider: "fish" as const, fishKey: "fish-key", voice: "fish-1" };
+
+  it("keeps its setup and key separate from ElevenLabs", async () => {
+    const { describeVoice, providerConfigured, voiceConfigured, voiceReady } = await voice();
+    expect(providerConfigured(cfg({ provider: "fish", key: "eleven-key" }))).toBe(false);
+    expect(providerConfigured(cfg({ provider: "fish", fishKey: "fish-key" }))).toBe(true);
+    expect(voiceConfigured(cfg({ provider: "fish", fishKey: "fish-key" }))).toBe(false);
+    expect(voiceConfigured(cfg(ready))).toBe(true);
+    expect(voiceReady(cfg({ provider: "fish", fishKey: "fish-key" }), "fish-per-agent")).toBe(true);
+    const described = describeVoice(cfg(ready));
+    expect(described).toEqual({
+      configured: true,
+      ready: true,
+      voice: "fish-1",
+      provider: "fish",
+      baseUrl: "",
+      model: "",
+    });
+    expect(JSON.stringify(described)).not.toContain("fish-key");
   });
 
-  it("verifies a server without a key (local unauthenticated)", async () => {
+  it("verifies the key against accessible voice models", async () => {
     refuse = null;
     seen.length = 0;
     const { verifyKey } = await voice();
-    expect(await verifyKey("", "openai-compatible", baseUrl())).toEqual({ ok: true });
-  });
-
-  it("verifies a server with a key", async () => {
-    refuse = null;
-    seen.length = 0;
-    const { verifyKey } = await voice();
-    expect(await verifyKey("sk-test", "openai-compatible", baseUrl())).toEqual({ ok: true });
+    expect(await verifyKey("fish", "fish-key")).toEqual({ ok: true });
     const call = seen.at(-1)!;
-    expect(call.headers.authorization).toBe("Bearer sk-test");
+    expect(call.method).toBe("GET");
+    expect(call.url).toBe("/model?page_size=1&self=true");
+    expect(call.headers.authorization).toBe("Bearer fish-key");
+    expect(call.url).not.toContain("fish-key");
   });
 
-  it("verifies with custom model parameter when provided", async () => {
-    refuse = null;
+  it("lists only trained TTS voices using Fish model ids", async () => {
     seen.length = 0;
-    const { verifyKey } = await voice();
-    expect(await verifyKey("", "openai-compatible", baseUrl(), "kokoro")).toEqual({ ok: true });
-    const call = seen.at(-1)!;
-    expect(JSON.parse(call.body)).toMatchObject({ model: "kokoro" });
-  });
-
-  it("lists voices from the server", async () => {
     const { listVoices } = await voice();
-    const voices = await listVoices(openaiCfg({ voice: "af_heart" }));
-    expect(voices).toContainEqual({ id: "af_heart", label: "Heart", description: "Warm female voice" });
-    expect(voices).toContainEqual({ id: "am_adam", label: "Adam", description: "Clear male voice" });
+    expect(await listVoices(cfg(ready))).toEqual([
+      { id: "fish-1", label: "Narrator", description: "Warm and measured" },
+      { id: "fish-2", label: "Studio Voice", description: undefined },
+    ]);
+    // The public page and the owned-page walk run concurrently (fish.ts:102,
+    // Promise.all), so how they interleave is not deterministic — asserting a
+    // fixed order made this fail on loaded runners. What IS ordered is the
+    // owned walk itself: page 2 is only fetched after page 1 reports hasMore.
+    const urls = seen.slice(-3).map((call) => call.url);
+    expect([...urls].sort()).toEqual([
+      "/model?page_size=100&self=true&sort_by=created_at&page_number=1",
+      "/model?page_size=100&self=true&sort_by=created_at&page_number=2",
+      "/model?page_size=100&sort_by=task_count",
+    ]);
+    expect(urls.indexOf("/model?page_size=100&self=true&sort_by=created_at&page_number=1"))
+      .toBeLessThan(urls.indexOf("/model?page_size=100&self=true&sort_by=created_at&page_number=2"));
   });
 
-  it("synthesizes speech with the OpenAI endpoint", async () => {
+  it("requests s2.1-pro mp3 speech and returns its raw audio", async () => {
     seen.length = 0;
     const { speak } = await voice();
-    const audio = await speak(openaiCfg({ voice: "af_heart" }), "hello there");
+    const audio = await speak(cfg(ready), "hello there");
     expect(audio.mime).toBe("audio/mpeg");
     expect(Buffer.from(audio.bytes)).toEqual(MP3);
 
     const call = seen.at(-1)!;
     expect(call.method).toBe("POST");
-    expect(call.url).toContain("/audio/speech");
-    expect(JSON.parse(call.body)).toMatchObject({ model: "tts-1", input: "hello there", voice: "af_heart" });
+    expect(call.url).toBe("/v1/tts");
+    expect(call.headers.authorization).toBe("Bearer fish-key");
+    expect(call.headers.model).toBe("s2.1-pro");
+    expect(JSON.parse(call.body)).toEqual({
+      text: "hello there",
+      reference_id: "fish-1",
+      format: "mp3",
+      sample_rate: 44_100,
+      mp3_bitrate: 64,
+      latency: "normal",
+    });
   });
 
-  it("sends a custom OpenAI-compatible model slug", async () => {
-    seen.length = 0;
-    const { speak } = await voice();
-    await speak(openaiCfg({ voice: "af_sky", model: "kokoro" }), "hello there");
-    expect(JSON.parse(seen.at(-1)!.body)).toMatchObject({ model: "kokoro", voice: "af_sky" });
+  it("returns a useful bounded error without echoing arbitrary response bodies", async () => {
+    refuse = { status: 422, body: { detail: "x".repeat(500) } };
+    const { synthesize } = await fish();
+    const message = await synthesize("hello", "fish-1", "fish-key").catch((error: Error) => error.message);
+    refuse = null;
+    if (typeof message !== "string") throw new Error("Fish Audio unexpectedly accepted the stubbed refusal");
+    expect(message).toMatch(/^speaking failed: x+$/);
+    expect(message.length).toBeLessThan(270);
   });
 
-  it("sends Authorization header when key is provided", async () => {
-    seen.length = 0;
-    const { speak } = await voice();
-    await speak(openaiCfg({ key: "sk-test", voice: "af_heart" }), "hello");
-    const call = seen.at(-1)!;
-    expect(call.headers.authorization).toBe("Bearer sk-test");
-  });
-
-  it("omits Authorization header when key is absent", async () => {
-    seen.length = 0;
-    const { speak } = await voice();
-    await speak(openaiCfg({ voice: "af_heart" }), "hello");
-    const call = seen.at(-1)!;
-    expect(call.headers.authorization).toBeUndefined();
+  it("explains rejected keys without exposing them", async () => {
+    const { verifyKey } = await fish();
+    const result = await verifyKey("not-a-real-key");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.message).toMatch(/rejected|access/i);
+      expect(result.message).not.toContain("not-a-real-key");
+    }
   });
 });
 
@@ -365,6 +387,201 @@ describe("built-in macOS voices", () => {
     const { speak, NoVoiceConfigured } = await voice();
     expect(() => speak(cfg({ provider: "system" }), "hi", undefined, fakeSay([]))).toThrow(NoVoiceConfigured);
     expect(() => speak(cfg({ provider: "system" }), "hi", undefined, fakeSay([]))).toThrow(
+      "Pick a voice in the agent profile.",
+    );
+  });
+});
+
+describe("Chatterbox (local server)", () => {
+  const chatCfg = (extra: Partial<AppConfig["tts"]> = {}) => ({ provider: "chatterbox" as const, ...extra });
+
+  it("is configured by a server address, never a key", async () => {
+    const { providerConfigured, voiceConfigured, voiceReady, describeVoice } = await voice();
+    expect(providerConfigured(cfg(chatCfg()))).toBe(false);
+    expect(providerConfigured(cfg(chatCfg({ baseUrl: stubBase })))).toBe(true);
+    expect(voiceConfigured(cfg(chatCfg({ baseUrl: stubBase })))).toBe(false);
+    expect(voiceConfigured(cfg(chatCfg({ baseUrl: stubBase, voice: "alex" })))).toBe(true);
+    expect(voiceReady(cfg(chatCfg({ baseUrl: stubBase })), "alex")).toBe(true);
+    expect(voiceReady(cfg(chatCfg({ voice: "alex" })), "alex")).toBe(false);
+    const described = describeVoice(cfg(chatCfg({ baseUrl: stubBase, model: "turbo-en", voice: "alex" })));
+    expect(described).toEqual({
+      configured: true,
+      ready: true,
+      voice: "alex",
+      provider: "chatterbox",
+      baseUrl: stubBase,
+      model: "turbo-en",
+    });
+  });
+
+  it("speaks with the OpenAI audio-speech shape and no key header", async () => {
+    refuse = null;
+    seen.length = 0;
+    const { speak } = await voice();
+    const audio = await speak(cfg(chatCfg({ baseUrl: stubBase, voice: "alex" })), "hello there");
+    expect(audio.mime).toBe("audio/wav");
+    expect(Buffer.from(audio.bytes)).toEqual(WAV);
+
+    const call = seen.at(-1)!;
+    expect(call.method).toBe("POST");
+    expect(call.url).toBe("/v1/audio/speech");
+    expect(JSON.parse(call.body)).toEqual({
+      model: "chatterbox-turbo",
+      input: "hello there",
+      voice: "alex",
+      response_format: "wav",
+    });
+    expect(call.headers["xi-api-key"]).toBeUndefined();
+    expect(call.url).not.toContain("key");
+  });
+
+  it("accepts a base that already ends in /v1, and honors the model setting", async () => {
+    refuse = null;
+    seen.length = 0;
+    const { speak } = await voice();
+    await speak(cfg(chatCfg({ baseUrl: `${stubBase}/v1`, model: "chatterbox-multilingual", voice: "alex" })), "hi", "will");
+
+    const call = seen.at(-1)!;
+    expect(call.url).toBe("/v1/audio/speech");
+    expect(JSON.parse(call.body)).toMatchObject({ model: "chatterbox-multilingual", voice: "will" });
+  });
+
+  it("surfaces the server's own refusal rather than a bare status", async () => {
+    refuse = { status: 500, body: { error: "model chatterbox-turbo is not loaded" } };
+    const { speak } = await voice();
+    const message = await speak(cfg(chatCfg({ baseUrl: stubBase, voice: "alex" })), "hi").catch((e: Error) => e.message);
+    refuse = null;
+    expect(message).toContain("not loaded");
+  });
+
+  it("says when the server is unreachable, instead of hanging", async () => {
+    // a port that was just closed: nothing listens, so connect fails fast
+    const gone = createServer();
+    await new Promise<void>((r) => gone.listen(0, "127.0.0.1", () => r()));
+    const port = (gone.address() as { port: number }).port;
+    await new Promise<void>((r) => gone.close(() => r()));
+
+    const { speak } = await voice();
+    const message = await speak(cfg(chatCfg({ baseUrl: `http://127.0.0.1:${port}`, voice: "alex" })), "hi").catch(
+      (e: Error) => e.message,
+    );
+    expect(message).toMatch(/couldn't reach the Chatterbox server/i);
+  });
+
+  it("lists the server's models as voices, with a fallback when it cannot", async () => {
+    refuse = null;
+    const { listVoices } = await voice();
+    expect(await listVoices(cfg(chatCfg({ baseUrl: stubBase })))).toEqual([
+      { id: "alex", label: "alex" },
+      { id: "turbo-en", label: "turbo-en" },
+    ]);
+    modelsFail = true;
+    expect(await listVoices(cfg(chatCfg({ baseUrl: stubBase })))).toEqual([
+      { id: "default", label: "Default", description: "the server's built-in Chatterbox voice" },
+    ]);
+    modelsFail = false;
+  });
+
+  it("lists no voices without a server address, rather than calling out", async () => {
+    seen.length = 0;
+    const { listVoices } = await voice();
+    expect(await listVoices(cfg(chatCfg()))).toEqual([]);
+    expect(seen).toHaveLength(0);
+  });
+
+  it("names the missing setup step in its own words", async () => {
+    const { speak, NoVoiceConfigured } = await voice();
+    expect(() => speak(cfg(chatCfg()), "hi")).toThrow(NoVoiceConfigured);
+    expect(() => speak(cfg(chatCfg()), "hi")).toThrow(
+      "Add the address of your Chatterbox server in Settings on the computer to turn on voice.",
+    );
+    expect(() => speak(cfg(chatCfg({ baseUrl: stubBase })), "hi")).toThrow("Pick a voice in the agent profile.");
+  });
+});
+
+describe("OpenAI-compatible (generic server)", () => {
+  const compatCfg = (extra: Partial<AppConfig["tts"]> = {}) => ({
+    provider: "openai-compatible" as const,
+    ...extra,
+  });
+
+  it("is configured by a server address; the key stays optional", async () => {
+    const { providerConfigured, voiceConfigured, voiceReady, describeVoice } = await voice();
+    expect(providerConfigured(cfg(compatCfg()))).toBe(false);
+    expect(providerConfigured(cfg(compatCfg({ baseUrl: `${stubBase}/v1` })))).toBe(true);
+    expect(voiceConfigured(cfg(compatCfg({ baseUrl: `${stubBase}/v1` })))).toBe(false);
+    expect(voiceConfigured(cfg(compatCfg({ baseUrl: `${stubBase}/v1`, voice: "af_heart" })))).toBe(true);
+    expect(voiceReady(cfg(compatCfg({ baseUrl: `${stubBase}/v1` })), "af_heart")).toBe(true);
+    expect(voiceReady(cfg(compatCfg({ voice: "af_heart" })), "af_heart")).toBe(false);
+    const described = describeVoice(
+      cfg(compatCfg({ baseUrl: `${stubBase}/v1`, model: "kokoro", voice: "af_heart", key: "sk-secret" })),
+    );
+    expect(described).toEqual({
+      configured: true,
+      ready: true,
+      voice: "af_heart",
+      provider: "openai-compatible",
+      baseUrl: `${stubBase}/v1`,
+      model: "kokoro",
+    });
+    expect(JSON.stringify(described)).not.toContain("sk-secret");
+  });
+
+  it("speaks with the plain audio-speech shape and no key header when keyless", async () => {
+    refuse = null;
+    seen.length = 0;
+    const { speak } = await voice();
+    const audio = await speak(cfg(compatCfg({ baseUrl: `${stubBase}/v1`, voice: "af_heart" })), "hello there");
+    expect(audio.mime).toBe("audio/wav");
+    expect(Buffer.from(audio.bytes)).toEqual(WAV);
+
+    const call = seen.at(-1)!;
+    expect(call.method).toBe("POST");
+    expect(call.url).toBe("/v1/audio/speech");
+    expect(JSON.parse(call.body)).toEqual({ model: "tts-1", input: "hello there", voice: "af_heart" });
+    expect(call.headers["authorization"]).toBeUndefined();
+  });
+
+  it("sends the optional key as a Bearer header and honors the model setting", async () => {
+    refuse = null;
+    seen.length = 0;
+    const { speak } = await voice();
+    await speak(
+      cfg(compatCfg({ baseUrl: `${stubBase}/v1`, key: "kokoro-key", model: "kokoro", voice: "af_heart" })),
+      "hi",
+      "bf_emma",
+    );
+
+    const call = seen.at(-1)!;
+    expect(call.url).toBe("/v1/audio/speech");
+    expect(call.headers["authorization"]).toBe("Bearer kokoro-key");
+    expect(JSON.parse(call.body)).toMatchObject({ model: "kokoro", voice: "bf_emma" });
+  });
+
+  it("falls back to the Kokoro voice list when the server exposes no /voices route", async () => {
+    // NOTE: the stub answers GET /v1/voices with an ElevenLabs-shaped list,
+    // so probe under a prefix the stub does not implement — that 404 is what
+    // exercises the Kokoro fallback.
+    refuse = null;
+    const { listVoices } = await voice();
+    const voices = await listVoices(cfg(compatCfg({ baseUrl: `${stubBase}/oai` })));
+    expect(voices.map((v) => v.id)).toContain("af_heart");
+  });
+
+  it("lists no voices without a server address, rather than calling out", async () => {
+    seen.length = 0;
+    const { listVoices } = await voice();
+    expect(await listVoices(cfg(compatCfg()))).toEqual([]);
+    expect(seen).toHaveLength(0);
+  });
+
+  it("names the missing setup step in its own words", async () => {
+    const { speak, NoVoiceConfigured } = await voice();
+    expect(() => speak(cfg(compatCfg()), "hi")).toThrow(NoVoiceConfigured);
+    expect(() => speak(cfg(compatCfg()), "hi")).toThrow(
+      "Add the address of your OpenAI-compatible server in Settings on the computer to turn on voice.",
+    );
+    expect(() => speak(cfg(compatCfg({ baseUrl: `${stubBase}/v1` })), "hi")).toThrow(
       "Pick a voice in the agent profile.",
     );
   });

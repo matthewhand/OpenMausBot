@@ -3,7 +3,8 @@ import { cn } from "@/lib/cn";
 import { useStore, type Message } from "@/state/store";
 
 /** A tool run: spinner while live, check/cross once settled. Click opens
- * the Inspector on that tool's runtime event (or the raw protocol line). */
+ * the Inspector focused on that tool's runtime event (falls back to the
+ * events lens when no row names the tool). */
 export function ActivityChip({ message, threadId }: { message: Message; threadId: string }) {
   const { dispatch } = useStore();
   const tool = message.tool;
@@ -17,7 +18,6 @@ export function ActivityChip({ message, threadId }: { message: Message; threadId
           dispatch({
             type: "focusInspector",
             threadId,
-            itemId: tool.itemId,
             toolName: tool.name,
             at: message.at,
           })

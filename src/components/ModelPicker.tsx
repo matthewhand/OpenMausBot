@@ -1,24 +1,23 @@
 // Compact model picker: providers live on a Cloud/Local rail. Ready engines
 // show a short suggested list with search and an explicit all-models view;
 // engines that need setup show one focused action instead of a disabled wall.
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Check, ChevronDown, ChevronLeft, ChevronRight, Search } from "lucide-react";
-import { useStore, type Bot, type InstanceInfo, type ModelSelection } from "@/state/store";
+// Reasoning effort rides along (EffortRow): model and effort are one choice to
+// the person making it, so the chat header and the settings dialog render the
+// same row and write through the same action.
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { Check, ChevronDown, ChevronLeft, ChevronRight, Loader2, RefreshCw, Search } from "lucide-react";
+import { useStore, currentTaskBot, type Bot, type InstanceInfo, type ModelSelection } from "@/state/store";
+import type { EffortLevel } from "../../shared/wire";
+import type { ModelVariantOption } from "../../shared/runtime-events";
 import { filterCustomModels, partitionCustomModels, suggestedModels } from "@/lib/custom-models";
 import { isCustomOnly, splitEngineRail } from "@/lib/engine-rail";
-import {
-  loadRecentModelPicks,
-  rankEngineRail,
-  recentInstanceIds,
-  recentModelIdsFor,
-  rememberModelPick,
-  saveRecentModelPicks,
-  seedRecentModelPicks,
-} from "@/lib/model-picker-recency";
-import { ProviderMark } from "./ProviderIcons";
-import { EngineSetup, needsCli, needsSignIn } from "./EngineSetup";
+import { InstanceProviderMark } from "./ProviderIcons";
+import { EngineSetup, EngineUpdateNotice, needsCli, needsSignIn } from "./EngineSetup";
 import { EngineGroupLabel } from "./EngineGroupLabel";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { approvalModeFor, modelSwitchNeedsAsk } from "../../shared/approval-mode";
 import { cn } from "@/lib/cn";
+import { t } from "@/lib/i18n";
 import { COMPACT_SQUARE } from "@/lib/compact-chip";
 
 type ModelOption = InstanceInfo["models"]["options"][number];
@@ -32,27 +31,169 @@ function modelProvider(instance: InstanceInfo | undefined, model: string): strin
   return instance?.models.options.find((option) => option.id === model)?.provider;
 }
 
-function engineStatus(instance: InstanceInfo): string {
-  if (needsCli(instance)) return "Not installed";
-  if (needsSignIn(instance)) return "Sign-in required";
-  return instance.snapshot.version ?? "Ready";
+export function engineStatus(instance: InstanceInfo): string {
+  if (needsCli(instance)) return t("model.setupRequired");
+  if (needsSignIn(instance)) return t("model.signInRequired");
+  return instance.snapshot.version ?? t("model.ready");
 }
 
-function engineReady(instance: InstanceInfo): boolean {
-  return !needsCli(instance) && !needsSignIn(instance);
+/** The others capitalize cleanly; "xhigh" would read "Xhigh". */
+export function effortLabel(level: EffortLevel): string {
+  return level === "xhigh" ? "X-High" : level[0].toUpperCase() + level.slice(1);
+}
+
+/** How hard the bot thinks, for the engine it currently runs on. Rendered
+ * both in the picker's popover and in the settings dialog's Model section so
+ * the two cannot drift: one list of levels, one `setModel` dispatch.
+ *
+ * `undefined` ("Default") is not the `none` level — Default sends nothing and
+ * lets the engine decide, `none` is a level the engine is told to use. Only
+ * pi offers both, and dropping either would change what an existing bot
+ * sends, so both stay and the tooltips say which is which. */
+export function EffortRow({
+  bot,
+  threadId,
+  updateBotDefault,
+  className,
+  label,
+}: {
+  bot: Bot;
+  threadId?: string;
+  updateBotDefault?: boolean;
+  className?: string;
+  label?: ReactNode;
+}) {
+  const { state, dispatch } = useStore();
+  const selection = bot.modelSelection;
+  const instance = state.instances.find((candidate) => candidate.instanceId === selection.instanceId);
+  if (instance?.capabilities?.modelVariants) {
+    return <ModelVariantRow bot={bot} threadId={threadId} updateBotDefault={updateBotDefault} className={className} label={label} />;
+  }
+  const levels = instance?.capabilities?.effortLevels;
+  // An engine with no levels gets no control at all, not an empty one.
+  if (!levels?.length) return null;
+
+  return (
+    <div className={className}>
+      {label}
+      {/* wraps rather than dividing a fixed width: pi offers Default plus six
+          levels, which a segmented control would squeeze in the popover */}
+      <div className="mt-2 flex flex-wrap gap-1" role="group" aria-label="Reasoning effort">
+        {[undefined, ...levels].map((level) => (
+          <button
+            key={level ?? "default"}
+            type="button"
+            aria-pressed={selection.effort === level}
+            title={
+              level === undefined
+                ? "Send no effort level and let the engine decide"
+                : `Ask for ${effortLabel(level)} reasoning effort`
+            }
+            onClick={() => dispatch({ type: "setModel", botId: bot.id, threadId, ...(updateBotDefault ? { updateBotDefault: true } : {}), selection: { ...selection, effort: level } })}
+            className={cn(
+              "rounded-full border px-2.5 py-1 text-[12px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70",
+              selection.effort === level
+                ? "border-accent/60 bg-control text-ink"
+                : "border-hairline/40 text-ink-secondary hover:bg-control/60 hover:text-ink",
+            )}
+          >
+            {level === undefined ? "Default" : effortLabel(level)}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function variantLabel(option: ModelVariantOption): string {
+  return option.id === "default" ? "OpenCode default" : option.label;
+}
+
+/** ACP variant ids are opaque; their model/session declares the available choices. */
+export function ModelVariantRow({ bot, threadId, updateBotDefault, className, label }: {
+  bot: Bot;
+  threadId?: string;
+  updateBotDefault?: boolean;
+  className?: string;
+  label?: ReactNode;
+}) {
+  const { state, dispatch } = useStore();
+  const selection = bot.modelSelection;
+  const instance = state.instances.find((candidate) => candidate.instanceId === selection.instanceId);
+  if (!instance?.capabilities?.modelVariants) return null;
+  const session = state.modelVariantSessions[threadId ?? bot.threadId];
+  const reported = session?.instanceId === selection.instanceId && session.model === selection.model ? session.variants : undefined;
+  const options = reported?.options ?? instance.models.options.find((option) => option.id === selection.model)?.variants ?? [];
+  if (!options.length && selection.variant === undefined) return null;
+  const missing = selection.variant !== undefined && !options.some((option) => option.id === selection.variant);
+  const unavailable = missing && reported !== undefined;
+  const current = reported?.currentValue;
+  const choose = (variant?: string) => {
+    const { effort: _effort, variant: _variant, ...model } = selection;
+    dispatch({ type: "setModel", botId: bot.id, threadId, ...(updateBotDefault ? { updateBotDefault: true } : {}),
+      selection: { ...model, ...(variant !== undefined ? { variant } : {}) } });
+  };
+  return (
+    <div className={className}>
+      {label}
+      {(selection.variant === undefined || missing) && (
+        <p className="mt-2 text-[12px] text-ink-secondary">
+          {unavailable ? `Saved variant “${selection.variant}” is unavailable. Choose an available variant.`
+            : missing ? `Saved variant “${selection.variant}” has not been checked in this session.` : "No variant selected."}
+          {current !== undefined && ` Session: ${variantLabel(options.find((option) => option.id === current) ?? { id: current, label: current })}.`}
+        </p>
+      )}
+      {selection.variant !== undefined && (
+        <button type="button" disabled={bot.busy} onClick={() => choose()}
+          title="Send no variant selection; OpenCode keeps its session or configured setting"
+          className="mt-2 block text-[12px] text-ink-secondary underline underline-offset-2 hover:text-ink disabled:opacity-50">
+          Clear variant selection
+        </button>
+      )}
+      {options.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1" role="group" aria-label="Reasoning variant">
+          {options.map((option) => (
+            <button
+              key={option.id}
+              type="button"
+              disabled={bot.busy}
+              aria-pressed={selection.variant === option.id}
+              title={`Use ${variantLabel(option)} for this model`}
+              onClick={() => choose(option.id)}
+              className={cn(
+                "rounded-full border px-2.5 py-1 text-[12px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-50",
+                selection.variant === option.id ? "border-accent/60 bg-control text-ink" : "border-hairline/40 text-ink-secondary hover:bg-control/60 hover:text-ink",
+              )}
+            >
+              {variantLabel(option)}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Switching models must not carry an opaque variant from the previous model. */
+export function modelSelectionForPick(selection: ModelSelection, instance: InstanceInfo, model: string): ModelSelection {
+  const next: ModelSelection = { instanceId: instance.instanceId, model };
+  if (instance.instanceId === selection.instanceId) {
+    if (instance.capabilities?.modelVariants) {
+      if (model === selection.model && selection.variant !== undefined) next.variant = selection.variant;
+    } else if (selection.effort) next.effort = selection.effort;
+  }
+  return next;
 }
 
 function ModelRow({
   option,
   current,
   defaultId,
-  recent,
   onPick,
 }: {
   option: ModelOption;
   current: boolean;
   defaultId: string;
-  recent: boolean;
   onPick: () => void;
 }) {
   return (
@@ -69,16 +210,13 @@ function ModelRow({
         {option.provider && (
           <span
             className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary"
-            title={`Provider: ${option.provider}`}
+            title={t("model.provider", { name: option.provider })}
           >
             {option.provider}
           </span>
         )}
         {option.id === defaultId && (
           <span className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary">Default</span>
-        )}
-        {recent && option.id !== defaultId && (
-          <span className="shrink-0 rounded bg-accent/10 px-1.5 py-px text-[10px] text-accent">Recent</span>
         )}
         {option.loaded && (
           <span className="shrink-0 rounded bg-accent/10 px-1.5 py-px text-[10px] text-accent">Loaded</span>
@@ -112,8 +250,8 @@ function ModelSearch({
             event.stopPropagation();
             onEscape();
           }}
-          placeholder="Search models"
-          aria-label={local ? "Search local models" : "Search models"}
+          placeholder={t("model.search")}
+          aria-label={local ? t("model.searchLocal") : t("model.search")}
           className="w-full bg-transparent text-[12.5px] text-ink placeholder:text-ink-secondary focus:outline-none"
         />
       </div>
@@ -121,50 +259,150 @@ function ModelSearch({
   );
 }
 
+export function ModelEngineRail({ instances, selectedInstance, claudeInstance, onSelect }: {
+  instances: InstanceInfo[];
+  selectedInstance?: InstanceInfo;
+  claudeInstance?: InstanceInfo;
+  onSelect: (instance: InstanceInfo) => void;
+}) {
+  const firstClaude = instances.find((instance) => instance.driverKind === "claudeAgent" && instance.claudeAccount?.isDefault)
+    ?? instances.find((instance) => instance.driverKind === "claudeAgent");
+  const providers = instances.filter((instance) => instance.driverKind !== "claudeAgent" || instance === firstClaude);
+  const { subscription, custom: local } = splitEngineRail(providers);
+  const railButton = (instance: InstanceInfo) => {
+    const claude = instance.driverKind === "claudeAgent";
+    const target = claude ? claudeInstance ?? instance : instance;
+    const selected = claude ? selectedInstance?.driverKind === "claudeAgent" : instance.instanceId === selectedInstance?.instanceId;
+    const label = claude ? "Claude" : instance.displayName;
+    const attention = needsCli(target) || needsSignIn(target) || Boolean(target.snapshot.update);
+    return (
+      <button
+        type="button"
+        key={instance.instanceId}
+        onClick={() => onSelect(target)}
+        aria-label={label}
+        aria-pressed={selected}
+        title={`${label} · ${engineStatus(target)}`}
+        className={cn("relative flex size-9 items-center justify-center rounded-lg", selected ? "bg-control ring-1 ring-hairline/50" : "hover:bg-control/60")}
+      >
+        <InstanceProviderMark instance={target} size={18} />
+        {attention && <span className="absolute bottom-0.5 right-0.5 size-1.5 rounded-full bg-warning ring-2 ring-panel" />}
+      </button>
+    );
+  };
+  return (
+    <div className="flex w-14 shrink-0 flex-col gap-1 overflow-y-auto border-r border-hairline/40 bg-panel p-2">
+      {subscription.length > 0 && <EngineGroupLabel className="px-0 pb-0.5 pt-0.5 text-center text-[9px]">Cloud</EngineGroupLabel>}
+      {subscription.map(railButton)}
+      {local.length > 0 && <EngineGroupLabel className="px-0 pb-0.5 pt-2 text-center text-[9px]">Local</EngineGroupLabel>}
+      {local.map(railButton)}
+    </div>
+  );
+}
+
+export function ClaudeAccountSelect({ accounts, selectedId, onSelect }: {
+  accounts: InstanceInfo[];
+  selectedId: string;
+  onSelect: (instance: InstanceInfo) => void;
+}) {
+  return (
+    <label className="mt-2 flex min-w-0 items-center gap-2 text-[12px] text-ink-secondary">
+      <span>{t("model.account")}:</span>
+      <select
+        aria-label={t("model.account")}
+        value={selectedId}
+        onChange={(event) => {
+          const account = accounts.find((instance) => instance.instanceId === event.target.value);
+          if (account) onSelect(account);
+        }}
+        className="min-w-0 flex-1 rounded-lg border border-hairline/40 bg-inset px-2 py-1.5 text-[12px] text-ink focus:border-accent/60 focus:outline-none"
+      >
+        {accounts.map((account) => <option key={account.instanceId} value={account.instanceId}>{account.displayName}</option>)}
+      </select>
+    </label>
+  );
+}
+
 export function ModelPicker({
   bot,
+  threadId,
   className,
   contained = false,
   label,
 }: {
   bot: Bot;
+  threadId?: string;
   className?: string;
   /** Expand the menu in-flow under the trigger so it cannot overflow a
    * narrow parent (the Agent profile sidebar). */
   contained?: boolean;
   label?: ReactNode;
 }) {
-  const { state, dispatch, refreshInstances } = useStore();
+  const { state, dispatch, refreshInstances, refreshModels: refreshInstanceModels } = useStore();
   const [open, setOpen] = useState(false);
   const [railId, setRailId] = useState<string | null>(null);
   const [pane, setPane] = useState<"main" | "custom">("main");
   const [query, setQuery] = useState("");
   const [showAll, setShowAll] = useState(false);
-  const [storedRecents, setStoredRecents] = useState(loadRecentModelPicks);
+  const [refreshing, setRefreshing] = useState(false);
+  const [scope, setScope] = useState<"bot" | "thread">("thread");
+  const [pendingSwitch, setPendingSwitch] = useState<{ botId: string; threadId: string;
+    selection: ModelSelection; updateBotDefault: boolean; name: string } | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const refreshingRef = useRef(false);
+  const lastClaudeIdRef = useRef<string | null>(null);
 
   const selection = bot.modelSelection;
-  const recents = useMemo(
-    () =>
-      seedRecentModelPicks(
-        storedRecents,
-        state.bots.map((candidate) => candidate.modelSelection),
-      ),
-    [storedRecents, state.bots],
-  );
-  const recentEngines = useMemo(() => recentInstanceIds(recents), [recents]);
-  const recentEngineSet = useMemo(() => new Set(recentEngines), [recentEngines]);
   const active = state.instances.find((instance) => instance.instanceId === selection.instanceId);
+  const selectedVariantLabel = selection.variant === undefined ? undefined : variantLabel(
+    active?.models.options.find((option) => option.id === selection.model)?.variants?.find((option) => option.id === selection.variant)
+      ?? { id: selection.variant, label: selection.variant },
+  );
+  const claudeAccounts = state.instances.filter((instance) => instance.driverKind === "claudeAgent");
+  const multipleClaudeAccounts = claudeAccounts.length > 1;
+  const showActiveAccount = multipleClaudeAccounts && active?.driverKind === "claudeAgent";
+  const claudeRailInstance = claudeAccounts.find((instance) => instance.instanceId === lastClaudeIdRef.current)
+    ?? (active?.driverKind === "claudeAgent" ? active : claudeAccounts[0]);
   const railInstance =
     state.instances.find((instance) => instance.instanceId === (railId ?? selection.instanceId)) ?? state.instances[0];
-  const recentModels = useMemo(
-    () => new Set(recentModelIdsFor(recents, railInstance?.instanceId ?? selection.instanceId)),
-    [recents, railInstance?.instanceId, selection.instanceId],
-  );
+
+  const refreshLocalInstances = useCallback(() => {
+    if (refreshingRef.current) return;
+    refreshingRef.current = true;
+    setRefreshing(true);
+    void refreshInstances()
+      .catch(() => {
+        // Keep the last known catalog when the app is temporarily offline.
+      })
+      .finally(() => {
+        refreshingRef.current = false;
+        setRefreshing(false);
+      });
+  }, [refreshInstances]);
+
+  const refreshModels = useCallback(() => {
+    if (refreshingRef.current) return;
+    refreshingRef.current = true;
+    setRefreshing(true);
+    const instanceId = railId ?? selection.instanceId;
+    void refreshInstances()
+      .then(() => refreshInstanceModels(instanceId))
+      .catch(() => {
+        // Keep the last known catalog when the app is temporarily offline.
+      })
+      .finally(() => {
+        refreshingRef.current = false;
+        setRefreshing(false);
+      });
+  }, [railId, refreshInstanceModels, refreshInstances, selection.instanceId]);
 
   useEffect(() => {
-    if (open) void refreshInstances();
-  }, [open, refreshInstances]);
+    if (open) refreshLocalInstances();
+  }, [open, refreshLocalInstances]);
+
+  useEffect(() => {
+    if (bot.busy) setOpen(false);
+  }, [bot.busy]);
 
   useEffect(() => {
     if (!open) return;
@@ -201,6 +439,7 @@ export function ModelPicker({
   };
 
   const selectRail = (instance: InstanceInfo) => {
+    if (instance.driverKind === "claudeAgent") lastClaudeIdRef.current = instance.instanceId;
     setRailId(instance.instanceId);
     const official = instance.models.options.filter((option) => !option.custom);
     setPane(isCustomOnly(instance) || official.length === 0 ? "custom" : "main");
@@ -208,18 +447,24 @@ export function ModelPicker({
   };
 
   const pick = (instance: InstanceInfo, model: string) => {
-    const sameInstance = instance.instanceId === selection.instanceId;
-    const nextSelection: ModelSelection = {
-      instanceId: instance.instanceId,
-      model,
-    };
-    if (sameInstance && selection.effort) nextSelection.effort = selection.effort;
-    const nextRecents = rememberModelPick(storedRecents, instance.instanceId, model);
-    setStoredRecents(nextRecents);
-    saveRecentModelPicks(nextRecents);
+    if (bot.busy) return;
+    const nextSelection = modelSelectionForPick(selection, instance, model);
+    const updateBotDefault = !threadId || scope === "bot";
+    const profile = state.bots.find((candidate) => candidate.id === bot.id) ?? bot;
+    const targets = updateBotDefault ? [currentTaskBot(profile, threadId ?? bot.threadId), profile] : [bot];
+    if (targets.some((target) => modelSwitchNeedsAsk(approvalModeFor(target),
+      state.instances.find((candidate) => candidate.instanceId === target.modelSelection.instanceId)?.driverKind,
+      instance.driverKind))) {
+      setPendingSwitch({ botId: bot.id, threadId: threadId ?? bot.threadId,
+        selection: nextSelection, updateBotDefault, name: modelLabel(instance, model) });
+      setOpen(false);
+      return;
+    }
     dispatch({
       type: "setModel",
       botId: bot.id,
+      threadId: threadId ?? bot.threadId,
+      updateBotDefault,
       selection: nextSelection,
     });
     setOpen(false);
@@ -229,27 +474,10 @@ export function ModelPicker({
   const custom = railInstance?.models.options.filter((option) => option.custom) ?? [];
   const currentModel = selection.instanceId === railInstance?.instanceId ? selection.model : undefined;
   const filteredOfficial = filterCustomModels(official, query);
-  const recentOfficialIds = railInstance ? recentModelIdsFor(recents, railInstance.instanceId) : [];
   const compactOfficial = railInstance
-    ? suggestedModels(
-        official,
-        railInstance.models.default,
-        currentModel,
-        COMPACT_MODEL_COUNT,
-        recentOfficialIds,
-      )
+    ? suggestedModels(official, railInstance.models.default, currentModel, COMPACT_MODEL_COUNT)
     : [];
-  const shownOfficial = query
-    ? filteredOfficial
-    : railInstance
-      ? suggestedModels(
-          official,
-          railInstance.models.default,
-          currentModel,
-          showAll ? official.length : COMPACT_MODEL_COUNT,
-          recentOfficialIds,
-        )
-      : [];
+  const shownOfficial = query ? filteredOfficial : showAll ? official : compactOfficial;
   const filteredCustom = filterCustomModels(custom, query);
   const { pinned, rest } = partitionCustomModels(filteredCustom);
   const blocked = railInstance
@@ -266,15 +494,17 @@ export function ModelPicker({
       option={option}
       current={selection.instanceId === railInstance?.instanceId && selection.model === option.id}
       defaultId={railInstance?.models.default ?? ""}
-      recent={recentModels.has(option.id)}
       onPick={() => railInstance && pick(railInstance, option.id)}
     />
   );
 
   const trigger = (
-    <button
+    <button data-tour="model"
       type="button"
+      disabled={Boolean(bot.busy)}
       onClick={() => {
+        if (bot.busy) return;
+        if (active?.driverKind === "claudeAgent") lastClaudeIdRef.current = active.instanceId;
         setRailId(selection.instanceId);
         setOpen((wasOpen) => {
           const next = !wasOpen;
@@ -282,28 +512,48 @@ export function ModelPicker({
           return next;
         });
       }}
-      aria-expanded={open}
+      aria-expanded={open && !bot.busy}
       aria-haspopup="dialog"
       className={cn(
-        "flex items-center gap-1.5 rounded-full border border-hairline/40 bg-control/60 py-1 pl-2 pr-2.5 text-[13px] text-ink hover:bg-raised-hover",
+        "flex items-center gap-1.5 rounded-full border border-hairline/40 bg-control/60 py-1 pl-2 pr-2.5 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-control/60",
         // in a narrow chat header fold to a rounded square with just the
         // provider mark; the model name rides the tooltip (a bot with no
-        // resolved engine keeps its label — the mark is what would hide it)
-        !contained && active && COMPACT_SQUARE,
+        // resolved engine keeps its label — the mark is what would hide it).
+        // Multiple Claude accounts keep their name even in the compact chip.
+        !contained && active && !showActiveAccount && COMPACT_SQUARE,
       )}
       title={
-        active
+        bot.busy
+          ? t(threadId ? "model.threadBusy" : "model.busy")
+          : active
           ? `${active.displayName} · ${modelLabel(active, selection.model)}${
               modelProvider(active, selection.model) ? ` · ${modelProvider(active, selection.model)}` : ""
-            }`
+            }${selectedVariantLabel ? ` · ${selectedVariantLabel}` : selection.effort ? ` · ${effortLabel(selection.effort)} effort` : ""}`
           : selection.model
       }
     >
-      {active && <ProviderMark driverKind={active.driverKind} size={14} />}
-      <span className={cn("max-w-[160px] truncate", !contained && active && "@max-4xl/chathead:hidden")}>
-        {modelLabel(active, selection.model)}
-        {active && modelProvider(active, selection.model) && (
-          <span className="text-ink-secondary"> · {modelProvider(active, selection.model)}</span>
+      {active && <InstanceProviderMark instance={active} size={14} />}
+      {!contained && showActiveAccount && (
+        <span data-model-account-compact className="hidden max-w-20 truncate @max-4xl/chathead:inline">{active.displayName}</span>
+      )}
+      <span className={cn("flex min-w-0 items-center gap-1", !contained && active && "@max-4xl/chathead:hidden")}>
+        <span className="max-w-[160px] truncate">
+          {showActiveAccount && (
+            <span data-model-account className="text-ink-secondary">{active.displayName} · </span>
+          )}
+          {modelLabel(active, selection.model)}
+          {active && modelProvider(active, selection.model) && (
+            <span className="text-ink-secondary"> · {modelProvider(active, selection.model)}</span>
+          )}
+        </span>
+        {/* outside the truncating span: a long model name must not be what
+            hides the effort the header exists to surface */}
+        {selectedVariantLabel !== undefined ? (
+          <span data-model-variant className="max-w-[120px] truncate text-ink-secondary">· {selectedVariantLabel}</span>
+        ) : selection.effort && (
+          <span data-model-effort className="shrink-0 text-ink-secondary">
+            · {effortLabel(selection.effort)}
+          </span>
         )}
       </span>
       <ChevronDown
@@ -328,87 +578,81 @@ export function ModelPicker({
         trigger
       )}
 
-      {open && (
+      {open && !bot.busy && (
         <div
           data-model-picker-content
           role="dialog"
-          aria-label="Choose model"
+          aria-label={t("model.choose")}
           className={cn(
             "flex overflow-hidden rounded-2xl border border-hairline/50 bg-card",
             contained
               ? "relative mt-3 w-full max-h-[min(420px,50dvh)]"
-              : "absolute right-0 top-full z-30 mt-2 w-[380px] max-h-[min(480px,calc(100dvh-7rem))] shadow-2xl shadow-black/50",
+              : "absolute right-0 top-full z-30 mt-2 w-[380px] max-w-[calc(100vw-2rem)] max-h-[min(480px,calc(100dvh-7rem))] shadow-2xl shadow-black/50",
           )}
         >
-          <div className="flex w-14 shrink-0 flex-col gap-1 overflow-y-auto border-r border-hairline/40 bg-panel p-2">
-            {(() => {
-              const { subscription, custom: local } = splitEngineRail(state.instances);
-              const rankedSubscription = rankEngineRail(subscription, recentEngines, engineReady);
-              const rankedLocal = rankEngineRail(local, recentEngines, engineReady);
-              const railButton = (instance: InstanceInfo) => {
-                const selected = instance.instanceId === railInstance?.instanceId;
-                const attention = needsCli(instance) || needsSignIn(instance);
-                const recent = recentEngineSet.has(instance.instanceId);
-                return (
-                  <button
-                    type="button"
-                    key={instance.instanceId}
-                    onClick={() => selectRail(instance)}
-                    aria-label={
-                      recent
-                        ? `${instance.displayName} (recent)`
-                        : instance.displayName
-                    }
-                    aria-pressed={selected}
-                    title={`${instance.displayName} · ${engineStatus(instance)}${recent ? " · Recent" : ""}`}
-                    className={cn(
-                      "relative flex size-9 items-center justify-center rounded-lg",
-                      selected ? "bg-control ring-1 ring-hairline/50" : "hover:bg-control/60",
-                    )}
-                  >
-                    <ProviderMark driverKind={instance.driverKind} size={18} />
-                    {attention ? (
-                      <span className="absolute bottom-0.5 right-0.5 size-1.5 rounded-full bg-warning ring-2 ring-panel" />
-                    ) : recent ? (
-                      <span className="absolute top-0.5 right-0.5 size-1.5 rounded-full bg-accent ring-2 ring-panel" />
-                    ) : null}
-                  </button>
-                );
-              };
-              return (
-                <>
-                  {subscription.length > 0 && (
-                    <EngineGroupLabel className="px-0 pb-0.5 pt-0.5 text-center text-[9px]">Cloud</EngineGroupLabel>
-                  )}
-                  {rankedSubscription.map(railButton)}
-                  {local.length > 0 && (
-                    <EngineGroupLabel className="px-0 pb-0.5 pt-2 text-center text-[9px]">Local</EngineGroupLabel>
-                  )}
-                  {rankedLocal.map(railButton)}
-                </>
-              );
-            })()}
-          </div>
+          <ModelEngineRail instances={state.instances} selectedInstance={railInstance} claudeInstance={claudeRailInstance} onSelect={selectRail} />
 
           <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+            {threadId && (
+              <div className="shrink-0 border-b border-hairline/40 px-3 py-2">
+                <div role="group" aria-label="Apply model changes to" className="flex gap-1">
+                  {(["thread", "bot"] as const).map((value) => (
+                    <button key={value} type="button" aria-pressed={scope === value} onClick={() => setScope(value)}
+                      className={cn("rounded-lg px-2 py-1 text-[12px]", scope === value ? "bg-control text-ink" : "text-ink-secondary hover:bg-control/60")}>
+                      {value === "bot" ? "Thread + bot default" : "Only this thread"}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-1 text-[11px] text-ink-secondary">
+                  {scope === "bot" ? "This thread, groups, and new threads. Other existing threads keep their model." : "Other threads and groups keep their model."}
+                </p>
+              </div>
+            )}
             {railInstance ? (
               <>
                 <div className="shrink-0 px-4 pb-2 pt-3.5">
                   <div className="flex items-center justify-between gap-3">
-                    <div className="truncate text-[14px] font-semibold text-ink">{railInstance.displayName}</div>
-                    <span
-                      className={cn(
-                        "shrink-0 rounded-full px-2 py-0.5 text-[10.5px] font-medium",
-                        blocked ? "bg-warning/10 text-warning" : "bg-success/10 text-success",
-                      )}
-                    >
-                      {pane === "custom" && !blocked ? "Local models" : engineStatus(railInstance)}
-                    </span>
+                    <div className="truncate text-[14px] font-semibold text-ink">{railInstance.driverKind === "claudeAgent" ? "Claude" : railInstance.displayName}</div>
+                    <div className="flex shrink-0 items-center gap-1">
+                      <button
+                        type="button"
+                        data-model-refresh
+                        disabled={refreshing}
+                        onClick={refreshModels}
+                        aria-label={
+                          refreshing
+                            ? t("model.refreshing", { name: railInstance.displayName })
+                            : t("model.refresh", { name: railInstance.displayName })
+                        }
+                        title={t("model.refreshTitle")}
+                        className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-control hover:text-ink disabled:cursor-wait disabled:opacity-70"
+                      >
+                        {refreshing ? (
+                          <Loader2 size={12} className="animate-spin" aria-hidden="true" />
+                        ) : (
+                          <RefreshCw size={12} aria-hidden="true" />
+                        )}
+                      </button>
+                      <span
+                        className={cn(
+                          "shrink-0 rounded-full px-2 py-0.5 text-[10.5px] font-medium",
+                          blocked ? "bg-warning/10 text-warning" : "bg-success/10 text-success",
+                        )}
+                      >
+                        {pane === "custom" && !blocked ? t("model.localModels") : engineStatus(railInstance)}
+                      </span>
+                    </div>
                   </div>
+                  {railInstance.driverKind === "claudeAgent" && (
+                    <ClaudeAccountSelect accounts={claudeAccounts} selectedId={railInstance.instanceId} onSelect={selectRail} />
+                  )}
+                  {railInstance.snapshot.authenticated && railInstance.snapshot.account && (
+                    <p className="mt-1 break-words text-[11px] text-ink-secondary">
+                      {[railInstance.snapshot.account.email, railInstance.snapshot.account.organization].filter(Boolean).join(" · ")}
+                    </p>
+                  )}
                   <div className="mt-0.5 text-[11.5px] text-ink-secondary">
-                    {pane === "custom"
-                      ? "Run this agent with a model already on your machine."
-                      : "Choose a model for this bot."}
+                    {pane === "custom" ? t("model.localHint") : t(threadId && scope === "thread" ? "model.chooseThreadHint" : "model.chooseHint")}
                   </div>
                 </div>
 
@@ -421,17 +665,25 @@ export function ModelPicker({
                     }}
                     className="mx-2 mb-1 flex shrink-0 items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-[12px] text-ink-secondary hover:bg-control/60"
                   >
-                    <ChevronLeft size={13} /> Back to {railInstance.displayName} models
+                    <ChevronLeft size={13} /> {t("model.backTo", { name: railInstance.displayName })}
                   </button>
                 )}
 
                 {blocked ? (
                   <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3 pt-1">
                     <EngineSetup instance={railInstance} intent={pane === "custom" ? "inject" : "cloud"} />
+                    {railInstance.claudeAccount && needsSignIn(railInstance) && pane !== "custom" && (
+                      <p className="mt-2 text-[11.5px] leading-relaxed text-ink-secondary">
+                        {railInstance.claudeAccount.signInShell === "powershell" && `${t("engines.account.powershell")} `}
+                        {t("engines.account.signInHint")}
+                      </p>
+                    )}
                     <p className="mt-2 text-center text-[11.5px] text-ink-secondary/70">
                       {pane === "main" && official.length > 0
-                        ? `${official.length} ${official.length === 1 ? "model" : "models"} will appear after setup.`
-                        : "Local models will appear as soon as the agent is installed."}
+                        ? official.length === 1
+                          ? t("model.afterSetupOne")
+                          : t("model.afterSetupMany", { count: official.length })
+                        : t("model.localSoon")}
                     </p>
                   </div>
                 ) : (
@@ -455,13 +707,20 @@ export function ModelPicker({
                     <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
                       {pane === "main" ? (
                         <>
+                          {railInstance.snapshot.update && (
+                            <EngineUpdateNotice update={railInstance.snapshot.update} instance={railInstance} className="mx-1 mb-2" />
+                          )}
                           <EngineGroupLabel className="px-2 pb-1 pt-0.5">
-                            {query ? `${filteredOfficial.length} results` : showAll ? `All models · ${official.length}` : "Suggested"}
+                            {query
+                              ? t("model.results", { count: filteredOfficial.length })
+                              : showAll
+                                ? t("model.allModels", { count: official.length })
+                                : t("model.suggested")}
                           </EngineGroupLabel>
                           {shownOfficial.map(renderRow)}
                           {shownOfficial.length === 0 && (
                             <div className="px-2 py-5 text-center text-[12.5px] text-ink-secondary">
-                              Nothing matches “{query.trim()}”
+                              {t("model.noMatch", { query: query.trim() })}
                             </div>
                           )}
                           {!query && !showAll && official.length > compactOfficial.length && (
@@ -470,7 +729,7 @@ export function ModelPicker({
                               onClick={() => setShowAll(true)}
                               className="mt-1 flex w-full items-center justify-between rounded-lg border-t border-hairline/40 px-2.5 py-2 text-[12.5px] font-medium text-ink-secondary hover:bg-control/60 hover:text-ink"
                             >
-                              Show all {official.length} models <ChevronDown size={13} />
+                              {t("model.showAll", { count: official.length })} <ChevronDown size={13} />
                             </button>
                           )}
                           {!query && showAll && official.length > COMPACT_MODEL_COUNT && (
@@ -479,14 +738,14 @@ export function ModelPicker({
                               onClick={() => setShowAll(false)}
                               className="mt-1 w-full rounded-lg px-2.5 py-2 text-[12px] text-ink-secondary hover:bg-control/60 hover:text-ink"
                             >
-                              Show suggested only
+                              {t("model.showSuggested")}
                             </button>
                           )}
                         </>
                       ) : (
                         <>
                           {pinned.length > 0 && (
-                            <EngineGroupLabel className="px-2 pb-1 pt-0.5">Loaded now</EngineGroupLabel>
+                            <EngineGroupLabel className="px-2 pb-1 pt-0.5">{t("model.loadedNow")}</EngineGroupLabel>
                           )}
                           {pinned.map(renderRow)}
                           {pinned.length > 0 && rest.length > 0 && (
@@ -495,15 +754,15 @@ export function ModelPicker({
                           {rest.map(renderRow)}
                           {custom.length === 0 && (
                             <div className="mx-1 rounded-xl border border-dashed border-hairline/50 px-3 py-5 text-center">
-                              <div className="text-[12.5px] font-medium text-ink">No local models found</div>
+                              <div className="text-[12.5px] font-medium text-ink">{t("model.noLocal")}</div>
                               <div className="mt-1 text-[11.5px] leading-relaxed text-ink-secondary">
-                                Start oMLX, Ollama, Unsloth, LM Studio, or EXO, then reopen this picker.
+                                {t("model.noLocalHint")}
                               </div>
                             </div>
                           )}
                           {custom.length > 0 && filteredCustom.length === 0 && (
                             <div className="px-2 py-5 text-center text-[12.5px] text-ink-secondary">
-                              Nothing matches “{query.trim()}”
+                              {t("model.noMatch", { query: query.trim() })}
                             </div>
                           )}
                         </>
@@ -512,11 +771,30 @@ export function ModelPicker({
                   </>
                 )}
 
+                {/* The header has nowhere else to put effort, so the popover
+                    carries it. `contained` callers (the settings dialog) render
+                    their own EffortRow card, and two copies of one control in
+                    one view read as a bug. Reads the bot's active engine, not
+                    the rail being browsed: effort applies to the model this bot
+                    runs on now, and picking a model on another rail closes the
+                    popover. */}
+                {!contained && (
+                  <EffortRow
+                    bot={bot}
+                    threadId={threadId}
+                    updateBotDefault={Boolean(threadId && scope === "bot")}
+                    className="shrink-0 border-t border-hairline/40 px-4 py-3"
+                    label={<span className="text-[12.5px] font-medium text-ink">{active?.capabilities?.modelVariants ? "Reasoning" : "Effort"}</span>}
+                  />
+                )}
+
                 {pane === "main" && (
                   <button
                     type="button"
                     aria-label={
-                      custom.length > 0 ? `Use a local model (${custom.length} available)` : "Use a local model"
+                      custom.length > 0
+                        ? t("model.useLocalCount", { count: custom.length })
+                        : t("model.useLocal")
                     }
                     disabled={!canOpenCustom}
                     onClick={() => {
@@ -525,11 +803,11 @@ export function ModelPicker({
                     }}
                     className="flex w-full shrink-0 items-center justify-between gap-2 border-t border-hairline/40 px-4 py-3 text-left text-[12.5px] font-medium text-ink hover:bg-control/60 disabled:cursor-not-allowed disabled:text-ink-secondary/40 disabled:hover:bg-transparent"
                   >
-                    <span>Use a local model</span>
+                    <span>{t("model.useLocal")}</span>
                     <span className="flex items-center gap-2">
                       {custom.length > 0 && (
                         <span className="rounded-full bg-inset px-2 py-0.5 text-[10.5px] text-ink-secondary">
-                          {custom.length} available
+                          {t("model.available", { count: custom.length })}
                         </span>
                       )}
                       <ChevronRight size={14} className="text-ink-secondary" />
@@ -538,11 +816,30 @@ export function ModelPicker({
                 )}
               </>
             ) : (
-              <div className="px-4 py-5 text-[13px] text-ink-secondary">No model providers are available.</div>
+              <div className="px-4 py-5 text-[13px] text-ink-secondary">{t("model.noProviders")}</div>
             )}
           </div>
         </div>
       )}
+      <ConfirmDialog
+        open={pendingSwitch !== null}
+        title={t("model.providerSwitch.title")}
+        body={t(pendingSwitch?.updateBotDefault ? "model.providerSwitch.botBody" : "model.providerSwitch.threadBody", {
+          model: pendingSwitch?.name ?? "",
+        })}
+        tone="neutral"
+        confirmLabel={t("model.providerSwitch.confirm")}
+        onCancel={() => setPendingSwitch(null)}
+        onConfirm={() => {
+          if (!pendingSwitch || bot.busy || pendingSwitch.botId !== bot.id || pendingSwitch.threadId !== (threadId ?? bot.threadId)) {
+            setPendingSwitch(null); return;
+          }
+          dispatch({ type: "setModel", botId: pendingSwitch.botId, threadId: pendingSwitch.threadId,
+            selection: pendingSwitch.selection, updateBotDefault: pendingSwitch.updateBotDefault,
+            resetApprovalToAsk: true });
+          setPendingSwitch(null);
+        }}
+      />
     </div>
   );
 }

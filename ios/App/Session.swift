@@ -19,6 +19,26 @@ import UIKit
 /// the transitions are worth being able to read.
 private let log = Logger(subsystem: "com.openmausbot.companion", category: "stream")
 
+private final class CachedAttachmentDownload: NSObject {
+    let value: DownloadedFile
+
+    init(_ value: DownloadedFile) {
+        self.value = value
+    }
+}
+
+/// An immutable, ciphertext-only credential write prepared on the main
+/// actor before any asynchronous work begins. HPKE uses fresh randomness for
+/// every seal, so retries must reuse this exact value rather than encrypting
+/// the same credential again after an ambiguous network failure.
+struct PreparedPhoneCredential: Equatable, Sendable {
+    fileprivate let requestIdentity: String
+    fileprivate let connectionID: String
+    fileprivate let botID: String
+    fileprivate let messageID: String
+    fileprivate let envelope: PhoneSecretEnvelope
+}
+
 @MainActor
 final class Session: ObservableObject {
     enum Status: Equatable {
@@ -33,6 +53,10 @@ final class Session: ObservableObject {
     @Published private(set) var state = CompanionState()
     @Published private(set) var connection: Connection?
     @Published private(set) var connections: [Connection] = []
+    /// Whether the live pairing may administer the workspace — see
+    /// `Connection.canAdminister`. Views hide owner-only controls when this
+    /// is false rather than offer buttons the server would answer 403 to.
+    var canAdminister: Bool { connection?.canAdminister ?? false }
     @Published private(set) var status: Status = .unpaired
     /// Transient, user-facing failures from an action they just took.
     @Published var actionError: String?
@@ -47,12 +71,20 @@ final class Session: ObservableObject {
     /// Pairing can be opened while another computer remains connected. The
     /// working session is only replaced after the new credential commits.
     @Published private(set) var pairingRequested = false
+    /// Views with sensitive input observe this value so an explicit runtime
+    /// disconnect clears the field even when the selected connection itself
+    /// has not changed.
+    @Published private(set) var credentialEntryResetGeneration = 0
 
     /// A notification response that should be pushed by the roster's
     /// NavigationStack after the exact detached task has been activated.
     @Published private(set) var notificationChat: Chat?
 
     private var client: CompanionClient?
+    /// Ciphertext-only operations survive navigation and transient
+    /// disconnects so a retry cannot accidentally reseal the same value with
+    /// a different HPKE operation id. Nothing here is persisted to disk.
+    private var preparedPhoneCredentials: [String: PreparedPhoneCredential] = [:]
     /// The device token, kept in memory so the client can be rebuilt when the
     /// dial moves to another stored host. The keychain remains the only place
     /// it is persisted.
@@ -88,10 +120,16 @@ final class Session: ObservableObject {
     /// for the same attachment path.
     private var avatarFetches: [String: (id: UUID, task: Task<Data?, Never>)] = [:]
     private var avatarCacheGeneration = 0
-    /// Only one downloaded document preview is retained. A replacement is
-    /// written completely before the previous directory is removed, so a
-    /// failed download cannot invalidate the file currently on screen.
-    private var filePreviewDirectory: URL?
+    /// Full image bytes are already fetched to draw a thumbnail. Keep a small,
+    /// cost-bounded window so tapping that thumbnail opens immediately instead
+    /// of downloading the same image twice.
+    private let attachmentCache: NSCache<NSString, CachedAttachmentDownload> = {
+        let cache = NSCache<NSString, CachedAttachmentDownload>()
+        cache.countLimit = 12
+        cache.totalCostLimit = 32 * 1_024 * 1_024
+        return cache
+    }()
+    private var attachmentCacheGeneration = 0
     /// An ambiguous network failure may happen after the server accepted a
     /// message. Reusing this id for the exact same retained draft makes Retry
     /// idempotent instead of sending the attachment twice.
@@ -103,6 +141,11 @@ final class Session: ObservableObject {
     /// is available. Retain the last explicitly tapped destination until the
     /// paired client can be rebuilt after unlock.
     private var pendingNotification: NotificationTarget?
+
+    /// The exact route the current client will use for a credential write.
+    var phoneCredentialTransportIsProtected: Bool {
+        client?.connection.activeEndpoint?.protectsCredentials == true
+    }
 
     private struct AttachmentDraftKey: Hashable {
         let destination: MessageDestination
@@ -122,7 +165,10 @@ final class Session: ObservableObject {
 #if DEBUG
         let arguments = ProcessInfo.processInfo.arguments
         if (arguments.contains("-store-preview") || arguments.contains("-computer-switcher-preview")),
-           let url = Bundle.main.url(forResource: "StorePreview", withExtension: "json"),
+           let url = Bundle.main.url(
+               forResource: arguments.contains("-threads-preview") ? "ThreadPreview" : "StorePreview",
+               withExtension: "json"
+           ),
            let data = try? Data(contentsOf: url),
            let fleet = try? JSONDecoder().decode(Fleet.self, from: data) {
             let preview = Connection(
@@ -148,6 +194,12 @@ final class Session: ObservableObject {
                 connections = [preview]
             }
             state.hydrate(fleet)
+            if arguments.contains("-threads-preview"),
+               let pagesURL = Bundle.main.url(forResource: "ThreadPreviewPages", withExtension: "json"),
+               let pagesData = try? Data(contentsOf: pagesURL),
+               let pages = try? JSONDecoder().decode([String: ThreadPage].self, from: pagesData) {
+                for (threadID, page) in pages { state.merge(page, intoThread: threadID) }
+            }
             status = .live
             return
         }
@@ -233,6 +285,30 @@ final class Session: ObservableObject {
         if invited.allowedRouteKinds == nil {
             invited.establishRoutePolicyFromInvite()
         }
+        // A 12-character code pairs with a server directly (its own sessions,
+        // a bearer with the code's scopes); anything else is the companion's.
+        if let code = PairingInvite.normalizedServerCode(credential) {
+            // Reachability first, on the public descriptor: a wrong address
+            // then fails as an address problem rather than a code problem,
+            // and no attempt is spent against the server's lockout.
+            try await Self.confirmServer(at: invited)
+            let paired = try await CompanionClient.pairWithServer(
+                connection: invited,
+                code: code,
+                label: deviceName,
+                attemptId: pairRequestId
+            )
+            var stored = invited
+            if !paired.environment.label.isEmpty { stored.name = paired.environment.label }
+            stored.serverEnvironmentId = paired.environment.environmentId
+            stored.serverScopes = paired.session.scopes
+            stored.companionDeviceId = nil
+            if let existing = registry.matchingConnection(for: stored) {
+                stored.id = existing.id
+            }
+            try commitPairing(stored, token: paired.token)
+            return
+        }
         let outcome = try await CompanionClient.pairFirstReachable(
             connection: invited,
             credential: credential,
@@ -243,6 +319,7 @@ final class Session: ObservableObject {
         // prefer the name the computer calls itself over the Bonjour label
         var stored = outcome.connection
         if !paired.serverName.isEmpty { stored.name = paired.serverName }
+        stored.companionDeviceId = paired.device.id
         // The computer knows every address it answers on, but redemption may
         // not widen the explicit route consent carried by the invite.
         stored.applyPairingAdvertisement(hosts: paired.hosts, endpoints: paired.endpoints)
@@ -258,8 +335,15 @@ final class Session: ObservableObject {
         if let existing = registry.matchingConnection(for: stored) {
             stored.id = existing.id
         }
+        try commitPairing(stored, token: paired.token, winner: winner)
+    }
 
-        try Keychain.save(paired.token, for: stored.id)
+    /// The device token goes to the keychain and the connection to defaults —
+    /// deliberately apart, so the thing that gets backed up is never the
+    /// credential. Shared by companion and server pairing; `winner` is the
+    /// route that answered, which a server pairing (one route) has no use for.
+    private func commitPairing(_ stored: Connection, token: String, winner: CompanionEndpoint? = nil) throws {
+        try Keychain.save(token, for: stored.id)
         let firstPairing = registry.connections.isEmpty
         var updatedRegistry = registry
         updatedRegistry.upsert(stored)
@@ -289,20 +373,35 @@ final class Session: ObservableObject {
         registry = updatedRegistry
         connections = registry.connections
         self.connection = stored
-        self.token = paired.token
+        self.token = token
         let liveRoutes = winner.map { route in
             [route] + stored.orderedEndpoints.filter { $0.url != route.url }
         } ?? stored.orderedEndpoints
         self.rotation = CandidateRotation(endpoints: liveRoutes)
         self.client = CompanionClient(
             connection: winner.map(stored.dialing) ?? stored,
-            token: paired.token
+            token: token
         )
         self.state = CompanionState()
         // A fresh pairing settles any restore that was still waiting on the
         // keychain — the token is in hand, so there is nothing left to retry.
         restorePending = false
         connect()
+    }
+
+    /// `GET /.well-known/openmausbot/environment` on a server about to be
+    /// paired. Nothing there means this address is not a server; the message
+    /// names the address, since that is what the person can fix. Any other
+    /// answer — unreachable, a gateway error — is passed through as it is.
+    private static func confirmServer(at connection: Connection) async throws {
+        let probe = CompanionClient(connection: connection, token: nil, requestTimeout: 8)
+        do {
+            _ = try await probe.environment()
+        } catch APIError.status(404, _) {
+            throw APIError.transport(
+                "\(connection.displayAddress) isn't an OpenMausBot server. Check the address and try again."
+            )
+        }
     }
 
     func receivePairingURL(_ url: URL) {
@@ -364,9 +463,16 @@ final class Session: ObservableObject {
     }
 
     func forgetConnection(id: String) {
-        guard registry.connection(id: id) != nil else { return }
+        guard let forgotten = registry.connection(id: id) else { return }
         let wasActive = registry.activeConnectionID == id
+        // A server session is ended on the server too, best effort: the
+        // bearer is discarded locally either way.
+        if forgotten.pairedWithServer, let token = try? Keychain.token(for: id) {
+            let client = CompanionClient(connection: forgotten, token: token)
+            Task.detached { try? await client.logout() }
+        }
         if wasActive { stopActiveRuntime() }
+        preparedPhoneCredentials = preparedPhoneCredentials.filter { $0.value.connectionID != id }
         Keychain.remove(id)
         registry.remove(id: id)
         persistRegistry()
@@ -400,6 +506,7 @@ final class Session: ObservableObject {
     }
 
     private func clearActiveConnection() {
+        resetCredentialEntry()
         streamTask?.cancel()
         streamTask = nil
         endpointRefreshTask?.cancel()
@@ -417,7 +524,7 @@ final class Session: ObservableObject {
         rotation = CandidateRotation(hosts: [])
         state = CompanionState()
         resetAvatarCache()
-        clearFilePreview()
+        resetAttachmentCache()
         attachmentSendIDs.removeAll()
         NotificationCoordinator.shared.setBadge(0)
         status = .unpaired
@@ -436,6 +543,7 @@ final class Session: ObservableObject {
     }
 
     private func stopActiveRuntime() {
+        resetCredentialEntry()
         streamGeneration += 1
         streamTask?.cancel()
         streamTask = nil
@@ -449,7 +557,7 @@ final class Session: ObservableObject {
         token = nil
         state = CompanionState()
         resetAvatarCache()
-        clearFilePreview()
+        resetAttachmentCache()
         attachmentSendIDs.removeAll()
         NotificationCoordinator.shared.setBadge(0)
     }
@@ -542,11 +650,16 @@ final class Session: ObservableObject {
     /// anyway; dropping it deliberately means the cursor is written down at
     /// a known point instead of wherever the socket happened to die.
     func disconnect() {
+        resetCredentialEntry()
         streamTask?.cancel()
         streamTask = nil
         endpointRefreshTask?.cancel()
         endpointRefreshTask = nil
         endLinger()
+    }
+
+    private func resetCredentialEntry() {
+        credentialEntryResetGeneration &+= 1
     }
 
     private var lingerTask: UIBackgroundTaskIdentifier = .invalid
@@ -589,6 +702,23 @@ final class Session: ObservableObject {
         while !Task.isCancelled {
             guard let client else { return }
             status = .connecting
+            // A server connection first checks it is still the same server.
+            // The descriptor is public, so this spends no credential; a
+            // changed environment id (the address now belongs to another
+            // server, or its data directory was recreated) means "pair
+            // again", exactly like a revoked token — the bearer would be
+            // refused anyway, and a fresh install must not be shown the old
+            // one. Unreachable is not "different": the stream attempt below
+            // reports that the usual way.
+            if let expected = client.connection.serverEnvironmentId {
+                let live = try? await client.environment()
+                if Task.isCancelled { return }
+                if let live, live.environmentId != expected {
+                    log.error("server identity changed: \(expected, privacy: .public) is now \(live.environmentId, privacy: .public)")
+                    status = .unauthorized
+                    return
+                }
+            }
             log.info("opening stream, cursor=\(self.state.cursor ?? "none", privacy: .public)")
             do {
                 // The query is fixed when the connection opens, so changing
@@ -609,7 +739,7 @@ final class Session: ObservableObject {
                         // the request dies halfway through replay/hydration,
                         // reconnecting must still ask for the missing gap.
                         if !resumed {
-                            try await hydrate()
+                            try await hydrate(using: client)
                             state.resetCursor(cursor)
                         }
                         status = .live
@@ -653,12 +783,24 @@ final class Session: ObservableObject {
         }
     }
 
-    private func hydrate() async throws {
-        guard let client else { return }
-        let fleet = try await client.fleet(messages: 50)
-        log.info("hydrated \(fleet.bots.count, privacy: .public) bots, \(fleet.groups.count, privacy: .public) rooms")
-        state.hydrate(fleet)
-        NotificationCoordinator.shared.setBadge(state.unreadCount)
+    private func hydrate(using client: CompanionClient) async throws {
+        let generation = streamGeneration
+        // Notification navigation can refresh while run() continues folding
+        // live events. Retry once if that makes the fetched snapshot stale.
+        for _ in 0..<2 {
+            let expectedCursor = state.cursor
+            let snapshot = try await client.fleetForHydration(messages: 50)
+            try Task.checkCancellation()
+            guard streamGeneration == generation, self.client?.connection.id == client.connection.id else {
+                throw CancellationError()
+            }
+            guard state.hydrate(snapshot.fleet, waitingThreads: snapshot.waitingThreads,
+                                ifCursorMatches: expectedCursor) else { continue }
+            log.info("hydrated \(snapshot.fleet.bots.count, privacy: .public) bots, \(snapshot.fleet.groups.count, privacy: .public) rooms")
+            NotificationCoordinator.shared.setBadge(state.unreadCount)
+            return
+        }
+        throw APIError.status(code: 409, message: "Conversations changed while loading. Please try opening this notification again.")
     }
 
     // MARK: - Which address to dial
@@ -713,7 +855,9 @@ final class Session: ObservableObject {
     /// sidecars return 404 and a transient refresh error must not tear down a
     /// perfectly healthy event stream.
     private func refreshConnectionMetadata(using sourceClient: CompanionClient) {
-        guard let connectionID = connection?.id else { return }
+        // A server has no companion routes to advertise (`/api/companion/*`
+        // is the sidecar's); its one address is the one that was paired.
+        guard connection?.pairedWithServer != true, let connectionID = connection?.id else { return }
         let workingEndpoint = rotation.currentEndpoint ?? sourceClient.connection.activeEndpoint
         endpointRefreshTask?.cancel()
         endpointRefreshTask = Task { [weak self] in
@@ -777,12 +921,19 @@ final class Session: ObservableObject {
     // is a phone that disagrees with the laptop.
 
     func send(_ text: String, to chat: Chat) async {
+        let connectionID = client?.connection.id
+        var receipt: SendReceipt?
         await perform {
             switch chat {
-            case let .bot(bot): try await $0.send(text: text, toBot: bot.id)
-            case let .room(room): try await $0.send(text: text, toRoom: room.id)
+            case let .bot(bot): receipt = try await $0.send(text: text, toBot: bot.id, threadId: bot.threadId)
+            case let .room(room): receipt = try await $0.send(text: text, toRoom: room.id)
             }
         }
+        // The receipt describes a queue on the computer this request went
+        // to. A machine switched mid-flight has already reset state for the
+        // computer now on screen, and that row must not land in it.
+        guard client?.connection.id == connectionID else { return }
+        rememberQueuedSend(from: receipt, text: text)
     }
 
     /// Send a composer draft with app-owned attachments. The destination
@@ -798,6 +949,7 @@ final class Session: ObservableObject {
             actionError = "This computer is offline."
             return false
         }
+        let connectionID = client.connection.id
         actionError = nil
         do {
             try AttachmentPolicy.validate(attachments)
@@ -821,13 +973,7 @@ final class Session: ObservableObject {
                 }
             }
 
-            let destination: MessageDestination
-            switch chat {
-            case let .bot(bot):
-                destination = .bot(id: bot.id, threadId: bot.threadId)
-            case let .room(room):
-                destination = .room(id: room.id, threadId: room.threadId)
-            }
+            let destination = chat.destination
             let draftKey = AttachmentDraftKey(
                 destination: destination,
                 text: text,
@@ -851,7 +997,11 @@ final class Session: ObservableObject {
                         mime: mime,
                         uploadId: attachment.id.uuidString
                     )
-                    uploaded.append(SharedAttachmentReference(path: path, kind: .image))
+                    uploaded.append(SharedAttachmentReference(
+                        path: path,
+                        kind: .image,
+                        displayName: attachment.name
+                    ))
                 case .file:
                     let file = try await client.uploadFile(
                         data: attachment.data,
@@ -873,7 +1023,13 @@ final class Session: ObservableObject {
                 urls: [],
                 attachments: uploaded
             )
-            try await client.send(text: message, to: destination, sendId: sendID)
+            let receipt = try await client.send(text: message, to: destination, sendId: sendID)
+            // The send succeeded on the computer it was addressed to, so the
+            // draft clears either way. Its queue row belongs to that computer,
+            // and must not be drawn on one selected mid-upload.
+            if self.client?.connection.id == connectionID {
+                rememberQueuedSend(from: receipt, text: text)
+            }
             attachmentSendIDs.removeValue(forKey: draftKey)
             actionError = nil
             return true
@@ -889,10 +1045,49 @@ final class Session: ObservableObject {
         }
     }
 
+    /// The harness's answer to a send, when it held the message instead of
+    /// delivering it. This is wire state, not optimism: the row exists
+    /// because the computer said it does, identified by its queueId.
+    private func rememberQueuedSend(from receipt: SendReceipt?, text: String) {
+        guard let receipt, receipt.queued == true,
+              let queueId = receipt.queueId, let threadId = receipt.threadId
+        else { return }
+        state.rememberQueued(
+            QueuedSend(
+                queueId: queueId,
+                text: text,
+                reason: receipt.reason == "capacity" ? "capacity" : nil
+            ),
+            threadId: threadId
+        )
+    }
+
+    /// Take back a held message. The row only goes when the computer agrees;
+    /// an entry that already drained counts as agreement.
+    func cancelQueued(_ send: QueuedSend, threadId: String, in chat: Chat) async {
+        let connectionID = client?.connection.id
+        let destination: MessageDestination
+        switch chat {
+        case let .bot(bot): destination = .bot(id: bot.id, threadId: threadId)
+        case let .room(room): destination = .room(id: room.id, threadId: threadId)
+        }
+        var agreed = false
+        await perform {
+            try await $0.cancelQueued(queueId: send.queueId, to: destination)
+            agreed = true
+        }
+        // The cancel landed on the computer that owned the row. One selected
+        // mid-request has already reset state; its rows are not this cancel's
+        // to retire.
+        if agreed, client?.connection.id == connectionID {
+            state.cancelQueued(queueId: send.queueId, threadId: threadId)
+        }
+    }
+
     private func imageSupported(by chat: Chat, capableInstances: Set<String>) -> Bool {
         switch chat {
         case let .bot(bot):
-            return capableInstances.contains(bot.modelSelection.instanceId)
+            return capableInstances.contains(bot.currentTaskModelSelection.instanceId)
         case let .room(room):
             return !room.memberIds.isEmpty && room.memberIds.allSatisfy { id in
                 guard let bot = state.bot(id) else { return false }
@@ -910,55 +1105,112 @@ final class Session: ObservableObject {
         }
     }
 
-    /// Download one desktop path through its originating transcript message,
-    /// then place it in a private temporary directory for Quick Look.
-    func downloadFile(
+    /// Fetch one app-owned attachment through the message that introduced it.
+    /// The caller owns presentation errors so a failed thumbnail or preview can
+    /// explain itself beside the attachment that was tapped.
+    func fetchAttachment(
         threadId: String,
         messageId: String,
-        path: String
-    ) async -> DownloadedFile? {
+        path: String,
+        cacheResult: Bool = false
+    ) async throws -> DownloadedFile {
         guard let client else {
-            actionError = "This computer is offline."
-            return nil
+            throw APIError.transport("This computer is offline.")
         }
-        actionError = nil
+        let cacheKey = "\(threadId)\u{1F}\(messageId)\u{1F}\(path)"
+        if cacheResult,
+           let cached = attachmentCache.object(forKey: cacheKey as NSString) {
+            return cached.value
+        }
+        let generation = attachmentCacheGeneration
         do {
+            // Keep this structured. When the row scrolls away SwiftUI cancels
+            // its task, which now propagates directly into URLSession instead
+            // of leaving a shared unstructured download running.
             let download = try await client.downloadFile(
                 threadId: threadId,
                 messageId: messageId,
                 path: path
             )
             try Task.checkCancellation()
-            let manager = FileManager.default
-            let root = manager.temporaryDirectory
-                .appendingPathComponent("OpenMausBotFilePreviews", isDirectory: true)
-            let nextDirectory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
-            try manager.createDirectory(
-                at: nextDirectory,
-                withIntermediateDirectories: true,
-                attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
-            )
-            let fileURL = nextDirectory.appendingPathComponent(download.filename, isDirectory: false)
-            do {
-                try download.data.write(to: fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-                // A synchronous write cannot be interrupted halfway through.
-                // Check immediately afterwards so a cancelled preview never
-                // leaves its completed temporary copy behind.
-                try Task.checkCancellation()
-            } catch {
-                try? manager.removeItem(at: nextDirectory)
-                throw error
+            guard generation == attachmentCacheGeneration else { throw CancellationError() }
+            if cacheResult {
+                attachmentCache.setObject(
+                    CachedAttachmentDownload(download),
+                    forKey: cacheKey as NSString,
+                    cost: download.data.count
+                )
             }
-            let previous = filePreviewDirectory
-            filePreviewDirectory = nextDirectory
-            if let previous { try? manager.removeItem(at: previous) }
-            actionError = nil
-            return download.stored(at: fileURL)
-        } catch is CancellationError {
-            return nil
+            return download
         } catch let error as APIError where error.isUnauthorized {
+            // A cancelled request from the previous computer may finish after
+            // a switch. Its 401 belongs to that old token and must not evict
+            // the current live session.
+            guard generation == attachmentCacheGeneration, !Task.isCancelled else {
+                throw CancellationError()
+            }
             status = .unauthorized
-            actionError = error.localizedDescription
+            throw error
+        } catch {
+            if Task.isCancelled || generation != attachmentCacheGeneration {
+                throw CancellationError()
+            }
+            throw error
+        }
+    }
+
+    /// Fetch and materialize an attachment in a protected temporary directory
+    /// for Quick Look, markdown/text preview, and the system share sheet.
+    func prepareAttachmentPreview(
+        threadId: String,
+        messageId: String,
+        path: String,
+        cacheResult: Bool = false
+    ) async throws -> DownloadedFile {
+        let download = try await fetchAttachment(
+            threadId: threadId,
+            messageId: messageId,
+            path: path,
+            cacheResult: cacheResult
+        )
+        try Task.checkCancellation()
+        let preparation = Task.detached(priority: .userInitiated) {
+            // Content-Disposition is the server's canonical, sanitised name.
+            // The transport tag's `name` is presentation-only and must never
+            // choose the on-disk preview/share filename.
+            try Self.materializePreview(download: download, filename: download.filename)
+        }
+        let prepared = try await withTaskCancellationHandler {
+            try await preparation.value
+        } onCancel: {
+            preparation.cancel()
+        }
+        do {
+            try Task.checkCancellation()
+            return prepared
+        } catch {
+            Self.removePreview(at: prepared.localURL)
+            throw error
+        }
+    }
+
+    /// Compatibility for file links in assistant markdown. User attachment
+    /// cards use the throwing API above so their feedback remains local.
+    func downloadFile(
+        threadId: String,
+        messageId: String,
+        path: String
+    ) async -> DownloadedFile? {
+        actionError = nil
+        do {
+            let download = try await prepareAttachmentPreview(
+                threadId: threadId,
+                messageId: messageId,
+                path: path
+            )
+            actionError = nil
+            return download
+        } catch is CancellationError {
             return nil
         } catch {
             actionError = error.localizedDescription
@@ -966,9 +1218,47 @@ final class Session: ObservableObject {
         }
     }
 
-    private func clearFilePreview() {
-        if let filePreviewDirectory { try? FileManager.default.removeItem(at: filePreviewDirectory) }
-        filePreviewDirectory = nil
+    private func resetAttachmentCache() {
+        attachmentCacheGeneration += 1
+        attachmentCache.removeAllObjects()
+    }
+
+    nonisolated private static func materializePreview(
+        download: DownloadedFile,
+        filename: String
+    ) throws -> DownloadedFile {
+        let manager = FileManager.default
+        let root = manager.temporaryDirectory
+            .appendingPathComponent("OpenMausBotFilePreviews", isDirectory: true)
+        let directory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try Task.checkCancellation()
+        try manager.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
+        )
+        let fileURL = directory.appendingPathComponent(filename, isDirectory: false)
+        do {
+            try download.data.write(
+                to: fileURL,
+                options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
+            )
+            try Task.checkCancellation()
+            return DownloadedFile(
+                data: download.data,
+                filename: filename,
+                contentType: download.contentType,
+                localURL: fileURL
+            )
+        } catch {
+            try? manager.removeItem(at: directory)
+            throw error
+        }
+    }
+
+    nonisolated private static func removePreview(at fileURL: URL?) {
+        guard let fileURL else { return }
+        try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent())
     }
 
     private static func removeStaleFilePreviews() {
@@ -989,6 +1279,157 @@ final class Session: ObservableObject {
             isPermission: card.isPermission,
             reviewedSha256: card.skillRequest?.reviewedSha256
         )
+    }
+
+    /// Synchronously seal a credential before the caller starts an async
+    /// request. The caller can then erase its input immediately and retain
+    /// only this ciphertext value for an exact, idempotent retry.
+    func prepareCredential(
+        _ value: String,
+        chat: Chat,
+        message: Message,
+        secret: SecretRequestCardData
+    ) throws -> PreparedPhoneCredential {
+        guard let client, let connection else {
+            throw APIError.transport("This computer is offline.")
+        }
+        guard let publicKey = connection.secretPublicKey,
+              let deviceId = connection.companionDeviceId,
+              let target = secret.target,
+              let requestKey = secret.requestKey
+        else { throw PhoneSecretError.unavailable }
+        guard client.connection.activeEndpoint?.protectsCredentials == true else {
+            throw PhoneSecretError.insecureTransport
+        }
+
+        let botId = try credentialBotID(chat: chat, message: message)
+        let context = PhoneSecretRequestContext(
+            deviceId: deviceId,
+            botId: botId,
+            threadId: chat.threadId,
+            messageId: message.id,
+            target: target,
+            requestKey: requestKey
+        )
+        let keyId = try PhoneSecretCrypto.publicKeyId(publicKey)
+        let requestIdentity = phoneCredentialRequestIdentity(
+            connectionID: connection.id,
+            botID: botId,
+            context: context,
+            keyID: keyId
+        )
+        if let prepared = preparedPhoneCredentials[requestIdentity] {
+            return prepared
+        }
+        let envelope = try PhoneSecretCrypto.encrypt(
+            value,
+            publicKey: publicKey,
+            context: context
+        )
+
+        let prepared = PreparedPhoneCredential(
+            requestIdentity: requestIdentity,
+            connectionID: connection.id,
+            botID: botId,
+            messageID: message.id,
+            envelope: envelope
+        )
+        preparedPhoneCredentials[requestIdentity] = prepared
+        return prepared
+    }
+
+    /// Recover an ambiguous ciphertext-only operation when a card view is
+    /// recreated. This is deliberately in-memory: a force-quit forgets it,
+    /// while ordinary navigation, AutoFill, and reconnects do not.
+    func preparedCredential(
+        chat: Chat,
+        message: Message,
+        secret: SecretRequestCardData
+    ) -> PreparedPhoneCredential? {
+        guard let connection,
+              let publicKey = connection.secretPublicKey,
+              let deviceId = connection.companionDeviceId,
+              let target = secret.target,
+              let requestKey = secret.requestKey,
+              let botId = try? credentialBotID(chat: chat, message: message),
+              let keyId = try? PhoneSecretCrypto.publicKeyId(publicKey)
+        else { return nil }
+        let context = PhoneSecretRequestContext(
+            deviceId: deviceId,
+            botId: botId,
+            threadId: chat.threadId,
+            messageId: message.id,
+            target: target,
+            requestKey: requestKey
+        )
+        return preparedPhoneCredentials[phoneCredentialRequestIdentity(
+            connectionID: connection.id,
+            botID: botId,
+            context: context,
+            keyID: keyId
+        )]
+    }
+
+    func discardPreparedCredential(_ prepared: PreparedPhoneCredential) {
+        if preparedPhoneCredentials[prepared.requestIdentity] == prepared {
+            preparedPhoneCredentials.removeValue(forKey: prepared.requestIdentity)
+        }
+    }
+
+    private func credentialBotID(chat: Chat, message: Message) throws -> String {
+        switch chat {
+        case let .bot(bot): return bot.id
+        case .room:
+            guard let sender = message.from?.botId else {
+                throw PhoneSecretError.invalidRequest
+            }
+            return sender
+        }
+    }
+
+    private func phoneCredentialRequestIdentity(
+        connectionID: String,
+        botID: String,
+        context: PhoneSecretRequestContext,
+        keyID: String
+    ) -> String {
+        [
+            connectionID,
+            keyID,
+            botID,
+            context.threadId,
+            context.messageId,
+            context.target,
+            context.requestKey,
+        ].joined(separator: "\u{0}")
+    }
+
+    /// Send one already-sealed operation. A retry deliberately reuses the
+    /// same HPKE envelope; the desktop derives its idempotency key from these
+    /// bytes, so a lost response cannot cause a second provider save.
+    func provideCredential(_ prepared: PreparedPhoneCredential) async throws {
+        guard let client, let connection else {
+            throw APIError.transport("This computer is offline.")
+        }
+        guard connection.id == prepared.connectionID,
+              connection.companionDeviceId == prepared.envelope.deviceId,
+              let publicKey = connection.secretPublicKey,
+              (try? PhoneSecretCrypto.publicKeyId(publicKey)) == prepared.envelope.keyId
+        else { throw PhoneSecretError.unavailable }
+        guard client.connection.activeEndpoint?.protectsCredentials == true else {
+            throw PhoneSecretError.insecureTransport
+        }
+
+        do {
+            try await client.provideCredential(
+                botId: prepared.botID,
+                messageId: prepared.messageID,
+                envelope: prepared.envelope
+            )
+        } catch let error as APIError where error.isUnauthorized {
+            status = .unauthorized
+            throw error
+        }
     }
 
     /// The same answer, from something that only has the ids — the Live
@@ -1022,7 +1463,7 @@ final class Session: ObservableObject {
     /// about what was just permitted.
     func alwaysAllow(bot: Bot, card: OptionCard) async {
         guard let key = card.allowKey else { return }
-        await perform { try await $0.alwaysAllow(botId: bot.id, key: key) }
+        await perform { try await $0.alwaysAllow(botId: bot.id, key: key, threadId: bot.threadId) }
     }
 
     /// Make a new bot. The harness chooses its name, colour and greeting, so
@@ -1077,7 +1518,7 @@ final class Session: ObservableObject {
     }
 
     func interrupt(bot: Bot) async {
-        await perform { try await $0.interrupt(botId: bot.id) }
+        await perform { try await $0.interrupt(botId: bot.id, threadId: bot.threadId) }
     }
 
     /// Ask for one fresh cloud viewer URL. Unlike ordinary actions this
@@ -1095,7 +1536,7 @@ final class Session: ObservableObject {
     func markRead(_ chat: Chat) async {
         await perform(quietly: true) {
             switch chat {
-            case let .bot(bot): try await $0.markRead(botId: bot.id)
+            case let .bot(bot): try await $0.markRead(botId: bot.id, threadId: bot.threadId)
             case let .room(room): try await $0.markRead(roomId: room.id)
             }
         }
@@ -1109,6 +1550,15 @@ final class Session: ObservableObject {
         } catch {
             actionError = error.localizedDescription
         }
+    }
+
+    /// A pinned background thread may not be in a fresh fleet snapshot.
+    func loadThreadIfNeeded(_ threadId: String) async {
+        guard let client, !state.hasLoadedPage(forThread: threadId) else { return }
+        do {
+            let page = try await client.messages(threadId: threadId)
+            state.merge(page, intoThread: threadId)
+        } catch { if !Task.isCancelled { actionError = error.localizedDescription } }
     }
 
     func image(threadId: String, messageId: String) async -> Data? {
@@ -1136,13 +1586,13 @@ final class Session: ObservableObject {
                     state.apply(.bot(bot))
                 }
                 if !hit.onActivePath {
-                    let leaf = try await client.setActiveBranch(botId: bot.id, messageId: hit.messageId)
+                    let leaf = try await client.setActiveBranch(botId: bot.id, messageId: hit.messageId, threadId: hit.threadId)
                     state.apply(.thread(threadId: hit.threadId, activeLeafId: leaf))
                 }
                 let page = try await client.messages(threadId: hit.threadId, around: hit.messageId)
                 state.merge(page, intoThread: hit.threadId)
                 focusedMessageId = hit.messageId
-                return state.bot(bot.id).map(Chat.bot)
+                return state.bot(forThread: hit.threadId).map(Chat.bot)
             }
             if let groupId = hit.groupId,
                var room = state.rooms.first(where: { $0.id == groupId }) {
@@ -1163,59 +1613,133 @@ final class Session: ObservableObject {
         if focusedMessageId == messageId { focusedMessageId = nil }
     }
 
-    func createTask(for bot: Bot, title: String?) async {
-        guard let client else { return }
-        do { state.apply(.bot(try await client.createTask(botId: bot.id, title: title))) }
-        catch { actionError = error.localizedDescription }
+    @discardableResult
+    func createTask(for bot: Bot, title: String?) async -> Bot? {
+        guard let client else { return nil }
+        do {
+            let updated = try await client.createTask(botId: bot.id, title: title)
+            state.apply(.bot(updated))
+            return updated
+        } catch { actionError = error.localizedDescription; return nil }
     }
 
-    func switchTask(_ task: BotTask, for bot: Bot) async {
-        guard let client, task.threadId != bot.threadId else { return }
-        do { state.apply(.bot(try await client.switchTask(botId: bot.id, threadId: task.threadId))) }
-        catch { actionError = error.localizedDescription }
+    @discardableResult
+    func switchTask(_ task: BotTask, for bot: Bot) async -> Bot? {
+        guard let client else { return nil }
+        do {
+            let updated = try await client.switchTask(botId: bot.id, threadId: task.threadId)
+            state.apply(.bot(updated))
+            return updated
+        } catch { actionError = error.localizedDescription; return nil }
     }
 
-    func renameTask(_ task: BotTask, for bot: Bot, title: String) async {
-        guard let client else { return }
+    @discardableResult
+    func renameTask(_ task: BotTask, for bot: Bot, title: String) async -> Bool {
+        guard let client else { return false }
         do {
             try await client.renameTask(botId: bot.id, threadId: task.threadId, title: title)
             await refresh()
-        } catch { actionError = error.localizedDescription }
+            return true
+        } catch { actionError = error.localizedDescription; return false }
     }
 
-    func deleteTask(_ task: BotTask, for bot: Bot) async {
-        guard let client else { return }
-        do { state.apply(.bot(try await client.deleteTask(botId: bot.id, threadId: task.threadId))) }
-        catch { actionError = error.localizedDescription }
+    @discardableResult
+    func setTaskArchived(_ task: BotTask, for bot: Bot, archivedAt: Double?) async -> Bool {
+        guard let client else { return false }
+        do {
+            try await client.archiveTask(botId: bot.id, threadId: task.threadId, archivedAt: archivedAt)
+            await refresh()
+            return true
+        } catch { actionError = error.localizedDescription; return false }
     }
 
-    func createTask(for room: Room, title: String?) async {
-        guard let client else { return }
-        do { state.apply(.room(try await client.createTask(groupId: room.id, title: title))) }
-        catch { actionError = error.localizedDescription }
+    @discardableResult
+    func deleteTask(_ task: BotTask, for bot: Bot) async -> Bot? {
+#if DEBUG
+        // The native UI fixture has no paired client. This explicit launch
+        // mode exercises list updates and a partial batch failure entirely
+        // offline, without touching a person's conversations.
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("-threads-preview-deletion"),
+           var updated = state.bot(bot.id),
+           task.threadId != bot.threadId,
+           updated.visibleTasks.contains(where: { $0.threadId == task.threadId && !$0.isWorking }) {
+            if arguments.contains("-threads-preview-deletion-fails-weekend")
+                && task.threadId == "preview-weekend" {
+                actionError = "Synthetic deletion failure"
+                return nil
+            }
+            updated.tasks?.removeAll { $0.threadId == task.threadId }
+            state.apply(.bot(updated))
+            return updated
+        }
+#endif
+        guard let client else { return nil }
+        do {
+            let updated = try await client.deleteTask(botId: bot.id, threadId: task.threadId)
+            state.apply(.bot(updated))
+            return updated
+        } catch { actionError = error.localizedDescription; return nil }
     }
 
-    func switchTask(_ task: BotTask, for room: Room) async {
-        guard let client, task.threadId != room.threadId else { return }
-        do { state.apply(.room(try await client.switchTask(groupId: room.id, threadId: task.threadId))) }
-        catch { actionError = error.localizedDescription }
+    @discardableResult
+    func createTask(for room: Room, title: String?) async -> Bool {
+        guard let client else { return false }
+        do { state.apply(.room(try await client.createTask(groupId: room.id, title: title))); return true }
+        catch { actionError = error.localizedDescription; return false }
     }
 
-    func renameTask(_ task: BotTask, for room: Room, title: String) async {
-        guard let client else { return }
+    @discardableResult
+    func switchTask(_ task: BotTask, for room: Room) async -> Bool {
+        guard task.threadId != room.threadId else { return true }
+        guard let client else { return false }
+        do { state.apply(.room(try await client.switchTask(groupId: room.id, threadId: task.threadId))); return true }
+        catch { actionError = error.localizedDescription; return false }
+    }
+
+    @discardableResult
+    func renameTask(_ task: BotTask, for room: Room, title: String) async -> Bool {
+        guard let client else { return false }
         do {
             try await client.renameTask(groupId: room.id, threadId: task.threadId, title: title)
             await refresh()
-        } catch { actionError = error.localizedDescription }
+            return true
+        } catch { actionError = error.localizedDescription; return false }
     }
 
-    func deleteTask(_ task: BotTask, for room: Room) async {
-        guard let client else { return }
-        do { state.apply(.room(try await client.deleteTask(groupId: room.id, threadId: task.threadId))) }
-        catch { actionError = error.localizedDescription }
+    @discardableResult
+    func deleteTask(_ task: BotTask, for room: Room) async -> Bool {
+        guard let client else { return false }
+        do { state.apply(.room(try await client.deleteTask(groupId: room.id, threadId: task.threadId))); return true }
+        catch { actionError = error.localizedDescription; return false }
     }
 
     // MARK: - Agent profile
+
+    /// The model catalog lives on the paired computer because availability
+    /// depends on which engines are installed and signed in there.
+    func modelInstances() async -> [Instance] {
+        guard let client else { return [] }
+        do {
+            return try await client.instances()
+        } catch {
+            if !Task.isCancelled { actionError = error.localizedDescription }
+            return []
+        }
+    }
+
+    func updateModel(_ selection: ModelSelection, for bot: Bot) async -> Bot? {
+        guard let client else { return nil }
+        do {
+            let updated = try await client.updateModel(botId: bot.id, selection: selection, threadId: bot.threadId)
+            guard !Task.isCancelled else { return nil }
+            state.apply(.bot(updated))
+            return updated
+        } catch {
+            if !Task.isCancelled { actionError = error.localizedDescription }
+            return nil
+        }
+    }
 
     func updateProfile(_ patch: BotProfilePatch, for bot: Bot) async -> Bot? {
         guard let client else { return nil }
@@ -1295,6 +1819,27 @@ final class Session: ObservableObject {
         catch { actionError = error.localizedDescription; return [] }
     }
 
+    /// Switch the workspace's voice engine. The fresh status comes back so
+    /// the caller can re-derive every provider-dependent row in place.
+    func setVoiceProvider(_ provider: VoiceProvider) async -> ConfigStatus? {
+        guard let client else { return nil }
+        do { return try await client.setVoiceProvider(provider) }
+        catch { actionError = error.localizedDescription; return nil }
+    }
+
+    func saveChatterboxServer(baseURL: String, model: String) async -> ConfigStatus? {
+        guard let client else { return nil }
+        do { return try await client.saveChatterboxServer(baseURL: baseURL, model: model) }
+        catch { actionError = error.localizedDescription; return nil }
+    }
+
+    /// The host's platform, which decides whether its built-in voices are a
+    /// real engine choice there or a row that must stay disabled.
+    func serverEnvironment() async -> ServerEnvironment? {
+        guard let client else { return nil }
+        return try? await client.environment()
+    }
+
     func previewVoice(_ voiceId: String, for bot: Bot) async -> Data? {
         guard let client else { return nil }
         do { return try await client.previewVoice(text: "Hello, I'm \(bot.name).", voiceId: voiceId) }
@@ -1304,6 +1849,21 @@ final class Session: ObservableObject {
     func configStatus() async -> ConfigStatus? {
         guard let client else { return nil }
         return try? await client.config()
+    }
+
+    func botOverview(for bot: Bot) async -> BotOverview? {
+        guard let client else { return nil }
+        let connectionID = connection?.id
+        do {
+            let overview = try await client.overview(botId: bot.id)
+            guard !Task.isCancelled, connection?.id == connectionID else { return nil }
+            return overview
+        } catch {
+            guard !Task.isCancelled, connection?.id == connectionID else { return nil }
+            guard !(error is CancellationError), (error as? URLError)?.code != .cancelled else { return nil }
+            actionError = error.localizedDescription
+            return nil
+        }
     }
 
     // MARK: - Routines
@@ -1371,8 +1931,7 @@ final class Session: ObservableObject {
         do {
             var bot = state.bot(target.botId)
             if bot == nil {
-                let fleet = try await client.fleet(messages: 50)
-                state.hydrate(fleet)
+                try await hydrate(using: client)
                 bot = state.bot(target.botId)
             }
             // A room's approval/question notification carries the asker bot
@@ -1405,10 +1964,68 @@ final class Session: ObservableObject {
                 }
             }
             notificationChat = .bot(selected)
+        } catch is CancellationError {
+            // A refresh from the previous computer must not alert on the
+            // newly selected connection after its generation guard rejects it.
         } catch { actionError = error.localizedDescription }
     }
 
     func consumeNotificationChat() { notificationChat = nil }
+
+    // MARK: - Thread chips
+
+    /// A tapped "Opened thread #Title on Scout" chip. Lands on that thread by
+    /// the route a thread row uses, which only changes what this phone is
+    /// looking at — a bot mid-turn keeps working where it was. A thread the
+    /// computer no longer has still lands on the bot, with a notice, rather
+    /// than nowhere.
+    ///
+    /// Returns the thread to select in place when the chip's bot is the one
+    /// already on screen. Any other bot is pushed the way a notification is,
+    /// and nil comes back.
+    func openThread(_ ref: ThreadRef, shownBotId: String?) async -> String? {
+        guard !Task.isCancelled else { return nil }
+        guard let client else {
+            actionError = "Pair this device with your computer to open that thread."
+            return nil
+        }
+        let generation = streamGeneration
+        let connectionID = client.connection.id
+        let requestIsCurrent = {
+            !Task.isCancelled && self.streamGeneration == generation && self.client?.connection.id == connectionID
+        }
+        actionError = nil
+        do {
+            var bot = state.bot(ref.botId)
+            if bot == nil {
+                try await hydrate(using: client)
+                guard requestIsCurrent() else { return nil }
+                bot = state.bot(ref.botId)
+            }
+            guard var selected = bot else { throw APIError.status(code: 404, message: "That agent no longer exists.") }
+            if selected.threadId != ref.threadId {
+                do {
+                    selected = try await client.switchTask(botId: selected.id, threadId: ref.threadId)
+                    guard requestIsCurrent() else { return nil }
+                    state.apply(.bot(selected))
+                } catch APIError.status(code: 404, message: _) {
+                    guard requestIsCurrent() else { return nil }
+                    // The thread may be gone (deleted since the chip was
+                    // written). The bot's current thread, and a word about
+                    // it, beats a dead tap.
+                    actionError = "That thread is no longer on your computer."
+                }
+            }
+            guard requestIsCurrent() else { return nil }
+            if selected.id == shownBotId { return selected.threadId }
+            notificationChat = .bot(selected)
+        } catch is CancellationError {
+        } catch {
+            guard requestIsCurrent() else { return nil }
+            actionError = error.localizedDescription
+        }
+        return nil
+    }
 
     func react(to message: Message, in threadId: String, emoji: String) async {
         guard let client else { return }
@@ -1419,13 +2036,13 @@ final class Session: ObservableObject {
     }
 
     func edit(_ message: Message, for bot: Bot, text: String) async {
-        await perform { try await $0.edit(botId: bot.id, messageId: message.id, text: text) }
+        await perform { try await $0.edit(botId: bot.id, messageId: message.id, text: text, threadId: bot.threadId) }
     }
 
     func switchVersion(to message: Message, for bot: Bot) async {
         guard let client else { return }
         do {
-            let leaf = try await client.setActiveBranch(botId: bot.id, messageId: message.id)
+            let leaf = try await client.setActiveBranch(botId: bot.id, messageId: message.id, threadId: bot.threadId)
             state.apply(.thread(threadId: bot.threadId, activeLeafId: leaf))
         } catch { actionError = error.localizedDescription }
     }
@@ -1500,95 +2117,6 @@ final class Session: ObservableObject {
             status = .unauthorized
         } catch {
             if !quietly { actionError = error.localizedDescription }
-        }
-    }
-}
-
-/// A chat is a bot or a room. They share a thread, which is what every
-/// message, approval and page is keyed by.
-enum Chat: Identifiable, Hashable {
-    case bot(Bot)
-    case room(Room)
-
-    var id: String {
-        switch self {
-        case let .bot(bot): return bot.id
-        case let .room(room): return room.id
-        }
-    }
-
-    static func == (left: Chat, right: Chat) -> Bool {
-        switch (left, right) {
-        case let (.bot(a), .bot(b)): return a.id == b.id
-        case let (.room(a), .room(b)): return a.id == b.id
-        default: return false
-        }
-    }
-
-    func hash(into hasher: inout Hasher) {
-        switch self {
-        case let .bot(bot):
-            hasher.combine(0)
-            hasher.combine(bot.id)
-        case let .room(room):
-            hasher.combine(1)
-            hasher.combine(room.id)
-        }
-    }
-
-    var threadId: String {
-        switch self {
-        case let .bot(bot): return bot.threadId
-        case let .room(room): return room.threadId
-        }
-    }
-
-    var name: String {
-        switch self {
-        case let .bot(bot): return bot.name
-        case let .room(room): return room.name
-        }
-    }
-
-    var isBot: Bool {
-        if case .bot = self { return true }
-        return false
-    }
-
-    var supportsTasks: Bool {
-        switch self {
-        case .bot: return true
-        // `tasks == nil` means an older paired desktop. Hide the affordance
-        // instead of sending it a route it does not know yet.
-        case let .room(room): return room.dm != true && room.tasks != nil
-        }
-    }
-
-    var subtitle: String {
-        switch self {
-        case let .bot(bot): return bot.title
-        case let .room(room): return "\(room.memberIds.count) bots"
-        }
-    }
-
-    var unread: Bool {
-        switch self {
-        case let .bot(bot): return bot.unread
-        case let .room(room): return room.unread
-        }
-    }
-
-    var busy: Bool {
-        switch self {
-        case let .bot(bot): return bot.busy ?? false
-        case let .room(room): return room.busyBotId != nil
-        }
-    }
-
-    var color: String {
-        switch self {
-        case let .bot(bot): return bot.color
-        case .room: return "blue"
         }
     }
 }

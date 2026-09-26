@@ -57,6 +57,13 @@ public struct OptionCard: Codable, Hashable, Sendable {
     /// Learned skills must show their complete reviewed contents before an
     /// approval button is offered on a compact companion surface.
     public var skillRequest: SkillRequestCardData? = nil
+    /// The model's own questions and options (Claude's `AskUserQuestion`).
+    /// Present only on a structured ask; every other card leaves it nil.
+    public var questionRequest: QuestionRequestCardData? = nil
+    /// What an answered question was answered WITH. `answered` only records
+    /// the behavior once the harness settles a live ask, so without this a
+    /// settled question card would read "answer" instead of the reply.
+    public var answeredText: String? = nil
 
     /// A card is actionable while it is unanswered and still has a request
     /// behind it. Everything else is transcript.
@@ -66,6 +73,14 @@ public struct OptionCard: Codable, Hashable, Sendable {
 
     /// Permission cards carry a tool; questions do not.
     public var isPermission: Bool { tool != nil }
+
+    /// A structured ask draws its own card: the model posed real questions
+    /// with real options, and a flat row of buttons cannot say which
+    /// question a tap answered.
+    public var questions: [AskQuestion] {
+        guard let questionRequest, !questionRequest.questions.isEmpty else { return [] }
+        return questionRequest.questions
+    }
 
     /// The wire API accepts an approval behavior rather than the button's
     /// display text. Treat the one refusal as deny and every other offered
@@ -106,6 +121,34 @@ public struct ToolActivity: Codable, Hashable, Sendable {
     public var setup: Bool?
 }
 
+/// The thread an activity chip opened — "Opened thread #Title on Scout" —
+/// so the phone can go there. Newer computers only; a chip without one is
+/// just a receipt.
+public struct ThreadRef: Codable, Hashable, Sendable {
+    public var botId: String
+    public var threadId: String
+    public var title: String
+}
+
+/// A credential request created by the desktop for one paused task.
+///
+/// The phone may fill this request only through the QR-pinned HPKE transport.
+/// The payload contains identifiers and display copy, never the credential.
+public struct SecretRequestCardData: Codable, Hashable, Sendable {
+    public var target: String?
+    public var label: String?
+    public var description: String?
+    public var placeholder: String?
+    public var helpUrl: String?
+    public var requestKey: String?
+    public var provided: Bool?
+    public var dismissed: Bool?
+    public var resumed: Bool?
+    public var error: String?
+
+    public var isPending: Bool { provided != true && dismissed != true }
+}
+
 public struct Sender: Codable, Hashable, Sendable {
     public var botId: String
     public var name: String
@@ -126,7 +169,7 @@ public struct CommChip: Codable, Hashable, Sendable {
 
 public struct Message: Codable, Hashable, Identifiable, Sendable {
     public enum Kind: String, Codable, Sendable {
-        case text, options, activity, screen
+        case text, options, activity, screen, secret
         /// A kind this build has never heard of.
         ///
         /// Not decorative. `kind` is not optional, so without this a single
@@ -163,10 +206,16 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
     public var at: Double
     public var text: String?
     public var card: OptionCard?
+    public var secret: SecretRequestCardData?
     public var tool: ToolActivity?
+    public var threadRef: ThreadRef?
     /// The message this one follows; nil at the thread root. Two messages
     /// sharing a parent are a fork.
     public var parentId: String?
+    /// Set when this line began as a queued send: the id the harness quoted
+    /// when it held the message, echoed back on the line that finally landed.
+    /// Clients match it against their held-send rows to retire them.
+    public var queueId: String?
     /// Rooms: which member said this.
     public var from: Sender?
     public var reactions: [Reaction]?
@@ -186,12 +235,138 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
 public struct ModelSelection: Codable, Hashable, Sendable {
     public var instanceId: String
     public var model: String
+    /// Optional reasoning effort passed through to engines that support it.
+    /// Older computers omit this field, which means the engine default.
+    public var effort: String?
+
+    public init(instanceId: String, model: String, effort: String? = nil) {
+        self.instanceId = instanceId
+        self.model = model
+        self.effort = effort
+    }
+}
+
+/// The bot that opened a thread, on itself or on a teammate. Absent — which
+/// is every thread from an older computer — means the person opened it.
+public struct ThreadOpener: Codable, Hashable, Sendable {
+    public var botId: String
+    public var name: String
+    public var delegationId: String?
+    public var at: Double
+}
+
+/// The bot that closed a thread with close_thread, once its result was
+/// read. Absent means the thread is open; the computer clears it the moment
+/// a new turn starts there, so a reopened thread simply loses the stamp.
+public struct ThreadCloser: Codable, Hashable, Sendable {
+    public var botId: String
+    public var name: String
+    public var at: Double
+}
+
+/// A folder within one bot, in the order saved by the desktop.
+public struct BotProject: Codable, Hashable, Identifiable, Sendable {
+    public var id: String
+    public var name: String
+    public var emoji: String?
 }
 
 public struct BotTask: Codable, Hashable, Sendable {
     public var threadId: String
     public var title: String
     public var createdAt: Double
+    public var modelSelection: ModelSelection?
+    public var busy: Bool?
+    /// Runtime state from newer computers; used to recover approvals in
+    /// background threads without downloading every conversation.
+    public var activity: String?
+    /// This thread's own turn is done and a dispatched teammate has not
+    /// settled yet (#1223): a wait, not work. Newer computers send it while
+    /// leaving busy/activity idle, so older builds simply see the thread
+    /// idle instead of spinning a work glyph for the whole teammate run.
+    public var waitingOnTeammate: Bool?
+    public var unread: Bool?
+    public var approvalMode: String?
+    public var autoApprove: Bool?
+    public var alwaysAllow: [String]?
+    public var projectId: String?
+    public var openedBy: ThreadOpener?
+    public var closedBy: ThreadCloser?
+    /// When the person put this thread away, in epoch milliseconds. The
+    /// field's presence — not its value — marks the thread archived: the
+    /// task API accepts any epoch number, so a thread persisted with
+    /// archivedAt: 0 is archived. Absent means it was never put away.
+    public var archivedAt: Double?
+    /// Bot-only internal execution. Keep it addressable, but out of thread pickers.
+    public var routineRunId: String?
+
+    /// The thread list's quiet second line, worded as the desktop words it.
+    public var openedByLabel: String? {
+        openedBy.map { "opened by \($0.name)" }
+    }
+
+    /// A bot closed this thread and nothing has happened there since.
+    public var isClosed: Bool { closedBy != nil }
+
+    /// Archived means the field is present, not nonzero: the task API
+    /// accepts any epoch number, so a thread persisted with
+    /// archivedAt: 0 is archived.
+    public var isArchived: Bool { archivedAt != nil }
+
+    /// Working is activity or flag: the wire can carry either alone, so the
+    /// archive action's busy gate and the working status ask the same
+    /// question. A run counts as work here exactly as its row already
+    /// labels it Working.
+    public var isWorking: Bool { activity == "working" || activity == "running" || busy == true }
+
+    /// The one line under a title: who closed it once a bot has, "Archived"
+    /// once the person put it away, otherwise who opened it, otherwise
+    /// nothing. Closed wins because it is the newer fact; archived wins over
+    /// the opener because it explains why the row sits where it does.
+    public var bylineLabel: String? {
+        if let closedBy { return "closed by \(closedBy.name)" }
+        return isArchived ? "Archived" : openedByLabel
+    }
+
+    /// Waiting on a dispatched teammate: the thread's own turn is done and
+    /// a teammate has not settled. Flag-only, matching Android: the live
+    /// #1228 wire paints busy, working, and this flag together during a
+    /// coordination wait, so the flag alone decides — a quiet wait, never
+    /// the work spinner.
+    public var isWaitingOnTeammate: Bool { waitingOnTeammate == true }
+
+    /// Whether the row must stay in the list regardless of closed state:
+    /// it is working, waiting on someone, has something they have not read,
+    /// or is holding a queued send. Queued is client state the harness
+    /// reports out-of-band, so it arrives as an input rather than living on
+    /// the wire-decoded task.
+    public func demandsAttention(queued: Bool = false) -> Bool {
+        if isWorking || isWaitingOnTeammate || unread == true { return true }
+        if queued { return true }
+        switch activity {
+        case "waiting-on-you", "waiting", "queued": return true
+        default: return false
+        }
+    }
+}
+
+/// A message the harness is holding until the running turn settles. The
+/// phone's copy of a server-owned queue entry, identified by the harness's
+/// queueId and never by its text.
+public struct QueuedSend: Codable, Hashable, Identifiable, Sendable {
+    public var queueId: String
+    public var text: String
+    /// Why the harness held it. "capacity" is the known value; anything else
+    /// parses and is shown as a plain queued line.
+    public var reason: String?
+
+    public var id: String { queueId }
+
+    public init(queueId: String, text: String, reason: String? = nil) {
+        self.queueId = queueId
+        self.text = text
+        self.reason = reason
+    }
 }
 
 public struct Bot: Codable, Hashable, Identifiable, Sendable {
@@ -213,11 +388,18 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     public var modelSelection: ModelSelection
     public var createdAt: Double
     public var busy: Bool?
+    /// A dispatched teammate has not settled yet; the bot itself is waiting
+    /// on it rather than working (#1223). Carries the active thread's wait;
+    /// per-thread waits live on the task.
+    public var waitingOnTeammate: Bool?
     public var pinned: Bool?
     public var hidden: Bool?
     /// Desktop sidebar section. Missing or blank means the built-in Bots area.
     public var section: String?
     public var chiefOfStaff: Bool?
+    /// ask, auto, full, or custom. Missing on older harnesses; autoApprove
+    /// remains the compatibility mirror for older companion builds.
+    public var approvalMode: String?
     public var autoApprove: Bool?
     public var alwaysAllow: [String]?
     public var computer: String?
@@ -232,10 +414,48 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     /// older harness included) means the shipped `cursor` silhouette.
     public var mascotBody: String?
     public var tasks: [BotTask]?
+    public var projects: [BotProject]?
     public var messages: [Message]?
     public var activeLeafId: String?
     /// Paged responses only: there is more transcript above what you got.
     public var hasMore: Bool?
+
+    /// Routine results are ordinary tasks; only their per-run executions are hidden.
+    public var visibleTasks: [BotTask] {
+        (tasks ?? []).filter { $0.routineRunId == nil }
+    }
+
+    /// Older computers only send the profile default. Newer ones snapshot
+    /// each thread's model independently, including the thread open here.
+    public var currentTaskModelSelection: ModelSelection {
+        tasks?.first { $0.threadId == threadId }?.modelSelection ?? modelSelection
+    }
+
+    public var currentTaskBusy: Bool? {
+        tasks?.first { $0.threadId == threadId }?.busy ?? busy
+    }
+
+    /// A view snapshot, never a replacement for the shared profile record.
+    /// The selected thread stays local even when another client navigates.
+    public func projected(forThread selectedThreadId: String) -> Bot? {
+        let task = tasks?.first { $0.threadId == selectedThreadId }
+        guard task != nil || selectedThreadId == threadId else { return nil }
+        var view = self
+        view.threadId = selectedThreadId
+        view.modelSelection = task?.modelSelection ?? modelSelection
+        view.busy = task?.busy ?? (selectedThreadId == threadId ? busy : false)
+        view.waitingOnTeammate = task?.waitingOnTeammate ?? (selectedThreadId == threadId ? waitingOnTeammate : false)
+        view.unread = task?.unread ?? (selectedThreadId == threadId ? unread : false)
+        view.approvalMode = task?.approvalMode ?? task?.autoApprove.map { $0 ? "auto" : "ask" } ?? approvalMode
+        view.autoApprove = task?.autoApprove ?? autoApprove
+        view.alwaysAllow = task?.alwaysAllow ?? alwaysAllow
+        if selectedThreadId != threadId {
+            view.messages = nil
+            view.activeLeafId = nil
+            view.hasMore = nil
+        }
+        return view
+    }
 }
 
 public enum AvatarCrop: String, Codable, CaseIterable, Hashable, Sendable {
@@ -253,6 +473,31 @@ public enum AvatarCrop: String, Codable, CaseIterable, Hashable, Sendable {
         var container = encoder.singleValueContainer()
         try container.encode(rawValue)
     }
+}
+
+/// The "who" section of a bot overview: identity and its soul in one line.
+public struct BotOverviewWho: Codable, Hashable, Sendable {
+    public var name: String
+    public var title: String
+    public var blurb: String
+    public var soulLead: String
+}
+
+public struct BotOverviewRecent: Codable, Hashable, Sendable {
+    /// epoch milliseconds, like every other timestamp on the wire
+    public var at: Double
+    public var summary: String
+}
+
+/// A read-only summary of one bot: who it is, what it does, what it can
+/// reach, what it won't do, and its recent activity. No settings and no
+/// transcript — this is the shape a phone is allowed to poll for.
+public struct BotOverview: Codable, Hashable, Sendable {
+    public var who: BotOverviewWho
+    public var does: [String]
+    public var reaches: [String]
+    public var wont: [String]
+    public var recent: [BotOverviewRecent]
 }
 
 public struct GroupResponder: Codable, Hashable, Sendable {
@@ -282,7 +527,7 @@ public struct Room: Codable, Hashable, Identifiable, Sendable {
 
 // MARK: - Responses
 
-private struct Lossy<Element: Decodable>: Decodable {
+struct Lossy<Element: Decodable>: Decodable {
     let value: Element?
 
     init(from decoder: Decoder) throws {
@@ -293,24 +538,35 @@ private struct Lossy<Element: Decodable>: Decodable {
 public struct Fleet: Decodable, Sendable {
     public var bots: [Bot]
     public var groups: [Room]
+    /// Held sends for every bot thread, the same snapshot the
+    /// bot.queued frames carry. Older computers omit it.
+    public var botQueuedMessages: [String: [QueuedSend]]?
 
-    private enum CodingKeys: String, CodingKey { case bots, groups }
+    private enum CodingKeys: String, CodingKey { case bots, groups, botQueuedMessages }
 
-    public init(bots: [Bot], groups: [Room]) {
+    public init(bots: [Bot], groups: [Room], botQueuedMessages: [String: [QueuedSend]]? = nil) {
         self.bots = bots
         self.groups = groups
+        self.botQueuedMessages = botQueuedMessages
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         bots = try container.decodeIfPresent([Lossy<Bot>].self, forKey: .bots)?.compactMap(\.value) ?? []
         groups = try container.decodeIfPresent([Lossy<Room>].self, forKey: .groups)?.compactMap(\.value) ?? []
+        // One malformed entry must not cost the whole fleet: the roster is
+        // worth more than the queue note beside it.
+        botQueuedMessages = (try? container.decodeIfPresent(
+            [String: [Lossy<QueuedSend>]].self,
+            forKey: .botQueuedMessages
+        ))??.mapValues { list in list.compactMap(\.value) }
     }
 }
 
 public struct ThreadPage: Codable, Sendable {
     public var messages: [Message]
     public var hasMore: Bool?
+    public var activeLeafId: String?
 }
 
 public struct SearchHit: Codable, Hashable, Identifiable, Sendable {
@@ -480,12 +736,24 @@ public struct ModelCatalog: Codable, Hashable, Sendable {
     public var options: [ModelOption]
 }
 
+/// The small, phone-safe part of an engine's capabilities needed by bot
+/// settings. Missing capabilities or effort levels mean the engine does not
+/// offer a reasoning control.
+public struct InstanceCapabilities: Codable, Hashable, Sendable {
+    public var effortLevels: [String]?
+
+    public init(effortLevels: [String]? = nil) {
+        self.effortLevels = effortLevels
+    }
+}
+
 public struct Instance: Codable, Hashable, Identifiable, Sendable {
     public var instanceId: String
     public var driverKind: String
     public var displayName: String?
     public var snapshot: ProviderSnapshot
     public var models: ModelCatalog
+    public var capabilities: InstanceCapabilities? = nil
 
     public var id: String { instanceId }
 }
@@ -498,7 +766,20 @@ public struct InstanceList: Codable, Sendable {
 /// Derived from `ConfigFlag.provider`, never decoded straight off the wire.
 public enum VoiceProvider: Hashable, Sendable {
     case elevenlabs
+    case fish
     case system
+    case chatterbox
+
+    /// The exact string the config write carries. The server matches
+    /// spellings, not meanings, so neither does this.
+    public var wireValue: String {
+        switch self {
+        case .elevenlabs: "elevenlabs"
+        case .fish: "fish"
+        case .system: "system"
+        case .chatterbox: "chatterbox"
+        }
+    }
 }
 
 public struct ConfigFlag: Codable, Hashable, Sendable {
@@ -510,6 +791,11 @@ public struct ConfigFlag: Codable, Hashable, Sendable {
     /// it through `ConfigStatus.voiceProvider`, which applies the server's own
     /// fallback; nothing should compare this string directly.
     public var provider: String?
+    /// Chatterbox's credential is an address, not a key. `describeVoice`
+    /// sends it and the model id empty under every other engine — and an
+    /// older computer omits them — so both read as "not set".
+    public var baseUrl: String?
+    public var model: String?
 }
 
 public struct Profile: Codable, Hashable, Sendable {
@@ -546,14 +832,25 @@ public struct ConfigStatus: Codable, Sendable {
         return isTTSConfigured && (hasAgentVoice || hasWorkspaceDefaultVoice)
     }
 
-    /// `voiceProvider(cfg)` in `server/tts/index.ts`: only the exact string
-    /// `"system"` selects the built-in engine. A missing field — a computer
-    /// older than the choice — and an engine this build has never heard of
-    /// both fall back to ElevenLabs, which is the server's own rule and what
-    /// keeps an unrecognised engine from being explained to the user with
-    /// copy written for a different one.
+    /// `voiceProvider(cfg)` in `server/tts/index.ts`: only the exact
+    /// strings `"fish"`, `"system"`, and `"chatterbox"` select those engines. A missing
+    /// field — a computer older than the choice — and an engine this build
+    /// has never heard of both fall back to ElevenLabs, which is the
+    /// server's own rule and what keeps an unrecognised engine from being
+    /// explained to the user with copy written for a different one.
     public var voiceProvider: VoiceProvider {
-        tts?.provider == "system" ? .system : .elevenlabs
+        switch tts?.provider {
+        case "fish": .fish
+        case "system": .system
+        case "chatterbox": .chatterbox
+        default: .elevenlabs
+        }
+    }
+
+    /// Walkie synthesizes directly on the phone through its own ElevenLabs
+    /// key. A voice chosen from another provider's catalog is not compatible.
+    public func walkieAgentVoice(_ voice: String?) -> String? {
+        voiceProvider == .elevenlabs ? voice : nil
     }
 }
 
@@ -634,7 +931,7 @@ public struct Voice: Codable, Hashable, Identifiable, Sendable {
 
 public struct RoutineSchedule: Codable, Hashable, Sendable {
     public enum Kind: String, Codable, Sendable {
-        case once, daily
+        case once, daily, interval
         /// A schedule introduced by a newer desktop. It remains visible but
         /// cannot be toggled or saved until the user chooses a supported kind.
         case unknown
@@ -653,6 +950,8 @@ public struct RoutineSchedule: Codable, Hashable, Sendable {
     public var at: Double?
     public var time: String?
     public var weekdays: [Int]?
+    public var everyMinutes: Int?
+    public var anchorAt: Int64?
 
     public static func once(at: Date) -> Self {
         .init(type: .once, at: at.timeIntervalSince1970 * 1_000, time: nil, weekdays: nil)
@@ -660,6 +959,17 @@ public struct RoutineSchedule: Codable, Hashable, Sendable {
 
     public static func daily(time: String, weekdays: [Int]) -> Self {
         .init(type: .daily, at: nil, time: time, weekdays: weekdays)
+    }
+
+    public static func interval(everyMinutes: Int, anchorAt: Date) -> Self {
+        .init(
+            type: .interval,
+            at: nil,
+            time: nil,
+            weekdays: nil,
+            everyMinutes: everyMinutes,
+            anchorAt: Int64((anchorAt.timeIntervalSince1970 * 1_000).rounded())
+        )
     }
 }
 
@@ -672,6 +982,7 @@ public struct Routine: Codable, Hashable, Identifiable, Sendable {
     public var enabled: Bool
     public var schedule: RoutineSchedule
     public var durationMinutes: Int
+    public var timeoutMinutes: Int?
     public var nextRunAt: Double?
     public var createdAt: Double
     public var updatedAt: Double
@@ -683,6 +994,7 @@ public struct RoutineRun: Codable, Hashable, Identifiable, Sendable {
     public var routineName: String
     public var prompt: String?
     public var durationMinutes: Int?
+    public var timeoutMinutes: Int?
     public var botId: String
     public var runOn: String
     public var scheduledFor: Double
@@ -706,10 +1018,15 @@ public struct RoutineInput: Encodable, Sendable {
     public var enabled: Bool?
     public var schedule: RoutineSchedule
     public var durationMinutes: Int
+    /// A value replaces the stored limit; nil leaves it unchanged on PATCH.
+    public var timeoutMinutes: Int?
+    /// Explicitly writes JSON null when `timeoutMinutes` is nil.
+    public var clearTimeout: Bool
 
     public init(
         name: String, prompt: String, botId: String, runOn: String = "maus",
-        enabled: Bool? = nil, schedule: RoutineSchedule, durationMinutes: Int = 30
+        enabled: Bool? = nil, schedule: RoutineSchedule, durationMinutes: Int = 30,
+        timeoutMinutes: Int? = nil, clearTimeout: Bool = false
     ) {
         self.name = name
         self.prompt = prompt
@@ -718,6 +1035,25 @@ public struct RoutineInput: Encodable, Sendable {
         self.enabled = enabled
         self.schedule = schedule
         self.durationMinutes = durationMinutes
+        self.timeoutMinutes = timeoutMinutes
+        self.clearTimeout = clearTimeout
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, prompt, botId, runOn, enabled, schedule, durationMinutes, timeoutMinutes
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(name, forKey: .name)
+        try values.encode(prompt, forKey: .prompt)
+        try values.encode(botId, forKey: .botId)
+        try values.encode(runOn, forKey: .runOn)
+        try values.encodeIfPresent(enabled, forKey: .enabled)
+        try values.encode(schedule, forKey: .schedule)
+        try values.encode(durationMinutes, forKey: .durationMinutes)
+        if let timeoutMinutes { try values.encode(timeoutMinutes, forKey: .timeoutMinutes) }
+        else if clearTimeout { try values.encodeNil(forKey: .timeoutMinutes) }
     }
 }
 
@@ -759,6 +1095,8 @@ public extension Routine {
         switch schedule.type {
         case .daily:
             true
+        case .interval:
+            (5...1_440).contains(schedule.everyMinutes ?? 0) && schedule.anchorAt != nil
         case .once:
             (schedule.at ?? -.infinity) > date.timeIntervalSince1970 * 1_000
         case .unknown:
@@ -929,4 +1267,31 @@ struct RoutineRunResponse: Codable, Sendable { var run: RoutineRun }
 
 struct ConnectorAuthorizationResponse: Codable, Sendable {
     var url: String
+}
+
+// MARK: - Server sessions (pairing with a server directly)
+
+/// What `POST /api/auth/pair` returns on a server: the bearer, the session
+/// it opened, and the server's public descriptor.
+public struct ServerPairResponse: Codable, Sendable {
+    public var token: String
+    public var session: ServerSession
+    public var environment: ServerEnvironment
+}
+
+public struct ServerSession: Codable, Hashable, Sendable {
+    public var id: String
+    public var label: String
+    public var scopes: [String]
+    public var expiresAt: Double?
+
+    public var isAdmin: Bool { scopes.contains("admin") }
+}
+
+/// `GET /.well-known/openmausbot/environment`, served without a session.
+public struct ServerEnvironment: Codable, Hashable, Sendable {
+    public var environmentId: String
+    public var label: String
+    public var platform: String?
+    public var version: String?
 }

@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -18,6 +19,7 @@ import { removeTempDir } from "./testing/cleanup.ts";
 import { DATA_DIR } from "./config.ts";
 import {
   applyStagedSkillWrite,
+  applySkillWriteWithReceipt,
   installSkill,
   listSkills,
   listStagedSkillWrites,
@@ -29,6 +31,7 @@ import {
   setSkillEnabled,
   skillsSystemPrompt,
   stageSkillWrite,
+  syncSkillLinks,
 } from "./skills.ts";
 import { parseSkillSource } from "./skill-fetch.ts";
 import { workspaceDir } from "./workspace.ts";
@@ -206,7 +209,9 @@ describe("install → review → enable lifecycle", () => {
     const userTarget = join(scratch, "replacement");
     mkdirSync(userTarget, { recursive: true });
     const replaced = join(root, ".claude", "skills", "link-safety");
-    rmSync(replaced, { force: true });
+    // Node 24 on macOS reports a directory symlink as EISDIR unless recursive
+    // removal is enabled; rm still unlinks the symlink without following it.
+    rmSync(replaced, { recursive: true, force: true });
     symlinkSync(userTarget, replaced, process.platform === "win32" ? "junction" : "dir");
 
     // The other two app links now point at a missing target and are broken.
@@ -230,7 +235,7 @@ describe("install → review → enable lifecycle", () => {
     });
     expect(existsSync(join(outsideRoot, "escaped"))).toBe(false);
 
-    rmSync(join(root, "skills"), { force: true });
+    rmSync(join(root, "skills"), { recursive: true, force: true });
     mkdirSync(join(root, "skills"));
     const content = SKILL("linked-skill");
     const outsideSkill = join(scratch, "outside-skill");
@@ -282,7 +287,7 @@ describe("install → review → enable lifecycle", () => {
     const userTarget = join(scratch, "user-native-target");
     mkdirSync(userTarget, { recursive: true });
     const userLink = join(root, ".claude", "skills", "root-replaced-user-link");
-    rmSync(userLink, { force: true });
+    rmSync(userLink, { recursive: true, force: true });
     symlinkSync(userTarget, userLink, process.platform === "win32" ? "junction" : "dir");
 
     const outsideRoot = join(scratch, "replacement-skills-user-link");
@@ -295,6 +300,30 @@ describe("install → review → enable lifecycle", () => {
     for (const dir of [".agents/skills", ".grok/skills"]) {
       expect(() => lstatSync(join(root, dir, "root-replaced-user-link"))).toThrow();
     }
+  });
+
+  it("does not unlink a regular file swapped in during unsafe-root cleanup", () => {
+    installSkill(bot, "src", [{ path: "SKILL.md", content: SKILL("unsafe-root-race") }]);
+    setSkillEnabled(bot, "unsafe-root-race", true);
+    const root = workspaceDir(bot);
+    const racedLink = join(root, ".agents", "skills", "unsafe-root-race");
+    const outsideRoot = join(scratch, "unsafe-root-race-skills");
+    mkdirSync(join(outsideRoot, "unsafe-root-race"), { recursive: true });
+    rmSync(join(root, "skills"), { recursive: true, force: true });
+    symlinkSync(outsideRoot, join(root, "skills"), process.platform === "win32" ? "junction" : "dir");
+
+    let swapped = false;
+    syncSkillLinks(bot, {
+      beforeRemove: (link) => {
+        if (link !== racedLink || swapped) return;
+        swapped = true;
+        rmSync(link, { recursive: true, force: true });
+        writeFileSync(link, "workspace replacement\n");
+      },
+    });
+
+    expect(swapped).toBe(true);
+    expect(readFileSync(racedLink, "utf8")).toBe("workspace replacement\n");
   });
 
   it("skips a native discovery directory that is a symlink", () => {
@@ -614,7 +643,7 @@ describe("staged skill writes", () => {
     const userDirectory = join(scratch, "user-owned-link");
     mkdirSync(userDirectory);
     const claudeLink = join(workspaceDir(bot), ".claude", "skills", "link-owner");
-    rmSync(claudeLink, { force: true });
+    rmSync(claudeLink, { recursive: true, force: true });
     symlinkSync(userDirectory, claudeLink, process.platform === "win32" ? "junction" : "dir");
 
     const staged = stageSkillWrite(bot, {
@@ -627,6 +656,30 @@ describe("staged skill writes", () => {
     expect(realpathSync(claudeLink)).toBe(realpathSync(userDirectory));
     expect(realpathSync(join(workspaceDir(bot), ".agents", "skills", "link-owner")))
       .toContain(join("skills", ".revisions"));
+  });
+
+  it("does not unlink a regular file swapped in during ordinary link cleanup", () => {
+    installSkill(bot, "src", [{ path: "SKILL.md", content: SKILL("link-cleanup-race") }]);
+    setSkillEnabled(bot, "link-cleanup-race", true);
+    const root = workspaceDir(bot);
+    const racedLink = join(root, ".agents", "skills", "link-cleanup-race");
+    writeFileSync(
+      join(root, "skills", "link-cleanup-race", "SKILL.md"),
+      SKILL("link-cleanup-race", "Changed after review."),
+    );
+
+    let swapped = false;
+    syncSkillLinks(bot, {
+      beforeRemove: (link) => {
+        if (link !== racedLink || swapped) return;
+        swapped = true;
+        rmSync(link, { recursive: true, force: true });
+        writeFileSync(link, "workspace replacement\n");
+      },
+    });
+
+    expect(swapped).toBe(true);
+    expect(readFileSync(racedLink, "utf8")).toBe("workspace replacement\n");
   });
 
   it("refuses a stale update without overwriting the changed skill", () => {
@@ -868,6 +921,50 @@ describe("staged skill writes", () => {
     expect(applied).toMatchObject({ error: expect.stringContaining("changed after review") });
     expect(listSkills(bot)).toEqual([]);
     expect(listStagedSkillWrites(bot)).toHaveLength(1);
+  });
+
+  it("returns applied in Full Access even if recording its receipt fails", () => {
+    const staged = stageSkillWrite(bot, { action: "create", files: [{ path: "SKILL.md", content: SKILL("full-receipt") }] });
+    if ("error" in staged) throw new Error(staged.error);
+    const applied = applySkillWriteWithReceipt(bot, staged, () => { throw new Error("receipt write failed"); });
+    expect(applied).toMatchObject({ result: { name: "full-receipt", enabled: true }, settlementPending: true });
+    expect(listSkills(bot)).toMatchObject([{ name: "full-receipt", enabled: true }]);
+    // Recover the same durable operation, never create a second skill.
+    expect(applySkillWriteWithReceipt(bot, staged, () => {})).toMatchObject({ result: { name: "full-receipt" } });
+    expect(listStagedSkillWrites(bot)).toEqual([]);
+  });
+
+  it("returns applied in Full Access if staging cleanup fails after installation", () => {
+    const staged = stageSkillWrite(bot, { action: "create", files: [{ path: "SKILL.md", content: SKILL("full-cleanup") }] });
+    if ("error" in staged) throw new Error(staged.error);
+    const staging = join(DATA_DIR, "skill-state", bot, "staged.json");
+    const backup = `${staging}.fixture-backup`;
+    try {
+      const applied = applySkillWriteWithReceipt(bot, staged, () => {
+        // Only this fixture's staging path: make the post-commit atomic rename fail.
+        renameSync(staging, backup);
+        mkdirSync(staging);
+      });
+      expect(applied).toMatchObject({ result: { name: "full-cleanup", enabled: true }, settlementPending: true });
+      expect(listSkills(bot)).toMatchObject([{ name: "full-cleanup", enabled: true }]);
+    } finally {
+      if (existsSync(backup)) {
+        rmSync(staging, { recursive: true });
+        renameSync(backup, staging);
+      }
+    }
+    expect(applySkillWriteWithReceipt(bot, staged, () => {})).toMatchObject({ result: { name: "full-cleanup" } });
+    expect(listStagedSkillWrites(bot)).toEqual([]);
+  });
+
+  it("does not report applied or record a receipt for invalid Full Access skill content", () => {
+    const staged = stageSkillWrite(bot, { action: "create", files: [{ path: "SKILL.md", content: SKILL("full-invalid") }] });
+    if ("error" in staged) throw new Error(staged.error);
+    let receipts = 0;
+    expect(applySkillWriteWithReceipt(bot, { ...staged, sha256: "0".repeat(64) }, () => { receipts++; }))
+      .toMatchObject({ error: expect.stringContaining("changed after review") });
+    expect(receipts).toBe(0);
+    expect(listSkills(bot)).toEqual([]);
   });
 
   it("replays approval safely if card settlement fails after installation", () => {

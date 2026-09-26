@@ -33,6 +33,7 @@ pnpm dev:desktop   # Electron shell (macOS/Ubuntu; keep server + Vite running)
 pnpm typecheck     # app + server
 pnpm test          # vitest suite (server unit + driver contract + API smoke)
 pnpm test:watch    # same, in watch mode
+pnpm exec vitest run --shard=1/4   # one CI shard, exactly the files CI ran in it
 pnpm check:electron # syntax-check the plain JS Electron entrypoints
 
 pnpm package:mac   # DMG + ZIP; requires Swift/Xcode tools
@@ -225,9 +226,50 @@ API keys are write-only: they land in `~/.openmausbot/config.json` via `PUT /api
 only ever reports `configured` booleans. Keep it that way — no logging keys, no echoing them in
 responses or events, no baking them into argv where another local process could read them.
 
+## Downstream forks and release ownership
+
+Changes prepared in a downstream fork should keep provenance in the pull request, not add
+fork-specific branding or ownership claims to the upstream source tree. Record the exact upstream
+commit used as the comparison base, the head branch, and the checks run after the final rebase.
+
+Fork maintainers own the binaries and update channels they publish. Before distributing a fork,
+review the application name and identifiers, signing configuration, update metadata, and every
+`electron-builder` publish target. Never upload fork artifacts or update metadata to the official
+OpenMausBot release repository, and never change the upstream publish target in a feature PR unless
+that release migration was explicitly agreed with the maintainer.
+
+An upstream PR should contain only the portable product change. Keep local build paths, account
+names, credentials, private endpoints, machine-specific configuration, and fork-only release notes
+out of its commits and screenshots.
+
+## Contribution licensing
+
+- No DCO sign-off is required. Submit only code you wrote or have the right
+  to contribute under the applicable project license.
+- Changes under `enterprise/` (source-available, see [LICENSING.md](LICENSING.md))
+  need the [CLA](CLA.md), signed once by commenting on the pull request
+  when the bot asks. Changes outside `enterprise/` do not require a CLA.
+- `enterprise/`, the cloud seam and the licensing files have code owners; a
+  maintainer review is required there.
+
+## CI, in one glance
+
+Every PR runs the same checks, each as its own job so a failure names itself:
+
+- **typecheck + lint** — typecheck, lint, locale catalogs (`pnpm i18n:check`), Electron syntax check, production UI build. Once, on Ubuntu; none of it is platform-specific.
+- **vitest (os, shard n/4)** — the suite on macOS, Ubuntu and Windows, split into four shards each. The suite runs its files serially on purpose (fake CLIs and a real harness server), so one runner takes ~19 minutes; a shard takes 4–10. To reproduce a shard's failure locally, run the same `pnpm exec vitest run --shard=n/4`. Failures also appear as annotations on the PR.
+- **packaged server smoke (os)** — the server bundle copied out of the repo and started with no `node_modules` in reach.
+- **Windows CUA host smoke**, **Electron smokes (macOS)** — real Electron utility processes against disposable homes; never the live app.
+- **typecheck + test (os)** — the three checks the branch rules require. They only aggregate the jobs above; if one is red, the failing job is named in its log.
+
+A `pre-push` hook installed by `pnpm install` runs lint, typecheck and the locale check before a push (about a minute). `git push --no-verify` skips it once; `OMB_SKIP_HOOKS=1` skips it for a session.
+
+Provider fakes under `server/testing/fake-*.ts` must stay dependency-free: they run as bare subprocesses and at least one is copied out of the repo by a test, so a relative import from the repo dies at link time. `server/testing/fakes-self-contained.test.ts` enforces it.
+
 ## Before you open the PR
 
 - [ ] `pnpm typecheck` and `pnpm test` pass
+- [ ] `pnpm lint` passes
 - [ ] Locale changes pass `pnpm i18n:check` and have been reviewed by a speaker
 - [ ] `pnpm check:electron` passes for desktop-shell changes
 - [ ] Ubuntu packaging changes pass `pnpm package:linux` and `node scripts/verify-linux-package.mjs`
