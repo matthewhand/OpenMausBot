@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 // TCP alias so the historical LAN UI port (5199) still reaches the review
 // Vite on 8802. HMR, SSE, and POSTs all ride the same byte stream.
+// Review stack port map: API 8800, webhook 8801, UI 8802, alias 5199 — and the
+// primary stack (run-server.cmd / run-omb.cmd) 8799 + webhook 8797, so neither
+// derives PORT+1 onto the other's port.
 import net from "node:net";
 
 const listenPort = Number(process.env.OMB_UI_ALIAS_PORT || 5199);

@@ -8,7 +8,7 @@
 # - Node.js 24+ installed
 #
 # Usage:
-#   .\install-service.ps1 [-ServiceName "OpenMausBot"] [-Port 8799] [-Host "0.0.0.0"] [-AuthToken "your-token"]
+#   .\install-service.ps1 [-ServiceName "OpenMausBot"] [-Port 8799] [-Host "0.0.0.0"] [-AuthToken "your-token"] [-WebhookPort 8797]
 
 param(
     [string]$ServiceName = "OpenMausBot",
@@ -17,6 +17,12 @@ param(
     [string]$AuthToken = "",
     [string]$LanBypassCidr = "",
     [string]$CorsOrigin = "*",
+    # Empty keeps the server default of PORT+1 (8800 for the default port) -
+    # fine on a box that only runs this service. On a machine that also runs the
+    # review stack (start-review-api.ps1 binds 8800), pass 8797 instead or the
+    # service's webhook receiver takes the review API's port and that stack dies
+    # with "listen EADDRINUSE 0.0.0.0:8800".
+    [string]$WebhookPort = "",
     [string]$InstallDir = "",
     [switch]$Help
 )
@@ -30,6 +36,8 @@ Usage: .\install-service.ps1 [OPTIONS]
 Options:
   -ServiceName <name>    Service name (default: OpenMausBot)
   -Port <port>           Server port (default: 8799)
+  -WebhookPort <port>    Webhook receiver port (default: <port+1>; use 8797 when the
+                         review stack's start-review-api.ps1 owns 8800 on this box)
   -Host <host>           Bind address (default: 0.0.0.0 for LAN access)
   -AuthToken <token>     Authentication token (required for LAN)
   -LanBypassCidr <cidr>  Subnets/CIDRs to allow without auth (e.g. "10.0.0.0/24" or "true")
@@ -183,6 +191,9 @@ Write-Host "Configuring service..." -ForegroundColor Cyan
 
 # Set environment variables (must be a single call — NSSM overwrites on each set)
 $envVars = @("OMB_HOST=$Host", "OMB_PORT=$Port")
+if (-not [string]::IsNullOrWhiteSpace($WebhookPort)) {
+    $envVars += "OMB_WEBHOOK_PORT=$WebhookPort"
+}
 if (-not [string]::IsNullOrWhiteSpace($AuthToken)) {
     $envVars += "OMB_AUTH_TOKEN=$AuthToken"
 }
@@ -224,6 +235,7 @@ Write-Host "`nService installed successfully!" -ForegroundColor Green
 Write-Host "`nService Details:" -ForegroundColor Cyan
 Write-Host "  Name:        $ServiceName"
 Write-Host "  Port:        $Port"
+Write-Host "  Webhook:     $(if ($WebhookPort) { $WebhookPort } else { 'port+1 (default)' })"
 Write-Host "  Host:        $Host"
 Write-Host "  Auth:        $(if ($AuthToken) { 'Enabled' } else { 'Disabled' })"
 Write-Host "  Logs:        $logDir"
