@@ -19,3 +19,7 @@ allowBuilds:
 onlyBuiltDependencies:
   - electron
   - esbuild
+
+# Pin the transitive posthog-js sanitizer above the critical advisory fix floor.
+overrides:
+  dompurify: 3.4.17

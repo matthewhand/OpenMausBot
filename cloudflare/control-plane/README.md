@@ -7,7 +7,7 @@ tool output.
 
 ## What is included
 
-- Better Auth 1.7.1 with email OTP, signed bearer sessions, hashed OTP storage,
+- Better Auth 1.7.7 with email OTP, signed bearer sessions, hashed OTP storage,
   and D1-backed IP plus recipient rate limits.
 - A Cloudflare Email Sending binding that produces both HTML and plain-text OTP
   messages. Authentication responses remain generic even when delivery fails;
@@ -33,7 +33,10 @@ recipient-scoped OTP limiter whose keys are HMACs rather than email addresses,
 plus an authenticated installation-creation limiter. `0004` adds managed
 endpoint resource IDs, lifecycle state, generation leases, redacted error
 codes, and installation-scoped action limits. `0005` adds the cleanup-attempt
-counter used for scheduled retry backoff. Endpoint rows deliberately do not
+counter used for scheduled retry backoff. Migration `0006` updates the Better Auth
+account schema for 1.7.7 while retaining issuer history. See
+[`BETTER_AUTH_1_7_UPGRADE.md`](BETTER_AUTH_1_7_UPGRADE.md) for the mandatory
+production preflight and rollback constraints. Endpoint rows deliberately do not
 cascade away with a hard installation deletion: losing the tunnel and DNS IDs
 would make operator cleanup impossible.
 
