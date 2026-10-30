@@ -23,3 +23,5 @@ onlyBuiltDependencies:
 # Pin the transitive posthog-js sanitizer above the critical advisory fix floor.
 overrides:
   dompurify: 3.4.17
+  fast-uri: 3.1.9
+  zod: 4.6.7
