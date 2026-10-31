@@ -29,3 +29,5 @@ overrides:
   # js-yaml 1x high via electron-builder tooling.
   '@xmldom/xmldom': 0.8.15
   js-yaml: 4.3.2
+  # 2026-10-31 dependabot alerts: source-map-js 1x high via postcss/@tailwindcss/node.
+  source-map-js: 1.2.2
