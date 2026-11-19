@@ -22,6 +22,12 @@ onlyBuiltDependencies:
 
 # Pin the transitive posthog-js sanitizer above the critical advisory fix floor.
 overrides:
+  'undici@>=6.0.0 <6.29.1': 6.29.1
+  'undici@>=7.0.0 <7.30.2': 7.30.2
+  'sharp@>=0.35.0 <0.35.5': 0.35.5
+  'brace-expansion@>=1.0.0 <1.1.21': 1.1.21
+  'brace-expansion@>=2.0.0 <2.1.7': 2.1.7
+  'brace-expansion@>=5.0.0 <5.0.12': 5.0.12
   dompurify: 3.4.17
   fast-uri: 3.1.9
   zod: 4.6.7
