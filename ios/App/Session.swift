@@ -199,6 +199,13 @@ final class Session: ObservableObject {
                let pagesData = try? Data(contentsOf: pagesURL),
                let pages = try? JSONDecoder().decode([String: ThreadPage].self, from: pagesData) {
                 for (threadID, page) in pages { state.merge(page, intoThread: threadID) }
+                if arguments.contains("-threads-preview-updates") {
+                    // Queued sends arrive separately from the fleet and thread pages.
+                    state.rememberQueued(
+                        QueuedSend(queueId: "preview-weekend-held", text: "Find a place to stay for the weekend."),
+                        threadId: "preview-weekend"
+                    )
+                }
             }
             status = .live
             return

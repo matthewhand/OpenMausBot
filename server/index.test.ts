@@ -4681,7 +4681,11 @@ describe("harness HTTP API", () => {
       composio: true,
       computer: "off",
     });
-    const groupsBefore = (await api("GET", "/api/bots")).body.groups.length;
+    const beforeImport = (await api("GET", "/api/bots")).body;
+    const groupsBefore = beforeImport.groups.length;
+    const chiefIds = (bots: Array<{ id: string; chiefOfStaff?: boolean }>) =>
+      bots.filter((bot) => bot.chiefOfStaff).map((bot) => bot.id).sort();
+    const chiefsBeforeImport = chiefIds(beforeImport.bots);
     const room = (await api("POST", "/api/groups", { memberIds: [trusted.id], name: "War Room" })).body.group;
 
     const smuggled = {
@@ -4747,10 +4751,8 @@ describe("harness HTTP API", () => {
       composio: true,
       computer: "off",
     });
-    // the single-Chief invariant survives the manifest's chiefOfStaff claim
-    expect(after.bots.filter((bot: { chiefOfStaff?: boolean }) => bot.chiefOfStaff).map((bot: { id: string }) => bot.id)).toEqual([
-      trusted.id,
-    ]);
+    // Each section can have its own Chief. Importing a team preserves the existing Chiefs.
+    expect(chiefIds(after.bots)).toEqual(chiefsBeforeImport);
 
     // a legacy v1 file carries a room block; import ignores it entirely —
     // it neither creates a room nor touches the existing one sharing its name
@@ -8838,66 +8840,56 @@ describe("harness HTTP API", () => {
     expect(after.body.profile).toEqual({ name: "Ada Lovelace", email: "Ada@Example.com" });
   });
 
-  it("saves custom MCP servers and never echoes headers back", async () => {
-    const servers = [
-      {
-        name: "notion",
-        transport: "http",
-        url: "https://api.example.com/mcp/notion",
-        headers: { Authorization: "Bearer secret-token-123" },
-        enabled: true,
-      },
-      {
-        name: "deepwiki",
-        transport: "sse",
-        url: "https://api.example.com/mcp/deepwiki",
+  it("saves custom MCP servers and never echoes header values", async () => {
+    const endpoint = "/api/mcp/servers";
+    const httpUrl = "https://example.test/mcp/notes";
+    const editedUrl = "https://example.test/mcp/notes-edited";
+    const sseUrl = "https://example.test/mcp/wiki";
+    const secret = "Bearer fixture-secret";
+
+    try {
+      const created = await api("POST", endpoint, {
+        name: "fixture-notes",
+        type: "http",
+        url: httpUrl,
+        headers: { Authorization: secret },
         enabled: false,
-      },
-    ];
+      });
+      expect(created.status).toBe(201);
+      expect(created.body.servers).toContainEqual({
+        name: "fixture-notes", type: "http", url: httpUrl, headerKeys: ["Authorization"], enabled: false,
+      });
+      expect(JSON.stringify(created.body)).not.toContain(secret);
 
-    const put = await api("PUT", "/api/config", { mcpServers: servers });
-    expect(put.status).toBe(200);
-    expect(put.body.mcpServers).toHaveLength(2);
-    expect(put.body.mcpServers[0]).toMatchObject({
-      name: "notion",
-      transport: "http",
-      url: "https://api.example.com/mcp/notion",
-      enabled: true,
-      hasHeaders: true,
-    });
-    expect(put.body.mcpServers[0].headers).toBeUndefined();
-    expect(JSON.stringify(put.body)).not.toContain("secret-token-123");
-    expect(JSON.stringify(put.body)).not.toContain("Bearer");
+      const createdSse = await api("POST", endpoint, {
+        name: "fixture-wiki", type: "sse", url: sseUrl, enabled: false,
+      });
+      expect(createdSse.status).toBe(201);
 
-    const after = await api("GET", "/api/config");
-    expect(after.body.mcpServers).toHaveLength(2);
-    expect(after.body.mcpServers[0]).toMatchObject({
-      name: "notion",
-      transport: "http",
-      url: "https://api.example.com/mcp/notion",
-      enabled: true,
-      hasHeaders: true,
-    });
-    expect(after.body.mcpServers[1]).toMatchObject({
-      name: "deepwiki",
-      transport: "sse",
-      url: "https://api.example.com/mcp/deepwiki",
-      enabled: false,
-      hasHeaders: false,
-    });
-    expect(JSON.stringify(after.body)).not.toContain("secret-token-123");
+      const listed = await api("GET", endpoint);
+      expect(listed.status).toBe(200);
+      expect(listed.body.servers).toEqual(expect.arrayContaining([
+        { name: "fixture-notes", type: "http", url: httpUrl, headerKeys: ["Authorization"], enabled: false },
+        { name: "fixture-wiki", type: "sse", url: sseUrl, headerKeys: [], enabled: false },
+      ]));
+      expect(JSON.stringify(listed.body)).not.toContain(secret);
 
-    // A later save that omits headers (the UI never has them) must keep them.
-    const again = await api("PUT", "/api/config", {
-      mcpServers: [
-        { name: "notion", transport: "http", url: "https://api.example.com/mcp/notion", enabled: false },
-        { name: "deepwiki", transport: "sse", url: "https://api.example.com/mcp/deepwiki", enabled: false },
-      ],
-    });
-    expect(again.status).toBe(200);
-    expect(again.body.mcpServers[0]).toMatchObject({ name: "notion", enabled: false, hasHeaders: true });
-    const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
-    expect(disk.mcpServers[0].headers).toEqual({ Authorization: "Bearer secret-token-123" });
+      // The editor submits true for stored write-only values that it should keep.
+      const saved = await api("PUT", `${endpoint}/fixture-notes`, {
+        type: "http", url: editedUrl, headers: { Authorization: true }, enabled: false,
+      });
+      expect(saved.status).toBe(200);
+      expect(saved.body.servers).toContainEqual({
+        name: "fixture-notes", type: "http", url: editedUrl, headerKeys: ["Authorization"], enabled: false,
+      });
+      expect(JSON.stringify(saved.body)).not.toContain(secret);
+
+      const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
+      expect(disk.mcpServers["fixture-notes"].headers).toEqual({ Authorization: secret });
+    } finally {
+      await api("DELETE", `${endpoint}/fixture-notes`);
+      await api("DELETE", `${endpoint}/fixture-wiki`);
+    }
   });
 
   it("creates an independent webhook, accepts a delivery, deduplicates it, and rotates its secret", async () => {

@@ -132,20 +132,23 @@ final class ThreadNavigationUITests: XCTestCase {
 
     @MainActor
     func testUpdatesKeepSiblingThreadsSeparate() {
-        let app = launchPreview()
+        let app = launchPreview(extraArguments: ["-threads-preview-updates"])
         app.buttons["updates-button"].tap()
         let gmail = app.buttons["update-preview-gmail"]
         let iCloud = app.buttons["update-preview-icloud"]
         let weekend = app.buttons["update-preview-weekend"]
         XCTAssertTrue(gmail.waitForExistence(timeout: 5))
-        XCTAssertTrue(iCloud.exists)
-        XCTAssertTrue(weekend.exists)
         XCTAssertTrue(gmail.label.contains("Triage Gmail"))
-        XCTAssertTrue(iCloud.label.contains("Triage iCloud"))
+        XCTAssertTrue(weekend.waitForExistence(timeout: 5))
         XCTAssertTrue(weekend.label.contains("Plan weekend"))
-        XCTAssertFalse(app.buttons["update-preview-routine"].exists)
+        XCTAssertTrue(weekend.label.contains("Queued"))
         XCTAssertTrue(app.staticTexts["3 active"].exists)
-        if !iCloud.isHittable { app.swipeUp() }
+        if !iCloud.isHittable {
+            app.scrollViews.containing(.button, identifier: "update-preview-gmail").firstMatch.swipeUp()
+        }
+        XCTAssertTrue(iCloud.waitForExistence(timeout: 5))
+        XCTAssertTrue(iCloud.label.contains("Triage iCloud"))
+        XCTAssertFalse(app.buttons["update-preview-routine"].exists)
         recordScreenshot("Separate updates for sibling threads", in: app)
         iCloud.tap()
         assertThread("Triage iCloud", in: app)

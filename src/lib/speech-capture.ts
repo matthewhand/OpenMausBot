@@ -77,11 +77,12 @@ export function speechEndUserMessage(code: number | null, reason?: string): stri
 }
 
 function emitTranscript(line: SpeechTranscript) {
-  for (const fn of [...transcriptWatchers]) fn(line);
+  // Snapshot the listeners so subscriptions added during a callback apply to the next event.
+  for (const fn of Array.from(transcriptWatchers)) fn(line);
 }
 
 function emitEnd(info: SpeechEnd) {
-  for (const fn of [...endWatchers]) fn(info);
+  for (const fn of Array.from(endWatchers)) fn(info);
 }
 
 function emitFinal(text: string) {
