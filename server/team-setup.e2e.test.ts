@@ -32,6 +32,9 @@ it("Clive reviews multi-provider teams once, continues after each decision, and 
     const chief = (await api("POST", "/api/bots", { name: "Clive", title: "Chief of Staff", section: "Operations", modelSelection: selection(claude) }, 201)).bot;
     await api("PATCH", `/api/bots/${chief.id}`, { chiefOfStaff: true });
     const state = async () => (await api("GET", "/api/bots")).bots;
+    const rosterIds = async () => (await state()).map((bot: any) => bot.id).sort();
+    // The starter bot is randomly named and may share a specialist's name.
+    const initialBotIds: string[] = await rosterIds();
     let previousPid: number | undefined;
     const start = async (text: string) => {
       if (existsSync(gate)) unlinkSync(gate);
@@ -86,9 +89,10 @@ it("Clive reviews multi-provider teams once, continues after each decision, and 
     await api("POST", "/api/internal/team-setup-requests", { plan: { ...plan, operations: [build("Bad", "Research", { instanceId: "codex", model: "invented-model" })] } }, 400, token);
     await api("POST", "/api/internal/team-setup-requests", { fromBotId: "foreign", plan }, 403, token);
     const denied = await api("POST", "/api/internal/team-setup-requests", { plan }, 201, token);
-    expect((await state()).filter((bot: any) => ["Mira", "Patch", "Quill"].includes(bot.name))).toHaveLength(0);
+    expect(await rosterIds()).toEqual(initialBotIds);
     await api("POST", `/api/threads/${chief.threadId}/respond`, { requestId: denied.requestId, behavior: "deny" });
     await finish(); await continueOnce(denied.requestId);
+    expect(await rosterIds()).toEqual(initialBotIds);
     expect((await state()).find((bot: any) => bot.id === chief.id).managedSections).toBeUndefined();
 
     token = await start("Apply the reviewed Research, Engineering and Growth setup.");
@@ -99,17 +103,19 @@ it("Clive reviews multi-provider teams once, continues after each decision, and 
     expect(card.subtitle).toContain("Authorize @Clive");
     // Origin is forgeable by an active bot shell: it cannot self-grant teams.
     await api("POST", `/api/threads/${chief.threadId}/respond`, { requestId: proposed.requestId, behavior: "allow" }, 403);
-    expect((await state()).some((bot: any) => bot.name === "Patch")).toBe(false);
+    expect(await rosterIds()).toEqual(initialBotIds);
     await finish();
     await api("POST", `/api/threads/${chief.threadId}/respond`, { requestId: proposed.requestId, behavior: "allow" }, 403, undefined, false);
     const approved = await api("POST", `/api/threads/${chief.threadId}/respond`, { requestId: proposed.requestId, behavior: "allow" });
     expect(approved.result.state).toBe("applied"); await continueOnce(proposed.requestId);
     const saved = await state();
-    const engineer = saved.find((bot: any) => bot.name === "Patch");
+    const specialists = saved.filter((bot: any) => !initialBotIds.includes(bot.id));
+    expect(specialists.map((bot: any) => bot.name).sort()).toEqual(["Mira", "Patch", "Quill"]);
+    const engineer = specialists.find((bot: any) => bot.name === "Patch");
     expect(engineer).toMatchObject({ title: "Implementation and verification engineer", section: "Engineering", modelSelection: selection(codex), approvalMode: "ask", autoApprove: false, composio: false });
     expect(saved.find((bot: any) => bot.id === chief.id).managedSections).toEqual(expect.arrayContaining(plan.newTeams));
     await api("POST", `/api/threads/${chief.threadId}/respond`, { requestId: proposed.requestId, behavior: "allow" });
-    expect((await state()).filter((bot: any) => bot.name === "Patch")).toHaveLength(1);
+    expect(await rosterIds()).toEqual(saved.map((bot: any) => bot.id).sort());
     expect(JSON.parse(readFileSync(fixture.fixtureDumpPath, "utf8")).pid).toBe(previousPid);
 
     token = await start("Move Patch to Growth and switch its default engine to Claude; retain its existing thread.");

@@ -138,14 +138,20 @@ final class ThreadNavigationUITests: XCTestCase {
         let iCloud = app.buttons["update-preview-icloud"]
         let weekend = app.buttons["update-preview-weekend"]
         XCTAssertTrue(gmail.waitForExistence(timeout: 5))
-        XCTAssertTrue(iCloud.exists)
-        XCTAssertTrue(weekend.exists)
+        XCTAssertTrue(iCloud.waitForExistence(timeout: 5))
         XCTAssertTrue(gmail.label.contains("Triage Gmail"))
         XCTAssertTrue(iCloud.label.contains("Triage iCloud"))
-        XCTAssertTrue(weekend.label.contains("Plan weekend"))
         XCTAssertFalse(app.buttons["update-preview-routine"].exists)
         XCTAssertTrue(app.staticTexts["3 active"].exists)
-        if !iCloud.isHittable { app.swipeUp() }
+
+        // At the medium detent the last row can be outside the accessible viewport.
+        let updates = app.scrollViews.containing(.button, identifier: "update-preview-gmail").firstMatch
+        for _ in 0..<2 where !weekend.isHittable { updates.swipeUp() }
+        XCTAssertTrue(weekend.waitForExistence(timeout: 5))
+        XCTAssertTrue(weekend.label.contains("Plan weekend"))
+        XCTAssertFalse(app.buttons["update-preview-routine"].exists)
+        for _ in 0..<2 where !iCloud.isHittable { updates.swipeDown() }
+        XCTAssertTrue(iCloud.isHittable)
         recordScreenshot("Separate updates for sibling threads", in: app)
         iCloud.tap()
         assertThread("Triage iCloud", in: app)
