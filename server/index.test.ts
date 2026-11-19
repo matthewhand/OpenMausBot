@@ -8845,44 +8845,49 @@ describe("harness HTTP API", () => {
     const sseUrl = "https://example.test/mcp/wiki";
     const secret = "Bearer fixture-secret";
 
-    const created = await api("POST", endpoint, {
-      name: "fixture-notes",
-      type: "http",
-      url: httpUrl,
-      headers: { Authorization: secret },
-      enabled: false,
-    });
-    expect(created.status).toBe(201);
-    expect(created.body.servers).toContainEqual({
-      name: "fixture-notes", type: "http", url: httpUrl, headerKeys: ["Authorization"], enabled: false,
-    });
-    expect(JSON.stringify(created.body)).not.toContain(secret);
+    try {
+      const created = await api("POST", endpoint, {
+        name: "fixture-notes",
+        type: "http",
+        url: httpUrl,
+        headers: { Authorization: secret },
+        enabled: false,
+      });
+      expect(created.status).toBe(201);
+      expect(created.body.servers).toContainEqual({
+        name: "fixture-notes", type: "http", url: httpUrl, headerKeys: ["Authorization"], enabled: false,
+      });
+      expect(JSON.stringify(created.body)).not.toContain(secret);
 
-    const createdSse = await api("POST", endpoint, {
-      name: "fixture-wiki", type: "sse", url: sseUrl, enabled: false,
-    });
-    expect(createdSse.status).toBe(201);
+      const createdSse = await api("POST", endpoint, {
+        name: "fixture-wiki", type: "sse", url: sseUrl, enabled: false,
+      });
+      expect(createdSse.status).toBe(201);
 
-    const listed = await api("GET", endpoint);
-    expect(listed.status).toBe(200);
-    expect(listed.body.servers).toEqual(expect.arrayContaining([
-      { name: "fixture-notes", type: "http", url: httpUrl, headerKeys: ["Authorization"], enabled: false },
-      { name: "fixture-wiki", type: "sse", url: sseUrl, headerKeys: [], enabled: false },
-    ]));
-    expect(JSON.stringify(listed.body)).not.toContain(secret);
+      const listed = await api("GET", endpoint);
+      expect(listed.status).toBe(200);
+      expect(listed.body.servers).toEqual(expect.arrayContaining([
+        { name: "fixture-notes", type: "http", url: httpUrl, headerKeys: ["Authorization"], enabled: false },
+        { name: "fixture-wiki", type: "sse", url: sseUrl, headerKeys: [], enabled: false },
+      ]));
+      expect(JSON.stringify(listed.body)).not.toContain(secret);
 
-    // The editor submits true for stored write-only values that it should keep.
-    const saved = await api("PUT", `${endpoint}/fixture-notes`, {
-      type: "http", url: editedUrl, headers: { Authorization: true }, enabled: false,
-    });
-    expect(saved.status).toBe(200);
-    expect(saved.body.servers).toContainEqual({
-      name: "fixture-notes", type: "http", url: editedUrl, headerKeys: ["Authorization"], enabled: false,
-    });
-    expect(JSON.stringify(saved.body)).not.toContain(secret);
+      // The editor submits true for stored write-only values that it should keep.
+      const saved = await api("PUT", `${endpoint}/fixture-notes`, {
+        type: "http", url: editedUrl, headers: { Authorization: true }, enabled: false,
+      });
+      expect(saved.status).toBe(200);
+      expect(saved.body.servers).toContainEqual({
+        name: "fixture-notes", type: "http", url: editedUrl, headerKeys: ["Authorization"], enabled: false,
+      });
+      expect(JSON.stringify(saved.body)).not.toContain(secret);
 
-    const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
-    expect(disk.mcpServers["fixture-notes"].headers).toEqual({ Authorization: secret });
+      const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
+      expect(disk.mcpServers["fixture-notes"].headers).toEqual({ Authorization: secret });
+    } finally {
+      await api("DELETE", `${endpoint}/fixture-notes`);
+      await api("DELETE", `${endpoint}/fixture-wiki`);
+    }
   });
 
   it("creates an independent webhook, accepts a delivery, deduplicates it, and rotates its secret", async () => {
