@@ -195,12 +195,16 @@ describe("server-owned browser MCP runtime", () => {
     // reconnects, deleting and recreating the browser in Settings, remounting
     // the conversation's tools, and restarting the app. Nothing an agent can
     // call clears it, because every tool call passes the same gate.
-    const value = runtime({ requestTimeoutMs: 60 });
+    // Leave time for a cold Node child on hosted Windows before timing the hung call.
+    const value = runtime({ requestTimeoutMs: 1_500 });
+    const before = await value.agentRpc("s", spec(), "tools/list", {}) as { pid: number; initialized: boolean };
+    expect(before.initialized).toBe(true);
     await expect(value.agentRpc("s", spec(), "tools/call", { name: "hang" })).rejects.toThrow(/timed out/);
     // The timeout stopped the transport, which SIGKILLs the child, so nothing
     // is left running and the next call must be allowed to start a browser.
-    await expect(value.agentRpc("s", spec(), "tools/call", { name: "echo", arguments: { text: "back" } }))
-      .resolves.toMatchObject({ content: [{ text: expect.stringContaining("back") }] });
+    const reply = await value.agentRpc("s", spec(), "tools/call", { name: "echo", arguments: { text: "back" } });
+    expect(reply).toMatchObject({ pid: expect.any(Number), content: [{ text: expect.stringContaining("back") }] });
+    expect(reply).not.toMatchObject({ pid: before.pid });
     // and a person can still take control afterwards
     await value.take("s", "owner");
     expect(value.canControl("s", "owner")).toBe(true);

@@ -1368,7 +1368,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     }
   });
 
-  it("mounts custom remote MCP servers (HTTP/SSE) and pre-allows their tools", async () => {
+  it("mounts custom remote MCP servers without pre-allowing their tools", async () => {
     await create();
     const dump = join(scratch, "dump.json");
     process.env.FAKE_CLAUDE_DUMP = dump;
@@ -1377,27 +1377,14 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       threadId: "t-custom-mcp-http",
       text: "hi",
       integrations: {
-        mcpServers: [
-          {
-            name: "notion",
-            transport: "http",
+        custom: {
+          notion: {
+            type: "http",
             url: "https://api.example.com/mcp/notion",
             headers: { Authorization: "Bearer secret-token" },
-            enabled: true,
           },
-          {
-            name: "deepwiki",
-            transport: "sse",
-            url: "https://api.example.com/mcp/deepwiki",
-            enabled: true,
-          },
-          {
-            name: "disabled-server",
-            transport: "http",
-            url: "https://disabled.example.com/mcp",
-            enabled: false,
-          },
-        ],
+          deepwiki: { type: "sse", url: "https://api.example.com/mcp/deepwiki", headers: {} },
+        },
       },
     });
     await recorder.until((e) => e.type === "turn.completed");
@@ -1412,10 +1399,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       type: "sse",
       url: "https://api.example.com/mcp/deepwiki",
     });
-    expect(seen.mcpConfig.mcpServers["disabled-server"]).toBeUndefined();
     const allowed = seen.argv[seen.argv.indexOf("--allowedTools") + 1];
-    expect(allowed).toContain("mcp__notion");
-    expect(allowed).toContain("mcp__deepwiki");
+    expect(allowed).not.toContain("mcp__notion");
+    expect(allowed).not.toContain("mcp__deepwiki");
     expect(allowed).not.toContain("mcp__disabled-server");
   });
 
@@ -1525,9 +1511,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
           args: ["/tmp/connector-proxy.js"],
           env: { OMB_CONNECTOR_UPSTREAM_URL: "https://example.test/mcp" },
         },
-        mcpServers: [
-          { name: "custom", transport: "http", url: "https://custom.example.com/mcp", enabled: true },
-        ],
+        custom: {
+          custom: { type: "http", url: "https://custom.example.com/mcp", headers: {} },
+        },
       },
     });
     await recorder.until((e) => e.type === "turn.completed");
@@ -1546,7 +1532,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(JSON.stringify(seen.argv)).not.toContain("ak_test");
     const allowed = seen.argv[seen.argv.indexOf("--allowedTools") + 1];
     expect(allowed).toContain("mcp__composio");
-    expect(allowed).toContain("mcp__custom");
+    expect(allowed).not.toContain("mcp__custom");
   });
 
   // the config file holds live credentials, so it must not outlive the turn —
